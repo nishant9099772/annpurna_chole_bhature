@@ -21,6 +21,12 @@ import {
 import { Bill, MonthlyReportData, DailySalesData } from '../types/billing';
 import { CopyMobileButton } from './CopyMobileButton';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import {
+  buildMonthlyReportFromBills,
+  hydrateAndSyncBillsWithServer,
+  loadPersistentBills,
+  savePersistentBills,
+} from '../utils/persistentBillsStorage';
 
 interface MonthlySalesCalendarProps {
   adminToken: string;
@@ -63,6 +69,9 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
       setIsLoading(true);
       setError(null);
       try {
+        // Hydrate server with any persistent client bills first so cold-started serverless instances have full history
+        await hydrateAndSyncBillsWithServer(adminToken);
+
         const res = await fetch(`/api/reports/monthly?year=${year}&month=${month}`, {
           headers: {
             Authorization: `Bearer ${adminToken}`,
@@ -76,13 +85,30 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
 
         const data = await res.json();
         if (data.report) {
+          // Merge any bills returned in the report into the persistent ledger
+          const reportBills: Bill[] = [];
+          if (Array.isArray(data.report.dailyData)) {
+            for (const day of data.report.dailyData) {
+              if (Array.isArray(day.bills)) {
+                reportBills.push(...day.bills);
+              }
+            }
+          }
+          if (reportBills.length > 0) {
+            savePersistentBills(reportBills);
+          }
           setReport(data.report);
         } else {
           throw new Error('Invalid monthly report response');
         }
       } catch (err: any) {
-        console.error('Error fetching monthly report:', err);
-        setError(err.message || 'Could not load sales report');
+        console.error('Error fetching monthly report, using persistent ledger fallback:', err);
+        const localPersistent = loadPersistentBills();
+        if (localPersistent.length > 0) {
+          setReport(buildMonthlyReportFromBills(localPersistent, year, month));
+        } else {
+          setError(err.message || 'Could not load sales report');
+        }
       } finally {
         setIsLoading(false);
       }

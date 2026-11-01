@@ -17,6 +17,7 @@
 import crypto from 'crypto';
 import { Bill, BillItem, MenuItemKey, OrderType, PaymentMethod } from '../types/billing';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import { parseKolkataDateTimeToMs } from '../utils/billTimestamp';
 
 export const DEFAULT_SPREADSHEET_TITLE = 'ANNAPURNA CHOLE BHATURE - Billing Records';
 
@@ -604,6 +605,7 @@ export async function appendBillToSheets(
     'Grand Total': bill.grandTotalRupees,
     'Record ID': bill.id,
     'Unique Bill ID': bill.id,
+    'Timestamp (ms)': bill.timestamp,
   };
 
   const billRow = billsHeaders.map((header) => {
@@ -1043,12 +1045,21 @@ export async function fetchBillsFromGoogleSheets(options?: {
         rowObj['Date & Time (IST)'] ||
         (billDate && billTime ? `${billDate}, ${billTime} IST` : billDate || 'IST');
 
-      // Parse timestamp from Order ID (ORD-YYYYMMDD-XXXX) or Bill Date (DD/MM/YYYY)
+      // Parse exact millisecond timestamp from Timestamp (ms), Date & Time (IST), Bill Date + Bill Time, or Order ID
       let timestamp = Date.now() - r * 1000;
-      const ordMatch = (orderId || billNumber).match(/(\d{4})(\d{2})(\d{2})/);
-      if (ordMatch) {
-        const parsedTime = Date.parse(`${ordMatch[1]}-${ordMatch[2]}-${ordMatch[3]}T12:00:00+05:30`);
-        if (!isNaN(parsedTime)) timestamp = parsedTime + r;
+      const rawTsMs = Number(rowObj['Timestamp (ms)'] || '');
+      if (Number.isFinite(rawTsMs) && rawTsMs > 946684800000) {
+        timestamp = rawTsMs;
+      } else {
+        const parsedKolkataMs = parseKolkataDateTimeToMs(
+          dateTimeKolkata,
+          billDate,
+          billTime,
+          orderId || billNumber
+        );
+        if (parsedKolkataMs !== null && Number.isFinite(parsedKolkataMs)) {
+          timestamp = parsedKolkataMs;
+        }
       }
 
       const itemsSummary = rowObj['Items'] || rowObj['Product Details'] || '';

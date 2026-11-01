@@ -24,6 +24,11 @@ import { Bill, PaymentMethod } from '../types/billing';
 import { BillDetailsModal } from './BillDetailsModal';
 import { CopyMobileButton } from './CopyMobileButton';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import {
+  hydrateAndSyncBillsWithServer,
+  savePersistentBills,
+  upsertPersistentBill,
+} from '../utils/persistentBillsStorage';
 
 interface BillHistoryViewProps {
   adminToken: string;
@@ -59,12 +64,14 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
   const [selectedBillForDetails, setSelectedBillForDetails] = useState<Bill | null>(null);
   const [retryingBillId, setRetryingBillId] = useState<string | null>(null);
 
-  // Fetch Bills from Server
+  // Fetch Bills from Server (hydrating persistent client bills first so cold-start instances have full history)
   const fetchBills = useCallback(async (page: number = 1) => {
     setIsLoading(true);
     setErrorMessage(null);
 
     try {
+      await hydrateAndSyncBillsWithServer(adminToken, googleToken);
+
       const params = new URLSearchParams({
         page: String(page),
         limit: String(itemsPerPage),
@@ -93,7 +100,11 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
       }
 
       const data = await res.json();
-      setBills(data.bills || []);
+      const loadedBills: Bill[] = Array.isArray(data.bills) ? data.bills : [];
+      if (loadedBills.length > 0) {
+        savePersistentBills(loadedBills);
+      }
+      setBills(loadedBills);
       setTotalPages(data.totalPages || 1);
       setTotalCount(data.total || 0);
       setCurrentPage(data.page || 1);
@@ -103,7 +114,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     } finally {
       setIsLoading(false);
     }
-  }, [adminToken, searchTerm, selectedOrderType, selectedPaymentMethod, selectedSyncStatus, selectedDateFilter]);
+  }, [adminToken, googleToken, searchTerm, selectedOrderType, selectedPaymentMethod, selectedSyncStatus, selectedDateFilter]);
 
   // Refetch when filters or search change
   useEffect(() => {
@@ -142,6 +153,8 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         savedToSheets: true,
         sheetsSyncStatus: 'synced',
       };
+
+      upsertPersistentBill(syncedBill);
 
       // Update local state with the synced bill
       setBills((prev) =>
@@ -230,6 +243,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
               className="bg-transparent focus:outline-hidden text-xs font-semibold cursor-pointer text-slate-800"
             >
               <option value="all">All Dates</option>
+              <option value="24h">Last 24 Hours (Rolling)</option>
               <option value="today">Today</option>
               <option value="yesterday">Yesterday</option>
               <option value="this_month">This Month</option>

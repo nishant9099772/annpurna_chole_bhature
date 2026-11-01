@@ -42,6 +42,12 @@ import { MonthlySalesCalendar } from './MonthlySalesCalendar';
 import { BillDetailsModal } from './BillDetailsModal';
 import { CopyMobileButton } from './CopyMobileButton';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import { computeBusinessMetricsFromBills } from '../utils/billTimestamp';
+import {
+  hydrateAndSyncBillsWithServer,
+  loadPersistentBills,
+  upsertPersistentBill,
+} from '../utils/persistentBillsStorage';
 
 interface BillingDashboardProps {
   adminUsername: string;
@@ -73,19 +79,10 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   // Navigation View: 'terminal' (New Bill), 'history' (Bill Records), or 'calendar' (Monthly Sales Calendar)
   const [activeTab, setActiveTab] = useState<'terminal' | 'history' | 'calendar'>('terminal');
 
-  // Business Metrics State
-  const [metrics, setMetrics] = useState<BusinessMetrics>({
-    totalBills: 0,
-    todaySalesRupees: 0,
-    todayBillsCount: 0,
-    monthlySalesRupees: 0,
-    monthlyBillsCount: 0,
-    totalRevenueRupees: 0,
-    syncedBillsCount: 0,
-    failedBillsCount: 0,
-    currentMonthName: 'March',
-    currentYear: 2026,
-  });
+  // Business Metrics State — initialized from persistent ledger so stats never reset to 0 on login/refresh
+  const [metrics, setMetrics] = useState<BusinessMetrics>(() =>
+    computeBusinessMetricsFromBills(loadPersistentBills(), Date.now())
+  );
 
   // Order Type (Required: Dine In vs Pack)
   const [orderType, setOrderType] = useState<OrderType | null>(null);
@@ -145,7 +142,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
   const [currentTimeStr, setCurrentTimeStr] = useState('');
 
-  // Fetch Business Metrics & Server Google Sheets Status
+  // Fetch & Bidirectionally Hydrate Business Metrics & Server Google Sheets Status
   const refreshMetrics = useCallback(async () => {
     try {
       const headers: Record<string, string> = {
@@ -155,32 +152,57 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         headers['x-google-token'] = googleToken;
       }
 
-      const [metricsRes, statusRes] = await Promise.all([
-        fetch('/api/metrics', { headers }),
+      const [hydratedResult, statusRes] = await Promise.all([
+        hydrateAndSyncBillsWithServer(adminToken, googleToken, customSpreadsheetId),
         fetch('/api/sheets/status', { headers }),
       ]);
 
-      if (metricsRes.status === 401) {
+      if (statusRes.status === 401) {
         onLogout();
         return;
       }
-      if (metricsRes.ok) {
-        const data = await metricsRes.json();
-        if (data?.metrics) {
-          setMetrics(data.metrics);
-        }
+
+      if (hydratedResult?.metrics) {
+        setMetrics(hydratedResult.metrics);
       }
+
       if (statusRes.ok) {
         const statusData = await statusRes.json();
         setServerSheetsStatus(statusData);
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.status === 401) {
+        onLogout();
+        return;
+      }
       console.log('Metrics load error:', err);
+      // Fallback to persistent local calculation so dashboard never blanks out
+      setMetrics(computeBusinessMetricsFromBills(loadPersistentBills(), Date.now()));
     }
-  }, [adminToken, googleToken, onLogout]);
+  }, [adminToken, googleToken, customSpreadsheetId, onLogout]);
 
   useEffect(() => {
     refreshMetrics();
+  }, [refreshMetrics]);
+
+  // Automatic 24-hour rolling window evaluator:
+  // Re-evaluates the 24h rolling window every 15 seconds against actual transaction timestamps
+  // so transactions older than 24 hours automatically stop contributing to the 24h dashboard stats,
+  // and syncs with the server every 45 seconds.
+  useEffect(() => {
+    const rollingTick = setInterval(() => {
+      const currentPersistent = loadPersistentBills();
+      setMetrics(computeBusinessMetricsFromBills(currentPersistent, Date.now()));
+    }, 15_000);
+
+    const serverSyncTick = setInterval(() => {
+      refreshMetrics();
+    }, 45_000);
+
+    return () => {
+      clearInterval(rollingTick);
+      clearInterval(serverSyncTick);
+    };
   }, [refreshMetrics]);
 
   // Live Asia/Kolkata Clock
@@ -578,6 +600,10 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         spreadsheetUrl: data.spreadsheetUrl,
       };
 
+      // Immediately persist the completed bill into the permanent ledger and update 24h rolling metrics
+      const updatedPersistent = upsertPersistentBill(authoritativeBill);
+      setMetrics(computeBusinessMetricsFromBills(updatedPersistent, Date.now()));
+
       // Reset local billing inputs
       clearEntireBill();
       refreshMetrics();
@@ -825,15 +851,22 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
         {/* SaaS Metrics Dashboard Cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-          {/* Card 1: Today's Sales */}
+          {/* Card 1: Rolling 24-Hour Sales */}
           <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
             <div>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Today's Sales</p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  24-Hour Sales
+                </p>
+                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
+                  Rolling 24h
+                </span>
+              </div>
               <h3 className="text-xl sm:text-2xl font-black text-slate-900 font-mono mt-1">
                 ₹{metrics.todaySalesRupees.toFixed(2)}
               </h3>
               <p className="text-[11px] text-slate-500 mt-0.5">
-                {metrics.todayBillsCount} {metrics.todayBillsCount === 1 ? 'bill' : 'bills'} today
+                {metrics.todayBillsCount} {metrics.todayBillsCount === 1 ? 'bill' : 'bills'} in last 24h
               </p>
             </div>
             <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center">

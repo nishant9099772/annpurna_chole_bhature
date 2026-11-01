@@ -1,16 +1,23 @@
 /**
  * Annpurna Chole Bhature - Persistent Storage Layer
- * Thread-safe, disk-backed persistent storage in ./data/bills.json.
- * Survives server restarts, logouts, and reboots.
- * Provides indexed Order ID lookups, multi-attribute filtering, pagination, and real-time business metrics.
+ * Thread-safe, disk-backed persistent storage in ./data/bills.json (with serverless /tmp fallback).
+ * Survives server restarts, logouts, logins, page refreshes, and reboots.
+ * Provides indexed Order ID lookups, multi-attribute filtering, pagination,
+ * 24-hour rolling window dashboard analytics, and monthly sales calendar reporting.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import crypto from 'crypto';
 import { Bill, BusinessMetrics, MonthlyReportData, DailySalesData } from '../types/billing';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import {
+  computeBusinessMetricsFromBills,
+  deduplicateBills,
+  getKolkataDateString,
+  isWithinRolling24Hours,
+  resolveBillTimestampMs,
+} from '../utils/billTimestamp';
 
 const PRIMARY_DATA_DIR = path.resolve(process.cwd(), 'data');
 const PRIMARY_BILLS_FILE = path.resolve(PRIMARY_DATA_DIR, 'bills.json');
@@ -29,40 +36,54 @@ class BillStorage {
   }
 
   private normalizeBillRecord(b: Bill): Bill {
+    const resolvedTs = resolveBillTimestampMs(b);
     return {
       ...b,
-      customerName: formatCustomerNameWithJi(b.customerName),
+      customerName: formatCustomerNameWithJi(b.customerName || 'Customer'),
+      timestamp: resolvedTs,
     };
   }
 
   private init() {
     try {
-      // Load from primary data file if present, or fallback to tmp file in serverless environments
-      let sourceFile: string | null = null;
+      const candidateFiles: string[] = [];
       if (fs.existsSync(PRIMARY_BILLS_FILE)) {
-        sourceFile = PRIMARY_BILLS_FILE;
-      } else if (fs.existsSync(TMP_BILLS_FILE)) {
-        sourceFile = TMP_BILLS_FILE;
+        candidateFiles.push(PRIMARY_BILLS_FILE);
+      }
+      if (fs.existsSync(TMP_BILLS_FILE)) {
+        candidateFiles.push(TMP_BILLS_FILE);
         this.activeDataDir = TMP_DATA_DIR;
         this.activeBillsFile = TMP_BILLS_FILE;
       }
 
+      const loadedList: Bill[] = [];
       let needsNormalizedFlush = false;
 
-      if (sourceFile) {
-        const raw = fs.readFileSync(sourceFile, 'utf-8');
-        if (raw.trim()) {
-          const list: Bill[] = JSON.parse(raw);
-          list.forEach((b) => {
-            const formattedName = formatCustomerNameWithJi(b.customerName);
-            if (formattedName !== b.customerName) {
-              needsNormalizedFlush = true;
+      for (const file of candidateFiles) {
+        try {
+          const raw = fs.readFileSync(file, 'utf-8');
+          if (raw.trim()) {
+            const parsed: Bill[] = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              loadedList.push(...parsed);
             }
-            this.bills.set(b.id, this.normalizeBillRecord(b));
-          });
-          this.sequence = list.length + 1;
-          console.log(`[Storage] Loaded ${this.bills.size} persistent bills from ${sourceFile}`);
+          }
+        } catch (readErr) {
+          console.warn(`[Storage] Failed reading ${file}:`, readErr);
         }
+      }
+
+      if (loadedList.length > 0) {
+        const deduped = deduplicateBills(loadedList);
+        deduped.forEach((b) => {
+          const normalized = this.normalizeBillRecord(b);
+          if (normalized.customerName !== b.customerName || normalized.timestamp !== b.timestamp) {
+            needsNormalizedFlush = true;
+          }
+          this.bills.set(normalized.id, normalized);
+        });
+        this.sequence = this.bills.size + 1;
+        console.log(`[Storage] Loaded ${this.bills.size} persistent bills`);
       } else {
         this.flushToDisk();
         console.log(`[Storage] Initialized new persistent bills file at ${this.activeBillsFile}`);
@@ -80,7 +101,12 @@ class BillStorage {
   }
 
   private flushToDisk() {
-    const allBills = Array.from(this.bills.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const allBills = deduplicateBills(Array.from(this.bills.values()));
+    this.bills.clear();
+    for (const b of allBills) {
+      this.bills.set(b.id, b);
+    }
+
     const payload = JSON.stringify(allBills, null, 2);
 
     try {
@@ -90,7 +116,7 @@ class BillStorage {
       const tmpFile = `${this.activeBillsFile}.${Date.now()}.tmp`;
       fs.writeFileSync(tmpFile, payload, 'utf-8');
       fs.renameSync(tmpFile, this.activeBillsFile);
-    } catch (err: any) {
+    } catch {
       // Fallback to os.tmpdir() if running in a read-only serverless container (e.g. Netlify Functions)
       try {
         this.activeDataDir = TMP_DATA_DIR;
@@ -109,8 +135,7 @@ class BillStorage {
    * Generates a unique, human-friendly Order ID (e.g. ORD-20260330-7492)
    */
   public generateOrderId(): string {
-    const now = new Date();
-    const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
+    const datePart = getKolkataDateString(Date.now()).replace(/-/g, '');
     const randPart = Math.floor(1000 + Math.random() * 9000);
     return `ORD-${datePart}-${randPart}`;
   }
@@ -119,17 +144,25 @@ class BillStorage {
    * Generates a sequential Bill Number (e.g. ACB-20260330-0001)
    */
   public generateBillNumber(): string {
-    const now = new Date();
-    const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
+    const datePart = getKolkataDateString(Date.now()).replace(/-/g, '');
     const seq = String(this.sequence++).padStart(4, '0');
     return `ACB-${datePart}-${seq}`;
   }
 
   /**
-   * Saves a new bill permanently
+   * Saves a new bill permanently (idempotent deduplication by Order ID / Bill Number / ID)
    */
   public async saveBill(bill: Bill): Promise<Bill> {
     const normalized = this.normalizeBillRecord(bill);
+    const existing =
+      this.getBill(normalized.orderId) ||
+      this.getBill(normalized.billNumber) ||
+      this.getBill(normalized.id);
+
+    if (existing && existing.id !== normalized.id) {
+      this.bills.delete(existing.id);
+    }
+
     this.bills.set(normalized.id, normalized);
     this.flushToDisk();
     return normalized;
@@ -139,7 +172,7 @@ class BillStorage {
    * Updates an existing bill (e.g., after Google Sheets retry sync)
    */
   public async updateBill(id: string, updates: Partial<Bill>): Promise<Bill | null> {
-    const existing = this.bills.get(id);
+    const existing = this.getBill(id);
     if (!existing) return null;
 
     const updated: Bill = this.normalizeBillRecord({
@@ -148,7 +181,7 @@ class BillStorage {
       id: existing.id, // prevent accidental ID change
     });
 
-    this.bills.set(id, updated);
+    this.bills.set(existing.id, updated);
     this.flushToDisk();
     return updated;
   }
@@ -169,8 +202,8 @@ class BillStorage {
     for (const b of this.bills.values()) {
       if (
         b.id === idOrOrderId ||
-        b.orderId.toUpperCase() === query ||
-        b.billNumber.toUpperCase() === query
+        (b.orderId && b.orderId.toUpperCase() === query) ||
+        (b.billNumber && b.billNumber.toUpperCase() === query)
       ) {
         return b;
       }
@@ -180,8 +213,16 @@ class BillStorage {
   }
 
   /**
-   * Merges bills fetched from Google Sheets (or client pending sync queue) idempotently
-   * by Order ID / Bill Number / ID so historical data is permanently preserved across serverless cold starts.
+   * Returns all stored bills sorted newest-first without deleting or filtering any record.
+   */
+  public getAllBills(): Bill[] {
+    return deduplicateBills(Array.from(this.bills.values()));
+  }
+
+  /**
+   * Merges bills fetched from Google Sheets or client persistent ledger idempotently
+   * by Order ID / Bill Number / ID so historical data is permanently preserved across
+   * logouts, logins, page refreshes, and serverless cold starts.
    */
   public mergeBillsFromSheets(remoteBills: Bill[]): number {
     if (!Array.isArray(remoteBills) || remoteBills.length === 0) return 0;
@@ -198,17 +239,47 @@ class BillStorage {
         const normalized = this.normalizeBillRecord(remote);
         this.bills.set(normalized.id, normalized);
         addedOrUpdatedCount++;
-      } else if (remote.savedToSheets && !existing.savedToSheets) {
-        const updated = this.normalizeBillRecord({
-          ...existing,
-          savedToSheets: true,
-          sheetsSyncStatus: 'synced',
-          sheetsSyncError: undefined,
-          spreadsheetId: remote.spreadsheetId || existing.spreadsheetId,
-          spreadsheetUrl: remote.spreadsheetUrl || existing.spreadsheetUrl,
-        });
-        this.bills.set(existing.id, updated);
-        addedOrUpdatedCount++;
+      } else {
+        const remoteSynced = Boolean(remote.savedToSheets || remote.sheetsSyncStatus === 'synced');
+        const existingSynced = Boolean(
+          existing.savedToSheets || existing.sheetsSyncStatus === 'synced'
+        );
+        const resolvedRemoteTs = resolveBillTimestampMs(remote);
+        const resolvedExistingTs = resolveBillTimestampMs(existing);
+
+        if (remoteSynced && !existingSynced) {
+          const updated = this.normalizeBillRecord({
+            ...existing,
+            timestamp: resolvedExistingTs || resolvedRemoteTs,
+            savedToSheets: true,
+            sheetsSyncStatus: 'synced',
+            sheetsSyncError: undefined,
+            spreadsheetId: remote.spreadsheetId || existing.spreadsheetId,
+            spreadsheetUrl: remote.spreadsheetUrl || existing.spreadsheetUrl,
+          });
+          this.bills.set(existing.id, updated);
+          addedOrUpdatedCount++;
+        } else if (
+          existing.id.startsWith('SHEET-') &&
+          remote.id &&
+          !remote.id.startsWith('SHEET-')
+        ) {
+          // Upgrade a sheet-reconstructed record with the full client/server record that has exact millisecond timestamp
+          this.bills.delete(existing.id);
+          const merged = this.normalizeBillRecord({
+            ...existing,
+            ...remote,
+            id: remote.id,
+            timestamp: resolvedRemoteTs,
+            savedToSheets: existingSynced || remoteSynced,
+            sheetsSyncStatus:
+              existingSynced || remoteSynced
+                ? 'synced'
+                : remote.sheetsSyncStatus || existing.sheetsSyncStatus,
+          });
+          this.bills.set(merged.id, merged);
+          addedOrUpdatedCount++;
+        }
       }
     }
 
@@ -221,6 +292,13 @@ class BillStorage {
   }
 
   /**
+   * Alias for merging client-persisted bills on login/refresh or serverless warm-up.
+   */
+  public mergeClientBills(clientBills: Bill[]): number {
+    return this.mergeBillsFromSheets(clientBills);
+  }
+
+  /**
    * Lists and filters bills with pagination
    */
   public listBills(options: {
@@ -228,7 +306,7 @@ class BillStorage {
     orderType?: string;
     paymentMethod?: string;
     syncStatus?: string;
-    dateFilter?: string; // 'all' | 'today' | 'yesterday' | 'this_week' | 'this_month' | 'YYYY-MM-DD'
+    dateFilter?: string; // 'all' | '24h' | 'today' | 'yesterday' | 'this_month' | 'YYYY-MM-DD'
     userId?: string;
     page?: number;
     limit?: number;
@@ -239,76 +317,66 @@ class BillStorage {
     limit: number;
     totalPages: number;
   } {
-    let list = Array.from(this.bills.values());
+    let list = this.getAllBills();
 
-    // 1. User isolation (if supplied and not 'admin_all')
-    if (options.userId && options.userId !== 'all') {
-      list = list.filter((b) => !b.userId || b.userId === options.userId || options.userId === 'admin');
-    }
-
-    // 2. Search query (matches Order ID, Bill Number, Customer Name, Mobile Number)
+    // 1. Search query (matches Order ID, Bill Number, Customer Name, Mobile Number)
     if (options.search && options.search.trim()) {
       const q = options.search.trim().toLowerCase();
       list = list.filter(
         (b) =>
-          b.orderId.toLowerCase().includes(q) ||
-          b.billNumber.toLowerCase().includes(q) ||
-          b.customerName.toLowerCase().includes(q) ||
-          b.mobileNumber.includes(q) ||
-          b.id.toLowerCase().includes(q)
+          (b.orderId && b.orderId.toLowerCase().includes(q)) ||
+          (b.billNumber && b.billNumber.toLowerCase().includes(q)) ||
+          (b.customerName && b.customerName.toLowerCase().includes(q)) ||
+          (b.mobileNumber && b.mobileNumber.includes(q)) ||
+          (b.id && b.id.toLowerCase().includes(q))
       );
     }
 
-    // 3. Order Type filter
+    // 2. Order Type filter
     if (options.orderType && options.orderType !== 'all') {
       list = list.filter((b) => b.orderType === options.orderType);
     }
 
-    // 4. Payment Method filter
+    // 3. Payment Method filter
     if (options.paymentMethod && options.paymentMethod !== 'all') {
       list = list.filter((b) => b.paymentMethod === options.paymentMethod);
     }
 
-    // 5. Sync Status filter
+    // 4. Sync Status filter
     if (options.syncStatus && options.syncStatus !== 'all') {
       list = list.filter((b) => b.sheetsSyncStatus === options.syncStatus);
     }
 
-    // 6. Date filter (Asia/Kolkata timezone)
+    // 5. Date filter (Asia/Kolkata timezone & 24-hour rolling support)
     if (options.dateFilter && options.dateFilter !== 'all') {
-      const now = new Date();
-      // Formatter for Kolkata YYYY-MM-DD
-      const kolkataDateStr = (date: Date) => {
-        return new Intl.DateTimeFormat('en-CA', {
-          timeZone: 'Asia/Kolkata',
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-        }).format(date);
-      };
+      const nowMs = Date.now();
+      const todayStr = getKolkataDateString(nowMs);
 
-      const todayStr = kolkataDateStr(now);
-
-      if (options.dateFilter === 'today') {
-        list = list.filter((b) => kolkataDateStr(new Date(b.timestamp)) === todayStr);
+      if (options.dateFilter === '24h') {
+        list = list.filter((b) => isWithinRolling24Hours(b, nowMs));
+      } else if (options.dateFilter === 'today') {
+        list = list.filter((b) => getKolkataDateString(resolveBillTimestampMs(b)) === todayStr);
       } else if (options.dateFilter === 'yesterday') {
-        const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        const yestStr = kolkataDateStr(yesterday);
-        list = list.filter((b) => kolkataDateStr(new Date(b.timestamp)) === yestStr);
+        const yestStr = getKolkataDateString(nowMs - 24 * 60 * 60 * 1000);
+        list = list.filter((b) => getKolkataDateString(resolveBillTimestampMs(b)) === yestStr);
       } else if (options.dateFilter === 'this_month') {
         const currentMonth = todayStr.slice(0, 7); // YYYY-MM
-        list = list.filter((b) => kolkataDateStr(new Date(b.timestamp)).startsWith(currentMonth));
+        list = list.filter((b) =>
+          getKolkataDateString(resolveBillTimestampMs(b)).startsWith(currentMonth)
+        );
       } else if (/^\d{4}-\d{2}-\d{2}$/.test(options.dateFilter)) {
-        list = list.filter((b) => kolkataDateStr(new Date(b.timestamp)) === options.dateFilter);
+        list = list.filter(
+          (b) => getKolkataDateString(resolveBillTimestampMs(b)) === options.dateFilter
+        );
       }
     }
 
-    // Sort newest first
-    list.sort((a, b) => b.timestamp - a.timestamp);
+    // Sort newest first using authoritative timestamp
+    list.sort((a, b) => resolveBillTimestampMs(b) - resolveBillTimestampMs(a));
 
     const total = list.length;
     const page = Math.max(1, options.page || 1);
-    const limit = Math.max(1, Math.min(100, options.limit || 50));
+    const limit = Math.max(1, Math.min(200, options.limit || 50));
     const totalPages = Math.ceil(total / limit) || 1;
     const startIndex = (page - 1) * limit;
     const paginated = list.slice(startIndex, startIndex + limit);
@@ -323,103 +391,26 @@ class BillStorage {
   }
 
   /**
-   * Computes authoritative Business Metrics for Dashboard
+   * Computes authoritative Business Metrics for Dashboard.
+   * Uses a strict 24-hour rolling window [nowMs - 24h, nowMs] based on actual transaction timestamps
+   * for `todaySalesRupees` and `todayBillsCount`.
+   * Historical records older than 24 hours are NEVER deleted and remain in total/monthly/calendar views.
    */
-  public getMetrics(userId?: string): BusinessMetrics {
-    let list = Array.from(this.bills.values());
-    if (
-      userId &&
-      !['all', 'admin', 'annpurna_chole_bhature', 'annapurna_chole_bhature', 'cashier', 'staff'].includes(
-        userId.trim().toLowerCase()
-      )
-    ) {
-      list = list.filter((b) => !b.userId || b.userId === userId);
-    }
-
-    const now = new Date();
-    const kolkataFormatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
-    const todayStr = kolkataFormatter.format(now);
-    const currentMonthPrefix = todayStr.slice(0, 7);
-
-    let todaySalesPaise = 0;
-    let todayBillsCount = 0;
-    let monthlySalesPaise = 0;
-    let monthlyBillsCount = 0;
-    let totalRevenuePaise = 0;
-    let syncedBillsCount = 0;
-    let failedBillsCount = 0;
-
-    for (const b of list) {
-      totalRevenuePaise += b.grandTotalPaise;
-
-      const billDateStr = kolkataFormatter.format(new Date(b.timestamp));
-      if (billDateStr === todayStr) {
-        todaySalesPaise += b.grandTotalPaise;
-        todayBillsCount++;
-      }
-
-      if (billDateStr.startsWith(currentMonthPrefix)) {
-        monthlySalesPaise += b.grandTotalPaise;
-        monthlyBillsCount++;
-      }
-
-      if (b.sheetsSyncStatus === 'synced' || b.savedToSheets) {
-        syncedBillsCount++;
-      } else if (b.sheetsSyncStatus === 'failed') {
-        failedBillsCount++;
-      }
-    }
-
-    const currentMonthName = new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      month: 'long',
-    }).format(now);
-    const currentYear = parseInt(todayStr.slice(0, 4), 10);
-
-    return {
-      totalBills: list.length,
-      todaySalesRupees: todaySalesPaise / 100,
-      todayBillsCount,
-      monthlySalesRupees: monthlySalesPaise / 100,
-      monthlyBillsCount,
-      totalRevenueRupees: totalRevenuePaise / 100,
-      syncedBillsCount,
-      failedBillsCount,
-      currentMonthName,
-      currentYear,
-    };
+  public getMetrics(_userId?: string, nowMs: number = Date.now()): BusinessMetrics {
+    const list = this.getAllBills();
+    return computeBusinessMetricsFromBills(list, nowMs);
   }
 
   /**
    * Generates comprehensive monthly sales report for any specified Year and Month (1-12)
    * Asia/Kolkata authoritative timezone. Historical data is permanently preserved.
    */
-  public getMonthlyReport(year: number, month: number, userId?: string): MonthlyReportData {
-    let list = Array.from(this.bills.values());
-    if (
-      userId &&
-      !['all', 'admin', 'annpurna_chole_bhature', 'annapurna_chole_bhature', 'cashier', 'staff'].includes(
-        userId.trim().toLowerCase()
-      )
-    ) {
-      list = list.filter((b) => !b.userId || b.userId === userId);
-    }
+  public getMonthlyReport(year: number, month: number, _userId?: string): MonthlyReportData {
+    const list = this.getAllBills();
 
     const targetYear = Math.max(2020, Math.min(2099, Math.floor(year)));
     const targetMonth = Math.max(1, Math.min(12, Math.floor(month)));
     const monthPrefix = `${targetYear}-${String(targetMonth).padStart(2, '0')}`;
-
-    const kolkataFormatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
 
     const monthLabelDate = new Date(Date.UTC(targetYear, targetMonth - 1, 15));
     const monthLabel = new Intl.DateTimeFormat('en-IN', {
@@ -429,7 +420,7 @@ class BillStorage {
 
     // Filter bills belonging to this specific month in IST
     const monthBills = list.filter((b) => {
-      const bDateStr = kolkataFormatter.format(new Date(b.timestamp));
+      const bDateStr = getKolkataDateString(resolveBillTimestampMs(b));
       return bDateStr.startsWith(monthPrefix);
     });
 
@@ -442,12 +433,16 @@ class BillStorage {
     }
 
     for (const b of monthBills) {
-      totalRevenuePaise += b.grandTotalPaise;
-      const bDateStr = kolkataFormatter.format(new Date(b.timestamp));
+      const amountPaise =
+        typeof b.grandTotalPaise === 'number' && !isNaN(b.grandTotalPaise)
+          ? b.grandTotalPaise
+          : Math.round((Number(b.grandTotalRupees) || 0) * 100);
+      totalRevenuePaise += amountPaise;
+      const bDateStr = getKolkataDateString(resolveBillTimestampMs(b));
       const dayNum = parseInt(bDateStr.slice(8, 10), 10);
       const existing = dailyMap.get(dayNum);
       if (existing) {
-        existing.revenuePaise += b.grandTotalPaise;
+        existing.revenuePaise += amountPaise;
         existing.bills.push(b);
       }
     }
@@ -472,7 +467,9 @@ class BillStorage {
         dayName,
         revenueRupees,
         billsCount,
-        bills: dayInfo.bills.sort((a, b) => b.timestamp - a.timestamp),
+        bills: dayInfo.bills.sort(
+          (a, b) => resolveBillTimestampMs(b) - resolveBillTimestampMs(a)
+        ),
       });
 
       if (revenueRupees > 0 && dayInfo.revenuePaise > maxDayPaise) {
@@ -488,7 +485,8 @@ class BillStorage {
 
     const totalBills = monthBills.length;
     const totalRevenueRupees = totalRevenuePaise / 100;
-    const averageBillValueRupees = totalBills > 0 ? Math.round((totalRevenueRupees / totalBills) * 100) / 100 : 0;
+    const averageBillValueRupees =
+      totalBills > 0 ? Math.round((totalRevenueRupees / totalBills) * 100) / 100 : 0;
 
     return {
       year: targetYear,

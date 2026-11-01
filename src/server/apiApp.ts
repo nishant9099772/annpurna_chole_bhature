@@ -491,14 +491,46 @@ app.get('/api/sheets/status', requireAdminAuth, async (req: Request, res: Respon
 
 /**
  * GET /api/metrics
- * Returns authoritative business analytics for dashboard cards
+ * Returns authoritative business analytics (including 24-hour rolling window stats) for dashboard cards
  */
-app.get('/api/metrics', requireAdminAuth, async (req: Request, res: Response) => {
+app.get(['/api/metrics', '/api/metrics/'], requireAdminAuth, async (req: Request, res: Response) => {
   const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
-  await maybeHydrateFromSheets(clientToken);
+  const customSheetId = typeof req.query.sheetId === 'string' ? req.query.sheetId : undefined;
+  await maybeHydrateFromSheets(clientToken, customSheetId);
   const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
   const metrics = billStorage.getMetrics(userId);
-  res.json({ metrics });
+  res.json({ metrics, bills: billStorage.getAllBills() });
+});
+
+/**
+ * POST /api/bills/hydrate
+ * Bidirectionally merges client-persisted bills, backend storage, and Google Sheets records,
+ * deduplicating by Order ID / Bill Number / ID, and returns authoritative 24h rolling metrics + full bill history.
+ */
+app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { clientBills, googleAccessToken, customSpreadsheetId } = req.body || {};
+    const headerToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+    const effectiveToken = googleAccessToken || headerToken;
+
+    if (Array.isArray(clientBills) && clientBills.length > 0) {
+      billStorage.mergeClientBills(clientBills);
+    }
+
+    await maybeHydrateFromSheets(effectiveToken, customSpreadsheetId);
+
+    const metrics = billStorage.getMetrics();
+    const bills = billStorage.getAllBills();
+
+    res.json({
+      success: true,
+      metrics,
+      bills,
+    });
+  } catch (err: any) {
+    console.error('[Bills Hydrate Error]:', err);
+    res.status(500).json({ error: err.message || 'Failed to hydrate bills' });
+  }
 });
 
 /**

@@ -6,13 +6,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { User as FirebaseUser } from 'firebase/auth';
 import { Bill } from './types/billing';
-import { initAuth, googleLogout } from './services/firebaseAuth';
+import { initAuth } from './services/firebaseAuth';
 import {
   generateBillPdfBytes,
   createBillPdfBlobUrl,
   createBillPdfFile,
 } from './services/pdfGenerator';
 import { formatCustomerNameWithJi } from './utils/customerFormat';
+import {
+  hydrateAndSyncBillsWithServer,
+  loadPersistentBills,
+  upsertPersistentBill,
+} from './utils/persistentBillsStorage';
 import { AdminLogin } from './components/AdminLogin';
 import { BillingDashboard } from './components/BillingDashboard';
 import { BillSuccessModal } from './components/BillSuccessModal';
@@ -44,8 +49,8 @@ export default function App() {
   const [googleUser, setGoogleUser] = useState<FirebaseUser | null>(null);
   const [googleToken, setGoogleToken] = useState<string | null>(null);
 
-  // Completed Bills in current shift
-  const [shiftBills, setShiftBills] = useState<Bill[]>([]);
+  // Completed Bills persisted across sessions, logouts, logins, and refreshes
+  const [shiftBills, setShiftBills] = useState<Bill[]>(() => loadPersistentBills());
   const [activeCompletedBill, setActiveCompletedBill] = useState<Bill | null>(null);
   const [isRetryingSync, setIsRetryingSync] = useState(false);
 
@@ -146,7 +151,7 @@ export default function App() {
     };
   }, []);
 
-  // Handle Admin Logout
+  // Handle Admin Logout — ONLY clears authentication session token; NEVER deletes sales/bill records
   const handleAdminLogout = useCallback(() => {
     if (adminToken) {
       fetch('/api/auth/logout', {
@@ -158,32 +163,25 @@ export default function App() {
     localStorage.removeItem('annpurna_admin_user');
     setAdminToken(null);
     setIsSessionVerified(false);
-    setShiftBills([]);
     setActiveCompletedBill(null);
-    googleLogout().catch(() => {});
   }, [adminToken]);
 
-  // Fetch recent bills from backend after session is verified
+  // Bidirectionally hydrate & fetch persistent bills from backend after session is verified
   useEffect(() => {
     if (!adminToken || !isSessionVerified) return;
 
-    fetch('/api/bills', {
-      headers: { Authorization: `Bearer ${adminToken}` },
-    })
-      .then((res) => {
-        if (res.status === 401) {
+    hydrateAndSyncBillsWithServer(adminToken, googleToken)
+      .then(({ bills }) => {
+        setShiftBills(bills);
+      })
+      .catch((err: any) => {
+        if (err?.status === 401) {
           handleAdminLogout();
-          return null;
+          return;
         }
-        return res.ok ? res.json() : null;
-      })
-      .then((data) => {
-        if (data?.bills) {
-          setShiftBills(data.bills);
-        }
-      })
-      .catch((err) => console.log('Could not load prior bills:', err));
-  }, [adminToken, isSessionVerified, handleAdminLogout]);
+        console.log('Could not hydrate prior bills:', err);
+      });
+  }, [adminToken, isSessionVerified, googleToken, handleAdminLogout]);
 
   // Handle Admin Login Success
   const handleAdminLoginSuccess = (token: string, username: string) => {
@@ -217,7 +215,8 @@ export default function App() {
       customerName: formatCustomerNameWithJi(newBill.customerName),
     };
     upsertPendingSyncBill(normalizedBill);
-    setShiftBills((prev) => [normalizedBill, ...prev]);
+    const mergedBills = upsertPersistentBill(normalizedBill);
+    setShiftBills(mergedBills);
     setActiveCompletedBill(normalizedBill);
   };
 
@@ -280,6 +279,7 @@ export default function App() {
         sheetsSyncStatus: 'synced',
       };
       upsertPendingSyncBill(syncedBill);
+      const mergedBills = upsertPersistentBill(syncedBill);
 
       setToastNotification(
         `Bill ${bill.orderId || bill.billNumber} saved to Google Sheets!`
@@ -287,9 +287,7 @@ export default function App() {
       if (activeCompletedBill && activeCompletedBill.id === bill.id) {
         setActiveCompletedBill(syncedBill);
       }
-      setShiftBills((prev) =>
-        prev.map((b) => (b.id === bill.id ? syncedBill : b))
-      );
+      setShiftBills(mergedBills);
     } catch (err: any) {
       setToastNotification(`Sync failed: ${err.message}`);
     } finally {

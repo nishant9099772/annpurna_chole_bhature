@@ -145,8 +145,12 @@ export interface AuthUser {
 
 export interface BusinessMetrics {
   totalBills: number;
-  todaySalesRupees: number;
-  todayBillsCount: number;
+  todaySalesRupees: number; // Rolling 24-hour sales (₹)
+  todayBillsCount: number; // Rolling 24-hour order count
+  rolling24hSalesRupees?: number;
+  rolling24hBillsCount?: number;
+  rolling24hWindowStart?: number;
+  rolling24hWindowEnd?: number;
   monthlySalesRupees: number;
   monthlyBillsCount: number;
   totalRevenueRupees: number;
