@@ -1,6 +1,8 @@
 import React from 'react';
 import { X, Receipt, ExternalLink, FileText, Share2, Clock, CheckCircle2, AlertCircle } from 'lucide-react';
 import { Bill } from '../types/billing';
+import { CopyMobileButton } from './CopyMobileButton';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
 
 interface RecentBillsDrawerProps {
   bills: Bill[];
@@ -91,10 +93,16 @@ export const RecentBillsDrawer: React.FC<RecentBillsDrawerProps> = ({
                           </span>
                         )}
                       </div>
-                      <h4 className="font-bold text-slate-900 text-sm mt-1.5">{bill.customerName}</h4>
-                      <p className="text-xs text-slate-500 font-mono">
-                        {bill.countryCode} {bill.mobileNumber}
-                      </p>
+                      <h4 className="font-bold text-slate-900 text-sm mt-1.5">{formatCustomerNameWithJi(bill.customerName)}</h4>
+                      <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                        <span className="text-xs text-slate-500 font-mono">
+                          {bill.countryCode} {bill.mobileNumber}
+                        </span>
+                        <CopyMobileButton
+                          countryCode={bill.countryCode}
+                          mobileNumber={bill.mobileNumber}
+                        />
+                      </div>
                     </div>
 
                     <div className="text-right">

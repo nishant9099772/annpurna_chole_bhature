@@ -27,8 +27,12 @@ import {
   appendBillToSheets,
   createBillingSpreadsheet,
   extractSpreadsheetId,
+  syncBillToGoogleSheets,
+  getSheetsConnectionStatus,
+  fetchBillsFromGoogleSheets,
 } from './src/services/googleSheetsService';
 import { billStorage } from './src/server/storage';
+import { formatCustomerNameWithJi } from './src/utils/customerFormat';
 
 dotenv.config();
 
@@ -36,9 +40,102 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Admin Credentials
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+// Admin Credentials & Cryptographic Signing Secret (Server-side only)
+const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'annpurna123';
+const SESSION_SECRET =
+  process.env.ADMIN_JWT_SECRET ||
+  crypto.createHash('sha256').update(`acb-secret:${ADMIN_USERNAME}:${ADMIN_PASSWORD}`).digest('hex');
+
+// 24-Hour Session Validity (as requested)
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Pre-compute scrypt password hash at server startup for timing-safe verification
+const PASSWORD_SALT = crypto.createHash('sha256').update(`acb-salt:${ADMIN_USERNAME}`).digest('hex').slice(0, 32);
+const AUTHORITATIVE_PASSWORD_HASH = crypto.scryptSync(ADMIN_PASSWORD, PASSWORD_SALT, 64);
+
+function verifyPasswordConstantTime(candidatePassword: string): boolean {
+  if (typeof candidatePassword !== 'string' || !candidatePassword) return false;
+  try {
+    const candidateHash = crypto.scryptSync(candidatePassword, PASSWORD_SALT, 64);
+    return crypto.timingSafeEqual(candidateHash, AUTHORITATIVE_PASSWORD_HASH);
+  } catch {
+    return false;
+  }
+}
+
+function isAuthorizedUserId(candidateUsername: string): boolean {
+  if (typeof candidateUsername !== 'string') return false;
+  const clean = candidateUsername.trim().toLowerCase();
+  if (!clean) return false;
+  // Support configured ADMIN_USERNAME as well as 'admin' alias so existing admin credentials work
+  return clean === ADMIN_USERNAME.toLowerCase() || clean === 'admin';
+}
+
+// Revoked tokens set (for explicit logouts before 24h expiry)
+const revokedTokens = new Set<string>();
+
+interface SignedSessionPayload {
+  sub: string;
+  role: 'admin';
+  iat: number;
+  exp: number;
+  jti: string;
+}
+
+function createSignedSessionToken(username: string): { token: string; expiresAt: number } {
+  const now = Date.now();
+  const expiresAt = now + SESSION_TTL_MS;
+  const payload: SignedSessionPayload = {
+    sub: username,
+    role: 'admin',
+    iat: now,
+    exp: expiresAt,
+    jti: crypto.randomBytes(12).toString('hex'),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const signatureB64 = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  return {
+    token: `acb.${payloadB64}.${signatureB64}`,
+    expiresAt,
+  };
+}
+
+function verifySignedSessionToken(token?: string | null): SignedSessionPayload | null {
+  if (!token || typeof token !== 'string') return null;
+  const clean = token.trim();
+  if (!clean || revokedTokens.has(clean)) return null;
+
+  const parts = clean.split('.');
+  if (parts.length !== 3 || parts[0] !== 'acb') return null;
+
+  const [, payloadB64, signatureB64] = parts;
+  if (!payloadB64 || !signatureB64) return null;
+
+  try {
+    const expectedSig = crypto
+      .createHmac('sha256', SESSION_SECRET)
+      .update(payloadB64)
+      .digest('base64url');
+
+    const sigBuf = Buffer.from(signatureB64, 'utf-8');
+    const expectedBuf = Buffer.from(expectedSig, 'utf-8');
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      return null;
+    }
+
+    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as SignedSessionPayload;
+    if (!decoded || typeof decoded.exp !== 'number' || Date.now() > decoded.exp) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
 
 // Fixed server-side authoritative prices in integer paise
 const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, number> = {
@@ -48,10 +145,20 @@ const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, num
   BHATURE: 2500,       // Rs 25.00
 };
 
-// Admin Sessions
-const activeSessions = new Set<string>();
-const DEFAULT_SESSION_TOKEN = 'annpurna-admin-session-active';
-activeSessions.add(DEFAULT_SESSION_TOKEN);
+// CORS & Preflight Middleware for API routes (ensures Netlify / cross-origin compatibility)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api') || req.url.startsWith('/api')) {
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+  }
+  next();
+});
 
 app.use(express.json());
 
@@ -78,26 +185,17 @@ app.set('strict routing', false);
 // -------------------------------------------------------------
 // Authentication Middleware
 // -------------------------------------------------------------
-function isValidAdminToken(token?: string | null): boolean {
-  if (!token || typeof token !== 'string') return false;
-  const clean = token.trim();
-  if (clean === DEFAULT_SESSION_TOKEN) return true;
-  if (activeSessions.has(clean)) return true;
-  // Session continuity: accept any standard admin tokens starting with acb- or annpurna-
-  if (clean.startsWith('acb-') || clean.startsWith('annpurna-')) return true;
-  return false;
-}
-
 function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized: Admin authentication token required' });
+    res.status(401).json({ error: 'Unauthorized: Please log in with your User ID and Password.' });
     return;
   }
 
   const token = authHeader.split(' ')[1];
-  if (!isValidAdminToken(token)) {
-    res.status(401).json({ error: 'Unauthorized: Invalid or expired admin session' });
+  const session = verifySignedSessionToken(token);
+  if (!session) {
+    res.status(401).json({ error: 'Unauthorized: Invalid or expired session. Please log in again.' });
     return;
   }
 
@@ -128,39 +226,42 @@ app.get('/api/health', (req: Request, res: Response) => {
 /**
  * POST /api/auth/login
  */
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { username, password } = req.body;
+app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) => {
+  const { username, password } = req.body || {};
 
-  if (!username || !password) {
-    res.status(400).json({ error: 'Username and password are required' });
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+    res.status(400).json({ error: 'Both User ID and Password are required.' });
     return;
   }
 
-  if (username.trim() === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    const sessionToken = `acb-${crypto.randomBytes(24).toString('hex')}`;
-    activeSessions.add(sessionToken);
+  if (isAuthorizedUserId(username) && verifyPasswordConstantTime(password)) {
+    const canonicalUser = username.trim();
+    const { token: sessionToken, expiresAt } = createSignedSessionToken(canonicalUser);
 
-    res.json({
+    res.status(200).json({
       success: true,
-      message: 'Admin authentication successful',
+      message: 'Authentication successful',
       token: sessionToken,
-      username: ADMIN_USERNAME,
+      username: canonicalUser,
       role: 'admin',
+      expiresAt,
     });
     return;
   }
 
-  res.status(401).json({ error: 'Invalid admin username or password' });
+  res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });
 });
 
 /**
  * POST /api/auth/logout
  */
-app.post('/api/auth/logout', (req: Request, res: Response) => {
+app.post(['/api/auth/logout', '/api/auth/logout/'], (req: Request, res: Response) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split(' ')[1];
-    activeSessions.delete(token);
+    const token = authHeader.split(' ')[1]?.trim();
+    if (token) {
+      revokedTokens.add(token);
+    }
   }
   res.json({ success: true, message: 'Logged out successfully' });
 });
@@ -168,24 +269,30 @@ app.post('/api/auth/logout', (req: Request, res: Response) => {
 /**
  * GET /api/auth/me
  */
-app.get('/api/auth/me', (req: Request, res: Response) => {
+app.get(['/api/auth/me', '/api/auth/me/'], (req: Request, res: Response) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ isAuthenticated: false });
+    res.status(401).json({ isAuthenticated: false, error: 'Authentication token required' });
     return;
   }
   const token = authHeader.split(' ')[1];
-  if (isValidAdminToken(token)) {
-    res.json({ isAuthenticated: true, username: ADMIN_USERNAME, role: 'admin' });
+  const session = verifySignedSessionToken(token);
+  if (session) {
+    res.json({
+      isAuthenticated: true,
+      username: session.sub,
+      role: session.role,
+      expiresAt: session.exp,
+    });
     return;
   }
-  res.status(401).json({ isAuthenticated: false });
+  res.status(401).json({ isAuthenticated: false, error: 'Invalid or expired session' });
 });
 
 /**
  * GET /api/menu
  */
-app.get('/api/menu', (req: Request, res: Response) => {
+app.get('/api/menu', requireAdminAuth, (req: Request, res: Response) => {
   res.json({
     restaurant: 'Annpurna Chole Bhature',
     currency: 'INR',
@@ -193,11 +300,53 @@ app.get('/api/menu', (req: Request, res: Response) => {
   });
 });
 
+// Throttled background hydration from Google Sheets so stateless Netlify cold starts always load historical bills
+let lastSheetsHydrationTime = 0;
+async function maybeHydrateFromSheets(clientToken?: string | null, customSheetId?: string | null): Promise<number> {
+  const now = Date.now();
+  if (now - lastSheetsHydrationTime < 45_000 && !clientToken) {
+    return 0;
+  }
+  lastSheetsHydrationTime = now;
+  try {
+    const remoteBills = await fetchBillsFromGoogleSheets({
+      clientAccessToken: clientToken,
+      customSpreadsheetId: customSheetId,
+    });
+    if (remoteBills.length > 0) {
+      return billStorage.mergeBillsFromSheets(remoteBills);
+    }
+  } catch (err: any) {
+    console.log('[Sheets Hydration] Skipped:', err.message);
+  }
+  return 0;
+}
+
+/**
+ * GET /api/sheets/status
+ * Returns authoritative server-side + client Google Sheets & WhatsApp Cloud API connection status
+ */
+app.get('/api/sheets/status', requireAdminAuth, async (req: Request, res: Response) => {
+  const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+  const customSheetId = typeof req.query.sheetId === 'string' ? req.query.sheetId : undefined;
+  const status = getSheetsConnectionStatus(clientToken, customSheetId);
+  const whatsappCloudConfigured = Boolean(
+    process.env.WHATSAPP_ACCESS_TOKEN?.trim() && process.env.WHATSAPP_PHONE_NUMBER_ID?.trim()
+  );
+  res.json({
+    ...status,
+    whatsappCloudConfigured,
+    businessWhatsappNumber: '+91 8800896679',
+  });
+});
+
 /**
  * GET /api/metrics
  * Returns authoritative business analytics for dashboard cards
  */
-app.get('/api/metrics', requireAdminAuth, (req: Request, res: Response) => {
+app.get('/api/metrics', requireAdminAuth, async (req: Request, res: Response) => {
+  const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+  await maybeHydrateFromSheets(clientToken);
   const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
   const metrics = billStorage.getMetrics(userId);
   res.json({ metrics });
@@ -206,7 +355,7 @@ app.get('/api/metrics', requireAdminAuth, (req: Request, res: Response) => {
 /**
  * POST /api/bills/calculate
  */
-app.post('/api/bills/calculate', (req: Request, res: Response) => {
+app.post('/api/bills/calculate', requireAdminAuth, (req: Request, res: Response) => {
   const { items, discountPercent = 0, discountRupees } = req.body;
   if (!Array.isArray(items) || items.length === 0) {
     res.status(400).json({ error: 'Items array is required' });
@@ -324,12 +473,13 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
     const validatedOrderType: OrderType = orderType;
     const orderTypeLabel: 'Dine In' | 'Pack' = validatedOrderType === 'PACK' ? 'Pack' : 'Dine In';
 
-    // 2. Validate Customer Name
-    const trimmedName = typeof customerName === 'string' ? customerName.trim() : '';
-    if (!trimmedName || trimmedName.length < 2) {
+    // 2. Validate Customer Name & Automatically Append " Ji"
+    const rawTrimmedName = typeof customerName === 'string' ? customerName.trim() : '';
+    if (!rawTrimmedName || rawTrimmedName.length < 2) {
       res.status(400).json({ error: 'Customer name is required and must be at least 2 characters.' });
       return;
     }
+    const trimmedName = formatCustomerNameWithJi(rawTrimmedName);
 
     // 3. Validate Mobile Number - STRICT 10 DIGIT INDIAN NUMBER
     let rawMobile = typeof mobileNumber === 'string' ? mobileNumber.trim() : '';
@@ -498,67 +648,31 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
       sheetsSyncStatus: 'pending',
     };
 
-    // 9. Sync to Google Sheets if access token is available
-    let sheetsResult: any = null;
-    if (googleAccessToken) {
-      newBill.sheetsSyncStatus = 'syncing';
-      let targetSheetId = extractSpreadsheetId(customSpreadsheetId || process.env.GOOGLE_SHEET_ID);
+    // 9. Sync to Google Sheets (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
+    newBill.sheetsSyncStatus = 'syncing';
+    const syncResult = await syncBillToGoogleSheets(newBill, {
+      clientAccessToken: googleAccessToken,
+      customSpreadsheetId,
+    });
 
-      if (!targetSheetId) {
-        console.log('[Sheets] No Google Sheet ID configured, creating dedicated billing spreadsheet in Drive...');
-        try {
-          const createdSheet = await createBillingSpreadsheet(googleAccessToken);
-          targetSheetId = extractSpreadsheetId(createdSheet.spreadsheetId);
-          newBill.spreadsheetUrl = createdSheet.spreadsheetUrl;
-        } catch (createErr: any) {
-          console.error('[Sheets] Sheet creation failed:', createErr.message);
-        }
-      }
-
-      if (targetSheetId) {
-        newBill.spreadsheetId = targetSheetId;
-        try {
-          sheetsResult = await appendBillToSheets(googleAccessToken, targetSheetId, newBill);
-          if (sheetsResult && sheetsResult.success) {
-            newBill.savedToSheets = true;
-            newBill.sheetsSyncStatus = 'synced';
-            newBill.spreadsheetUrl = sheetsResult.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`;
-            console.log(`[Sheets] Bill ${newBill.orderId} successfully synced to Google Sheet`);
-          } else {
-            throw new Error(sheetsResult?.error || 'Google Sheets append returned unsuccessful status');
-          }
-        } catch (sheetsErr: any) {
-          console.error('[Sheets] Google Sheets sync error:', sheetsErr.message);
-
-          // Auto-recovery attempt: create a fresh sheet in Drive and append
-          try {
-            console.log('[Sheets] Attempting auto-recovery with fresh spreadsheet...');
-            const autoSheet = await createBillingSpreadsheet(googleAccessToken);
-            const autoSheetId = extractSpreadsheetId(autoSheet.spreadsheetId);
-            newBill.spreadsheetId = autoSheetId;
-            newBill.spreadsheetUrl = autoSheet.spreadsheetUrl;
-
-            sheetsResult = await appendBillToSheets(googleAccessToken, autoSheetId, newBill);
-            if (sheetsResult && sheetsResult.success) {
-              newBill.savedToSheets = true;
-              newBill.sheetsSyncStatus = 'synced';
-              newBill.spreadsheetUrl = autoSheet.spreadsheetUrl;
-              console.log(`[Sheets] Auto-recovery succeeded! Logged to: ${autoSheet.spreadsheetUrl}`);
-            }
-          } catch (autoErr: any) {
-            console.error('[Sheets] Auto-recovery sheet creation also failed:', autoErr.message);
-            newBill.savedToSheets = false;
-            newBill.sheetsSyncStatus = 'failed';
-            newBill.sheetsSyncError = sheetsErr.message;
-          }
-        }
-      } else {
-        newBill.sheetsSyncStatus = 'failed';
-        newBill.sheetsSyncError = 'Could not initialize target Google Sheet';
-      }
+    if (syncResult.success) {
+      newBill.savedToSheets = true;
+      newBill.sheetsSyncStatus = 'synced';
+      newBill.sheetsSyncError = undefined;
+      newBill.spreadsheetId = syncResult.spreadsheetId;
+      newBill.spreadsheetUrl = syncResult.spreadsheetUrl;
+      console.log(
+        `[Sheets] Bill ${newBill.orderId} successfully recorded in Google Sheets (${syncResult.mode || 'verified'})`
+      );
     } else {
+      newBill.savedToSheets = false;
       newBill.sheetsSyncStatus = 'failed';
-      newBill.sheetsSyncError = 'Google Sheets not connected (Access token missing)';
+      newBill.sheetsSyncError = syncResult.error || 'Google Sheets synchronization pending';
+      if (syncResult.spreadsheetId) {
+        newBill.spreadsheetId = syncResult.spreadsheetId;
+        newBill.spreadsheetUrl = syncResult.spreadsheetUrl;
+      }
+      console.warn(`[Sheets] Bill ${newBill.orderId} saved locally; Sheets sync pending: ${newBill.sheetsSyncError}`);
     }
 
     // 10. Persist permanently to disk storage
@@ -569,7 +683,7 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
       success: true,
       message: newBill.savedToSheets
         ? 'Bill created and saved to Google Sheets successfully'
-        : 'Bill created and saved to database (Google Sheets sync pending/failed)',
+        : 'Bill saved locally (Pending Google Sheets synchronization)',
       bill: newBill,
       id: newBill.id,
       orderId: newBill.orderId,
@@ -605,42 +719,35 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
 
 /**
  * POST /api/bills/:id/retry-sheets
- * Retries Google Sheets synchronization for an existing bill
+ * Retries Google Sheets synchronization for an existing bill (or client-queued bill)
  */
 app.post('/api/bills/:id/retry-sheets', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { googleAccessToken, customSpreadsheetId } = req.body;
+    const { googleAccessToken, customSpreadsheetId, billPayload } = req.body || {};
 
-    if (!googleAccessToken) {
-      res.status(400).json({ error: 'Google Sheets access token required for synchronization' });
-      return;
+    let bill = billStorage.getBill(id);
+    if (!bill && billPayload && typeof billPayload === 'object' && billPayload.orderId) {
+      bill = await billStorage.saveBill(billPayload as Bill);
     }
 
-    const bill = billStorage.getBill(id);
     if (!bill) {
       res.status(404).json({ error: 'Bill record not found' });
       return;
     }
 
-    let targetSheetId = extractSpreadsheetId(
-      customSpreadsheetId || bill.spreadsheetId || process.env.GOOGLE_SHEET_ID
-    );
-
-    if (!targetSheetId) {
-      const created = await createBillingSpreadsheet(googleAccessToken);
-      targetSheetId = extractSpreadsheetId(created.spreadsheetId);
-    }
-
-    const syncResult = await appendBillToSheets(googleAccessToken, targetSheetId, bill);
+    const syncResult = await syncBillToGoogleSheets(bill, {
+      clientAccessToken: googleAccessToken,
+      customSpreadsheetId: customSpreadsheetId || bill.spreadsheetId,
+    });
 
     if (syncResult && syncResult.success) {
       const updated = await billStorage.updateBill(bill.id, {
         savedToSheets: true,
         sheetsSyncStatus: 'synced',
         sheetsSyncError: undefined,
-        spreadsheetId: targetSheetId,
-        spreadsheetUrl: syncResult.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+        spreadsheetId: syncResult.spreadsheetId,
+        spreadsheetUrl: syncResult.spreadsheetUrl,
       });
 
       res.json({
@@ -651,7 +758,7 @@ app.post('/api/bills/:id/retry-sheets', requireAdminAuth, async (req: Request, r
       return;
     }
 
-    throw new Error(syncResult?.error || 'Append operation did not confirm success');
+    throw new Error(syncResult?.error || 'Google Sheets did not confirm row write');
   } catch (err: any) {
     console.error('Retry sheets error:', err);
     await billStorage.updateBill(req.params.id, {
@@ -666,10 +773,131 @@ app.post('/api/bills/:id/retry-sheets', requireAdminAuth, async (req: Request, r
 });
 
 /**
+ * POST /api/bills/:id/send-whatsapp
+ * Sends the bill receipt via Official WhatsApp Business Cloud API (if WHATSAPP_ACCESS_TOKEN and
+ * WHATSAPP_PHONE_NUMBER_ID are configured in Netlify) or returns honest Click-to-Chat fallback details.
+ */
+app.post('/api/bills/:id/send-whatsapp', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const bill = billStorage.getBill(req.params.id) || (req.body?.bill as Bill | undefined);
+    if (!bill) {
+      res.status(404).json({ error: 'Bill not found' });
+      return;
+    }
+
+    const formattedCustomerName = formatCustomerNameWithJi(bill.customerName);
+    const cleanCountry = (bill.countryCode || '+91').replace(/\D/g, '') || '91';
+    const cleanMobile = (bill.mobileNumber || '').replace(/\D/g, '').slice(-10);
+    if (cleanMobile.length !== 10) {
+      res.status(400).json({ error: 'Valid 10-digit customer mobile number is required for WhatsApp delivery.' });
+      return;
+    }
+
+    const recipientPhone = `${cleanCountry}${cleanMobile}`;
+    const itemsList = bill.items
+      .map((i) => `• ${i.name} x ${i.quantity} (₹${i.unitPriceRupees.toFixed(2)}) = ₹${i.lineTotalRupees.toFixed(2)}`)
+      .join('\n');
+
+    const discountAmt = bill.discountAmountRupees !== undefined ? bill.discountAmountRupees : bill.discountRupees || 0;
+    const discountPct = bill.discountPercent || 0;
+
+    const receiptMessage = `*ANNAPURNA CHOLE BHATURE*
+POS Tax Invoice & Customer Receipt
+Contact / WhatsApp: +91 8800896679
+--------------------------------
+Order ID: *${bill.orderId || bill.id}*
+Bill No: ${bill.billNumber}
+Order Type: ${bill.orderTypeLabel}
+Date & Time: ${bill.dateTimeKolkata}
+Customer: *${formattedCustomerName}*
+Mobile: +${cleanCountry} ${cleanMobile}
+--------------------------------
+*ITEMS PURCHASED:*
+${itemsList}
+--------------------------------
+Subtotal: ₹${bill.subtotalRupees.toFixed(2)}
+Discount (${discountPct}%): -₹${discountAmt.toFixed(2)}
+*FINAL PAYABLE AMOUNT: ₹${bill.grandTotalRupees.toFixed(2)}*
+Payment Method: ${bill.paymentMethod || 'Cash'} (${bill.paymentStatus || 'Paid'})
+--------------------------------
+Thank you for visiting *ANNAPURNA CHOLE BHATURE*! We look forward to serving you again.`;
+
+    const waClickToChatUrl = `https://wa.me/${recipientPhone}?text=${encodeURIComponent(receiptMessage)}`;
+
+    const accessToken = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
+
+    if (!accessToken || !phoneNumberId) {
+      res.status(200).json({
+        success: true,
+        deliveredAutomatically: false,
+        mode: 'click_to_chat',
+        message:
+          'WhatsApp Click-to-Chat link prepared. Please press Send inside WhatsApp to complete delivery to the customer.',
+        waUrl: waClickToChatUrl,
+        recipientPhone: `+${cleanCountry} ${cleanMobile}`,
+        businessWhatsappNumber: '+91 8800896679',
+      });
+      return;
+    }
+
+    // Official Meta WhatsApp Business Cloud API request
+    const graphUrl = `https://graph.facebook.com/v20.0/${encodeURIComponent(phoneNumberId)}/messages`;
+    const cloudRes = await fetch(graphUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'text',
+        text: {
+          preview_url: false,
+          body: receiptMessage,
+        },
+      }),
+    });
+
+    const cloudData = await cloudRes.json();
+    if (!cloudRes.ok) {
+      const apiErr = cloudData?.error?.message || `HTTP ${cloudRes.status}`;
+      res.status(502).json({
+        success: false,
+        deliveredAutomatically: false,
+        mode: 'cloud_api_failed',
+        error: `WhatsApp Cloud API error: ${apiErr}`,
+        waUrl: waClickToChatUrl,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      deliveredAutomatically: true,
+      mode: 'cloud_api',
+      messageId: cloudData?.messages?.[0]?.id || undefined,
+      message: `Bill receipt automatically sent via WhatsApp Business API to +${cleanCountry} ${cleanMobile}.`,
+      waUrl: waClickToChatUrl,
+    });
+  } catch (err: any) {
+    console.error('WhatsApp send error:', err);
+    res.status(500).json({ error: err.message || 'Failed to process WhatsApp delivery' });
+  }
+});
+
+/**
  * GET /api/bills/:id
  */
-app.get('/api/bills/:id', requireAdminAuth, (req: Request, res: Response) => {
-  const bill = billStorage.getBill(req.params.id);
+app.get('/api/bills/:id', requireAdminAuth, async (req: Request, res: Response) => {
+  let bill = billStorage.getBill(req.params.id);
+  if (!bill) {
+    const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+    await maybeHydrateFromSheets(clientToken);
+    bill = billStorage.getBill(req.params.id);
+  }
   if (!bill) {
     res.status(404).json({ error: 'Bill not found' });
     return;
@@ -681,7 +909,10 @@ app.get('/api/bills/:id', requireAdminAuth, (req: Request, res: Response) => {
  * GET /api/bills
  * Lists ALL historical bills with search (by Order ID, Customer, Phone), filters, and pagination
  */
-app.get(['/api/bills', '/api/bills/'], requireAdminAuth, (req: Request, res: Response) => {
+app.get(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, res: Response) => {
+  const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+  await maybeHydrateFromSheets(clientToken);
+
   const {
     search,
     orderType,
@@ -728,7 +959,7 @@ app.get('/api/bills/:id/pdf', requireAdminAuth, async (req: Request, res: Respon
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
-      `inline; filename="Annpurna-Bill-${bill.orderId || bill.billNumber}.pdf"`
+      `inline; filename="Annapurna-Bill-${bill.orderId || bill.billNumber}.pdf"`
     );
     res.send(Buffer.from(pdfBytes));
   } catch (error: any) {
@@ -742,7 +973,10 @@ app.get('/api/bills/:id/pdf', requireAdminAuth, async (req: Request, res: Respon
  * Returns authoritative monthly breakdown, daily revenue, best sales day,
  * and monthly metrics for any requested year and month (1-12).
  */
-app.get('/api/reports/monthly', requireAdminAuth, (req: Request, res: Response) => {
+app.get('/api/reports/monthly', requireAdminAuth, async (req: Request, res: Response) => {
+  const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
+  await maybeHydrateFromSheets(clientToken);
+
   const now = new Date();
   const kolkataFormatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
@@ -764,15 +998,29 @@ app.get('/api/reports/monthly', requireAdminAuth, (req: Request, res: Response) 
 
 /**
  * POST /api/bills/batch-sync-sheets
- * Automatically synchronizes all pending and failed bills to Google Sheets in bulk.
+ * Automatically synchronizes all pending and failed bills to Google Sheets in bulk,
+ * and also pulls any remote bills from Google Sheets into local storage.
  */
 app.post('/api/bills/batch-sync-sheets', requireAdminAuth, async (req: Request, res: Response) => {
   try {
-    const { googleAccessToken, customSpreadsheetId } = req.body;
-    if (!googleAccessToken) {
-      res.status(400).json({ error: 'Google Sheets access token required for batch synchronization' });
+    const { googleAccessToken, customSpreadsheetId, clientPendingBills } = req.body || {};
+
+    // Merge any client-side pending bills from localStorage first
+    if (Array.isArray(clientPendingBills) && clientPendingBills.length > 0) {
+      billStorage.mergeBillsFromSheets(clientPendingBills);
+    }
+
+    const sheetsStatus = getSheetsConnectionStatus(googleAccessToken, customSpreadsheetId);
+    if (!sheetsStatus.configured) {
+      res.status(400).json({
+        error:
+          'Google Sheets is not connected. Connect your Google Account or configure GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, and GOOGLE_SHEET_ID in Netlify.',
+      });
       return;
     }
+
+    // Pull existing remote bills from Google Sheets first so we don't duplicate
+    await maybeHydrateFromSheets(googleAccessToken, customSpreadsheetId);
 
     const { bills } = billStorage.listBills({ limit: 500 });
     const pendingBills = bills.filter((b) => !b.savedToSheets || b.sheetsSyncStatus !== 'synced');
@@ -780,21 +1028,19 @@ app.post('/api/bills/batch-sync-sheets', requireAdminAuth, async (req: Request, 
     if (pendingBills.length === 0) {
       res.json({
         success: true,
-        message: 'All bills are already synchronized with Google Sheets.',
+        message: 'All bills are synchronized with Google Sheets.',
         syncedCount: 0,
         failedCount: 0,
+        spreadsheetId: sheetsStatus.spreadsheetId,
+        spreadsheetUrl: sheetsStatus.spreadsheetUrl,
       });
       return;
     }
 
-    let targetSheetId = extractSpreadsheetId(customSpreadsheetId || process.env.GOOGLE_SHEET_ID);
-    if (!targetSheetId) {
-      const created = await createBillingSpreadsheet(googleAccessToken);
-      targetSheetId = extractSpreadsheetId(created.spreadsheetId);
-    }
-
     let syncedCount = 0;
     let failedCount = 0;
+    let finalSheetId = sheetsStatus.spreadsheetId;
+    let finalSheetUrl = sheetsStatus.spreadsheetUrl;
     const errors: string[] = [];
 
     // Sync in chronological order
@@ -802,19 +1048,29 @@ app.post('/api/bills/batch-sync-sheets', requireAdminAuth, async (req: Request, 
 
     for (const bill of orderedPending) {
       try {
-        const syncResult = await appendBillToSheets(googleAccessToken, targetSheetId, bill);
+        const syncResult = await syncBillToGoogleSheets(bill, {
+          clientAccessToken: googleAccessToken,
+          customSpreadsheetId: finalSheetId || customSpreadsheetId,
+        });
         if (syncResult && syncResult.success) {
+          finalSheetId = syncResult.spreadsheetId || finalSheetId;
+          finalSheetUrl = syncResult.spreadsheetUrl || finalSheetUrl;
           await billStorage.updateBill(bill.id, {
             savedToSheets: true,
             sheetsSyncStatus: 'synced',
             sheetsSyncError: undefined,
-            spreadsheetId: targetSheetId,
-            spreadsheetUrl: syncResult.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+            spreadsheetId: finalSheetId,
+            spreadsheetUrl: finalSheetUrl,
           });
           syncedCount++;
         } else {
           failedCount++;
-          errors.push(`Bill ${bill.orderId}: ${syncResult?.error || 'Append returned false'}`);
+          const errMsg = syncResult?.error || 'Append returned unsuccessful status';
+          errors.push(`Bill ${bill.orderId}: ${errMsg}`);
+          await billStorage.updateBill(bill.id, {
+            sheetsSyncStatus: 'failed',
+            sheetsSyncError: errMsg,
+          });
         }
       } catch (err: any) {
         failedCount++;
@@ -827,13 +1083,13 @@ app.post('/api/bills/batch-sync-sheets', requireAdminAuth, async (req: Request, 
     }
 
     res.json({
-      success: syncedCount > 0,
+      success: syncedCount > 0 || failedCount === 0,
       message: `Batch sync complete: ${syncedCount} synced, ${failedCount} failed.`,
       syncedCount,
       failedCount,
       errors: errors.slice(0, 10),
-      spreadsheetId: targetSheetId,
-      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+      spreadsheetId: finalSheetId,
+      spreadsheetUrl: finalSheetUrl,
     });
   } catch (error: any) {
     console.error('Batch sync error:', error);
@@ -913,4 +1169,15 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only start HTTP listener when server.ts is executed directly (never when imported by Netlify Functions)
+const isDirectEntry =
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (isDirectEntry && !process.env.NETLIFY && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  startServer();
+}
+
+export { app };
+export default app;
+

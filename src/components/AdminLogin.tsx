@@ -1,26 +1,37 @@
 import React, { useState } from 'react';
-import { Lock, UtensilsCrossed, ArrowRight, ShieldCheck, AlertCircle } from 'lucide-react';
+import { Lock, User, UtensilsCrossed, ArrowRight, ShieldCheck, AlertCircle, Eye, EyeOff } from 'lucide-react';
 
 interface AdminLoginProps {
   onLoginSuccess: (token: string, username: string) => void;
 }
 
 export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    const trimmedUser = username.trim();
+    if (!trimmedUser || !password) {
+      setError('Please enter both your User ID and Password.');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
       const response = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ username: trimmedUser, password }),
       });
 
       const rawContentType = (response.headers.get('content-type') || '').toLowerCase();
@@ -36,16 +47,18 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
       }
 
       if (!response.ok) {
-        throw new Error(data?.error || `Authentication failed (HTTP ${response.status}). Please check credentials.`);
+        throw new Error(
+          data?.error || `Authentication failed (HTTP ${response.status}). Please verify your User ID and Password.`
+        );
       }
 
       if (!data || !data.token) {
-        throw new Error(`Invalid response received from server (HTTP ${response.status}).`);
+        throw new Error(`Invalid authentication response received from server (HTTP ${response.status}).`);
       }
 
-      onLoginSuccess(data.token, data.username);
+      onLoginSuccess(data.token, data.username || trimmedUser);
     } catch (err: any) {
-      setError(err.message || 'Login failed. Please check backend credentials.');
+      setError(err.message || 'Login failed. Please verify your User ID and Password.');
     } finally {
       setIsLoading(false);
     }
@@ -66,10 +79,10 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
             Annpurna Chole Bhature
           </h1>
           <p className="text-sm font-medium text-amber-800/80 mt-1">
-            Admin Billing System
+            Billing &amp; Management Portal
           </p>
-          <div className="inline-flex items-center gap-1.5 mt-3 px-3 py-1 bg-amber-50 border border-amber-200/70 rounded-full text-xs font-semibold text-amber-900">
-            <ShieldCheck className="w-3.5 h-3.5 text-amber-600" /> Authorized Admin Access Only
+          <div className="inline-flex items-center gap-1.5 mt-3 px-3 py-1 bg-amber-50 border border-amber-200/70 rounded-lg text-xs font-semibold text-amber-900">
+            <ShieldCheck className="w-3.5 h-3.5 text-amber-600" /> Protected Access — Sign In Required
           </div>
         </div>
 
@@ -82,39 +95,58 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         )}
 
         {/* Login Form */}
-        <form onSubmit={handleSubmit} className="space-y-5">
+        <form onSubmit={handleSubmit} className="space-y-5" autoComplete="on">
           <div>
-            <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
-              Admin Username
+            <label
+              htmlFor="login-userid"
+              className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5"
+            >
+              User ID <span className="text-red-500">*</span>
             </label>
-            <input
-              type="text"
-              required
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="e.g. admin"
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-slate-900 font-medium transition"
-            />
+            <div className="relative">
+              <User className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                id="login-userid"
+                type="text"
+                required
+                autoFocus
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Enter your User ID"
+                className="w-full pl-10 pr-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-slate-900 font-medium transition"
+              />
+            </div>
           </div>
 
           <div>
-            <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
-              Admin Password
+            <label
+              htmlFor="login-password"
+              className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5"
+            >
+              Password <span className="text-red-500">*</span>
             </label>
             <div className="relative">
+              <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
-                type="password"
+                id="login-password"
+                type={showPassword ? 'text' : 'password'}
                 required
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter admin password"
-                className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-slate-900 font-medium transition"
+                placeholder="Enter your password"
+                className="w-full pl-10 pr-10 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-slate-900 font-medium transition"
               />
-              <Lock className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <button
+                type="button"
+                onClick={() => setShowPassword((prev) => !prev)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
-            <p className="text-[11px] text-slate-500 mt-1">
-              Configured via backend environment variable <code className="text-amber-800 font-mono">ADMIN_PASSWORD</code> (default: <code className="text-amber-800 font-mono">annpurna123</code>).
-            </p>
           </div>
 
           <button
@@ -123,20 +155,19 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
             className="w-full mt-2 py-3.5 px-5 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white font-bold rounded-xl shadow-md shadow-amber-600/25 flex items-center justify-center gap-2 transition active:scale-[0.99] disabled:opacity-60 cursor-pointer"
           >
             {isLoading ? (
-              <span>Verifying Admin Access...</span>
+              <span>Verifying Credentials...</span>
             ) : (
               <>
-                <span>Enter Billing Counter</span>
+                <span>Sign In to Billing Counter</span>
                 <ArrowRight className="w-4 h-4" />
               </>
             )}
           </button>
         </form>
 
-        {/* Quick hint badge */}
-        <div className="mt-7 pt-5 border-t border-slate-100 text-center">
-          <p className="text-xs text-slate-500">
-            For local evaluation, default credentials are <span className="font-semibold text-slate-700">admin</span> / <span className="font-semibold text-slate-700">annpurna123</span>
+        <div className="mt-6 pt-5 border-t border-slate-100 text-center">
+          <p className="text-xs text-slate-400">
+            Session remains active for 24 hours • Server-side encrypted verification
           </p>
         </div>
       </div>

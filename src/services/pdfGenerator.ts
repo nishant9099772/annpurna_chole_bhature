@@ -1,283 +1,436 @@
 /**
- * Vector PDF Receipt Generator for Annpurna Chole Bhature
- * Generates crisp, high-fidelity customer receipts using pdf-lib.
- * Includes Order ID, Bill Number, Order Type, Item breakdown, Subtotal, Discount, Grand Total, and Payment Method.
+ * Vector PDF POS Receipt Generator for ANNAPURNA CHOLE BHATURE
+ * Generates crisp, high-fidelity restaurant POS receipts suitable for 80mm thermal rolls,
+ * A4 printing, PDF download, and WhatsApp sharing.
+ *
+ * Includes:
+ * - Restaurant branding: ANNAPURNA CHOLE BHATURE & Contact +91 8800896679
+ * - Unique Order ID & Bill Number
+ * - Bill Date & Time (IST)
+ * - Customer Name (with " Ji") & Customer Mobile Number
+ * - Items purchased, Quantity, Individual item price, Line total
+ * - Subtotal, Discount Percentage (%), Discount Amount, Final Payable Amount
+ * - Payment Method & Thank-You Message
+ * - Zero text clipping or column overlap
  */
 
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, PDFFont } from 'pdf-lib';
 import { Bill } from '../types/billing';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
+
+/**
+ * Safely truncates text to fit within maxWidth points so columns never overlap.
+ */
+function fitTextToWidth(text: string, font: PDFFont, fontSize: number, maxWidth: number): string {
+  const clean = (text || '').replace(/[^\x20-\x7E]/g, '').trim();
+  if (font.widthOfTextAtSize(clean, fontSize) <= maxWidth) {
+    return clean;
+  }
+  let truncated = clean;
+  while (truncated.length > 3 && font.widthOfTextAtSize(`${truncated}...`, fontSize) > maxWidth) {
+    truncated = truncated.slice(0, -1);
+  }
+  return `${truncated}...`;
+}
 
 export async function generateBillPdfBytes(bill: Bill): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.create();
+  const formattedCustomerName = formatCustomerNameWithJi(bill.customerName);
 
-  // Receipt dimensions: 400pt wide
-  const baseHeight = 580;
-  const itemHeight = Math.max(bill.items.length * 28, 60);
-  const totalHeight = baseHeight + itemHeight;
-  const pageWidth = 400;
+  // Standard POS / A4-friendly receipt width (420pt = ~148mm, scales cleanly to 80mm thermal & A4)
+  const pageWidth = 420;
+  const itemRowHeight = 24;
+  const baseHeight = 610;
+  const itemsBlockHeight = Math.max(bill.items.length * itemRowHeight, 48);
+  const totalHeight = baseHeight + itemsBlockHeight;
 
   const page = pdfDoc.addPage([pageWidth, totalHeight]);
   const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const fontMono = await pdfDoc.embedFont(StandardFonts.CourierBold);
 
-  // Professional color palette: Classic Navy / Royal Blue accent
-  const primaryBlue = rgb(0.12, 0.35, 0.85); // Professional SaaS Blue #1E59D9
-  const darkCharcoal = rgb(0.12, 0.15, 0.18);
-  const mutedGray = rgb(0.45, 0.48, 0.52);
-  const lineGray = rgb(0.88, 0.88, 0.90);
-  const lightBg = rgb(0.97, 0.98, 1.0);
-  const highlightGreen = rgb(0.08, 0.58, 0.28);
-  const packBadgeColor = rgb(0.15, 0.45, 0.88);
+  // Palette
+  const brandNavy = rgb(0.09, 0.25, 0.68);      // Deep Royal POS Blue
+  const darkInk = rgb(0.10, 0.12, 0.16);        // Primary text
+  const slateMuted = rgb(0.42, 0.46, 0.52);     // Labels
+  const borderGray = rgb(0.84, 0.86, 0.90);     // Dividers
+  const headerTint = rgb(0.96, 0.98, 1.0);      // Header fill
+  const zebraTint = rgb(0.98, 0.985, 0.995);    // Alternating row fill
+  const emeraldPaid = rgb(0.05, 0.52, 0.26);    // Final payable & paid status
+  const discountRed = rgb(0.78, 0.16, 0.18);    // Discount highlight
 
-  let y = totalHeight - 35;
+  const margin = 24;
+  const contentWidth = pageWidth - margin * 2;
+  let y = totalHeight;
 
-  // Background header band
+  // 1. Top Accent Bar & Branding Header
   page.drawRectangle({
     x: 0,
-    y: totalHeight - 90,
+    y: totalHeight - 104,
     width: pageWidth,
-    height: 90,
-    color: lightBg,
+    height: 104,
+    color: headerTint,
   });
 
-  // Top accent line
   page.drawRectangle({
     x: 0,
-    y: totalHeight - 6,
+    y: totalHeight - 7,
     width: pageWidth,
-    height: 6,
-    color: primaryBlue,
+    height: 7,
+    color: brandNavy,
   });
 
-  // Brand Name
-  const brandTitle = 'ANNPURNA CHOLE BHATURE';
-  const brandWidth = fontBold.widthOfTextAtSize(brandTitle, 17);
+  y = totalHeight - 32;
+  const brandTitle = 'ANNAPURNA CHOLE BHATURE';
+  const brandW = fontBold.widthOfTextAtSize(brandTitle, 17);
   page.drawText(brandTitle, {
-    x: (pageWidth - brandWidth) / 2,
+    x: (pageWidth - brandW) / 2,
     y,
     size: 17,
     font: fontBold,
-    color: primaryBlue,
+    color: brandNavy,
   });
 
-  y -= 18;
-  const subTitle = 'Customer Bill & Tax Invoice Receipt';
-  const subWidth = fontRegular.widthOfTextAtSize(subTitle, 9.5);
-  page.drawText(subTitle, {
-    x: (pageWidth - subWidth) / 2,
+  y -= 16;
+  const tagline = 'Authentic North Indian Cuisine  |  POS Tax Invoice & Receipt';
+  const taglineW = fontRegular.widthOfTextAtSize(tagline, 8.5);
+  page.drawText(tagline, {
+    x: (pageWidth - taglineW) / 2,
     y,
-    size: 9.5,
+    size: 8.5,
     font: fontRegular,
-    color: mutedGray,
+    color: slateMuted,
   });
-
-  y -= 25;
-
-  // Horizontal divider
-  page.drawLine({
-    start: { x: 20, y },
-    end: { x: pageWidth - 20, y },
-    thickness: 1,
-    color: lineGray,
-  });
-
-  y -= 18;
-
-  // Bill Meta Card (Order ID, Bill No, Date, Order Type, Customer, Payment)
-  page.drawRectangle({
-    x: 20,
-    y: y - 76,
-    width: pageWidth - 40,
-    height: 86,
-    borderColor: lineGray,
-    borderWidth: 1,
-    color: rgb(1, 1, 1),
-  });
-
-  // Left col: Order ID & Bill number
-  page.drawText('ORDER ID', { x: 30, y: y - 6, size: 7.5, font: fontBold, color: mutedGray });
-  page.drawText(bill.orderId || bill.id, { x: 30, y: y - 18, size: 9, font: fontBold, color: primaryBlue });
-
-  page.drawText('BILL NUMBER', { x: 30, y: y - 32, size: 7.5, font: fontBold, color: mutedGray });
-  page.drawText(bill.billNumber, { x: 30, y: y - 44, size: 9, font: fontBold, color: darkCharcoal });
-
-  page.drawText('DATE & TIME (IST)', { x: 30, y: y - 58, size: 7.5, font: fontRegular, color: mutedGray });
-  page.drawText(bill.dateTimeKolkata, { x: 30, y: y - 68, size: 7.5, font: fontRegular, color: darkCharcoal });
-
-  // Center col: Order Type Badge & Payment Method
-  const centerColX = pageWidth / 2 - 25;
-  page.drawText('ORDER TYPE', { x: centerColX, y: y - 6, size: 7.5, font: fontBold, color: mutedGray });
-  const isPack = bill.orderType === 'PACK';
-  const orderTypeStr = isPack ? 'PACK (TAKEAWAY)' : 'DINE IN';
-  page.drawText(orderTypeStr, {
-    x: centerColX,
-    y: y - 18,
-    size: 9,
-    font: fontBold,
-    color: isPack ? packBadgeColor : highlightGreen,
-  });
-
-  page.drawText('PAYMENT METHOD', { x: centerColX, y: y - 32, size: 7.5, font: fontBold, color: mutedGray });
-  page.drawText(bill.paymentMethod || 'Cash', { x: centerColX, y: y - 44, size: 9, font: fontBold, color: darkCharcoal });
-
-  // Right col: Customer Info
-  const rightColX = pageWidth / 2 + 75;
-  page.drawText('CUSTOMER NAME', { x: rightColX, y: y - 6, size: 7.5, font: fontBold, color: mutedGray });
-  page.drawText(bill.customerName, { x: rightColX, y: y - 18, size: 9, font: fontBold, color: darkCharcoal });
-
-  page.drawText('MOBILE NUMBER', { x: rightColX, y: y - 32, size: 7.5, font: fontRegular, color: mutedGray });
-  const fullPhone = `${bill.countryCode} ${bill.mobileNumber}`;
-  page.drawText(fullPhone, { x: rightColX, y: y - 44, size: 8.5, font: fontRegular, color: darkCharcoal });
-
-  y -= 98;
-
-  // Table Header
-  const colX = {
-    item: 24,
-    qty: 230,
-    rate: 290,
-    total: pageWidth - 28,
-  };
-
-  page.drawRectangle({
-    x: 20,
-    y: y - 6,
-    width: pageWidth - 40,
-    height: 22,
-    color: rgb(0.95, 0.96, 0.98),
-  });
-
-  page.drawText('ITEM DESCRIPTION', { x: colX.item, y: y, size: 8.5, font: fontBold, color: darkCharcoal });
-  page.drawText('QTY', { x: colX.qty - 10, y: y, size: 8.5, font: fontBold, color: darkCharcoal });
-  page.drawText('RATE', { x: colX.rate - 10, y: y, size: 8.5, font: fontBold, color: darkCharcoal });
-  const totalHeaderWidth = fontBold.widthOfTextAtSize('AMOUNT', 8.5);
-  page.drawText('AMOUNT', { x: colX.total - totalHeaderWidth, y: y, size: 8.5, font: fontBold, color: darkCharcoal });
 
   y -= 14;
+  const contactLine = 'Contact / WhatsApp: +91 8800896679';
+  const contactW = fontBold.widthOfTextAtSize(contactLine, 9);
+  page.drawText(contactLine, {
+    x: (pageWidth - contactW) / 2,
+    y,
+    size: 9,
+    font: fontBold,
+    color: darkInk,
+  });
 
-  // Table Rows
+  y -= 20;
+  // Order Type Pill Banner
+  const isPack = bill.orderType === 'PACK';
+  const orderBadgeText = isPack ? 'ORDER TYPE: PACK (TAKEAWAY)' : 'ORDER TYPE: DINE IN';
+  const badgeW = fontBold.widthOfTextAtSize(orderBadgeText, 8) + 20;
+  page.drawRectangle({
+    x: (pageWidth - badgeW) / 2,
+    y: y - 4,
+    width: badgeW,
+    height: 16,
+    color: isPack ? rgb(0.90, 0.94, 1.0) : rgb(0.90, 0.98, 0.93),
+    borderColor: isPack ? brandNavy : emeraldPaid,
+    borderWidth: 0.8,
+  });
+  page.drawText(orderBadgeText, {
+    x: (pageWidth - badgeW) / 2 + 10,
+    y: y + 1,
+    size: 8,
+    font: fontBold,
+    color: isPack ? brandNavy : emeraldPaid,
+  });
+
+  y = totalHeight - 116;
+
+  // 2. Clean 2-Column Metadata Box (Zero Overlapping Guarantee)
+  const metaBoxHeight = 104;
+  page.drawRectangle({
+    x: margin,
+    y: y - metaBoxHeight,
+    width: contentWidth,
+    height: metaBoxHeight,
+    color: rgb(1, 1, 1),
+    borderColor: borderGray,
+    borderWidth: 1,
+  });
+
+  // Vertical center divider inside metadata box
+  const midX = pageWidth / 2;
+  page.drawLine({
+    start: { x: midX, y: y - 8 },
+    end: { x: midX, y: y - metaBoxHeight + 8 },
+    thickness: 0.75,
+    color: borderGray,
+  });
+
+  const leftColX = margin + 12;
+  const rightColX = midX + 12;
+  const colMaxWidth = contentWidth / 2 - 20;
+
+  // Left Column: Order ID, Bill Number, Date & Time
+  page.drawText('UNIQUE ORDER ID', { x: leftColX, y: y - 16, size: 7, font: fontBold, color: slateMuted });
+  page.drawText(
+    fitTextToWidth(bill.orderId || bill.id, fontMono, 9.5, colMaxWidth),
+    { x: leftColX, y: y - 28, size: 9.5, font: fontMono, color: brandNavy }
+  );
+
+  page.drawText('BILL NUMBER', { x: leftColX, y: y - 46, size: 7, font: fontBold, color: slateMuted });
+  page.drawText(
+    fitTextToWidth(bill.billNumber, fontBold, 9, colMaxWidth),
+    { x: leftColX, y: y - 58, size: 9, font: fontBold, color: darkInk }
+  );
+
+  page.drawText('BILL DATE & TIME (IST)', { x: leftColX, y: y - 76, size: 7, font: fontBold, color: slateMuted });
+  const dateTimeStr =
+    bill.billDate && bill.billTime
+      ? `${bill.billDate}  ${bill.billTime} IST`
+      : bill.dateTimeKolkata;
+  page.drawText(
+    fitTextToWidth(dateTimeStr, fontRegular, 8.5, colMaxWidth),
+    { x: leftColX, y: y - 88, size: 8.5, font: fontRegular, color: darkInk }
+  );
+
+  // Right Column: Customer Name, Mobile Number, Payment Method
+  page.drawText('CUSTOMER NAME', { x: rightColX, y: y - 16, size: 7, font: fontBold, color: slateMuted });
+  page.drawText(
+    fitTextToWidth(formattedCustomerName, fontBold, 9.5, colMaxWidth),
+    { x: rightColX, y: y - 28, size: 9.5, font: fontBold, color: darkInk }
+  );
+
+  page.drawText('CUSTOMER MOBILE', { x: rightColX, y: y - 46, size: 7, font: fontBold, color: slateMuted });
+  const fullMobile = `${bill.countryCode || '+91'} ${bill.mobileNumber}`;
+  page.drawText(
+    fitTextToWidth(fullMobile, fontMono, 9, colMaxWidth),
+    { x: rightColX, y: y - 58, size: 9, font: fontMono, color: darkInk }
+  );
+
+  page.drawText('PAYMENT METHOD & STATUS', { x: rightColX, y: y - 76, size: 7, font: fontBold, color: slateMuted });
+  const paymentStr = `${bill.paymentMethod || 'Cash'}  •  ${(bill.paymentStatus || 'Paid').toUpperCase()}`;
+  page.drawText(
+    fitTextToWidth(paymentStr, fontBold, 8.5, colMaxWidth),
+    { x: rightColX, y: y - 88, size: 8.5, font: fontBold, color: emeraldPaid }
+  );
+
+  y -= metaBoxHeight + 16;
+
+  // 3. Itemized POS Table
+  const col = {
+    item: margin + 10,
+    qtyCenter: margin + 205,
+    rateRight: margin + 285,
+    amountRight: pageWidth - margin - 10,
+  };
+
+  // Table Header Bar
+  page.drawRectangle({
+    x: margin,
+    y: y - 20,
+    width: contentWidth,
+    height: 22,
+    color: brandNavy,
+  });
+
+  const thY = y - 13;
+  page.drawText('ITEM PURCHASED', { x: col.item, y: thY, size: 8, font: fontBold, color: rgb(1, 1, 1) });
+  const qtyHdrW = fontBold.widthOfTextAtSize('QTY', 8);
+  page.drawText('QTY', { x: col.qtyCenter - qtyHdrW / 2, y: thY, size: 8, font: fontBold, color: rgb(1, 1, 1) });
+  const rateHdrW = fontBold.widthOfTextAtSize('UNIT PRICE', 8);
+  page.drawText('UNIT PRICE', { x: col.rateRight - rateHdrW, y: thY, size: 8, font: fontBold, color: rgb(1, 1, 1) });
+  const amtHdrW = fontBold.widthOfTextAtSize('AMOUNT', 8);
+  page.drawText('AMOUNT', { x: col.amountRight - amtHdrW, y: thY, size: 8, font: fontBold, color: rgb(1, 1, 1) });
+
+  y -= 20;
+
   bill.items.forEach((item, index) => {
-    y -= 22;
+    const rowTop = y;
+    const rowBottom = y - itemRowHeight;
 
     if (index % 2 === 1) {
       page.drawRectangle({
-        x: 20,
-        y: y - 4,
-        width: pageWidth - 40,
-        height: 20,
-        color: rgb(0.985, 0.985, 0.99),
+        x: margin,
+        y: rowBottom,
+        width: contentWidth,
+        height: itemRowHeight,
+        color: zebraTint,
       });
     }
 
-    // Item name
-    page.drawText(item.name, { x: colX.item, y: y + 2, size: 9, font: fontBold, color: darkCharcoal });
+    const textY = rowBottom + 8;
+    const safeItemName = fitTextToWidth(`${index + 1}. ${item.name}`, fontBold, 9, 175);
+    page.drawText(safeItemName, { x: col.item, y: textY, size: 9, font: fontBold, color: darkInk });
 
-    // Quantity
-    page.drawText(`${item.quantity}`, { x: colX.qty - 5, y: y + 2, size: 9, font: fontRegular, color: darkCharcoal });
+    const qtyStr = String(item.quantity);
+    const qtyW = fontBold.widthOfTextAtSize(qtyStr, 9);
+    page.drawText(qtyStr, { x: col.qtyCenter - qtyW / 2, y: textY, size: 9, font: fontBold, color: darkInk });
 
-    // Rate
-    const rateText = `Rs. ${item.unitPriceRupees.toFixed(2)}`;
-    page.drawText(rateText, { x: colX.rate - 10, y: y + 2, size: 9, font: fontRegular, color: darkCharcoal });
+    const rateStr = `Rs. ${item.unitPriceRupees.toFixed(2)}`;
+    const rateW = fontRegular.widthOfTextAtSize(rateStr, 8.5);
+    page.drawText(rateStr, { x: col.rateRight - rateW, y: textY, size: 8.5, font: fontRegular, color: darkInk });
 
-    // Line Total
-    const amountText = `Rs. ${item.lineTotalRupees.toFixed(2)}`;
-    const amtWidth = fontBold.widthOfTextAtSize(amountText, 9.5);
-    page.drawText(amountText, { x: colX.total - amtWidth, y: y + 2, size: 9.5, font: fontBold, color: darkCharcoal });
+    const lineStr = `Rs. ${item.lineTotalRupees.toFixed(2)}`;
+    const lineW = fontBold.widthOfTextAtSize(lineStr, 9);
+    page.drawText(lineStr, { x: col.amountRight - lineW, y: textY, size: 9, font: fontBold, color: darkInk });
 
-    // Row divider
     page.drawLine({
-      start: { x: 20, y: y - 3 },
-      end: { x: pageWidth - 20, y: y - 3 },
+      start: { x: margin, y: rowBottom },
+      end: { x: pageWidth - margin, y: rowBottom },
       thickness: 0.5,
-      color: rgb(0.92, 0.92, 0.94),
+      color: borderGray,
     });
+
+    y = rowBottom;
   });
 
-  y -= 25;
-
-  // Totals breakdown: Subtotal, Discount, Grand Total
-  const hasDiscount = (bill.discountRupees || 0) > 0;
-  const totalsBoxHeight = hasDiscount ? 66 : 50;
-
+  // Outer border around items table
+  const tableTotalHeight = 22 + bill.items.length * itemRowHeight;
   page.drawRectangle({
-    x: pageWidth / 2 - 15,
-    y: y - totalsBoxHeight,
-    width: pageWidth / 2 - 5,
-    height: totalsBoxHeight + 8,
-    color: lightBg,
-    borderColor: primaryBlue,
+    x: margin,
+    y,
+    width: contentWidth,
+    height: tableTotalHeight,
+    borderColor: borderGray,
+    borderWidth: 1,
+  });
+
+  y -= 16;
+
+  // 4. Financial Summary Box (Always displays Subtotal, Discount %, Discount Amount, Final Payable Amount)
+  const summaryBoxHeight = 112;
+  page.drawRectangle({
+    x: margin,
+    y: y - summaryBoxHeight,
+    width: contentWidth,
+    height: summaryBoxHeight,
+    color: headerTint,
+    borderColor: brandNavy,
     borderWidth: 1.2,
   });
 
-  let currentTotalsY = y - 4;
+  const sumLeftX = margin + 14;
+  const sumRightX = pageWidth - margin - 14;
+  let sumY = y - 18;
 
-  if (hasDiscount) {
-    // Subtotal
-    page.drawText('Subtotal:', { x: pageWidth / 2 - 5, y: currentTotalsY, size: 8.5, font: fontRegular, color: mutedGray });
-    const subStr = `Rs. ${bill.subtotalRupees.toFixed(2)}`;
-    const subW = fontRegular.widthOfTextAtSize(subStr, 8.5);
-    page.drawText(subStr, { x: pageWidth - 28 - subW, y: currentTotalsY, size: 8.5, font: fontRegular, color: darkCharcoal });
-    currentTotalsY -= 16;
+  const totalItemsQty = bill.itemCount || bill.items.reduce((s, i) => s + i.quantity, 0);
+  const discPct = bill.discountPercent !== undefined ? bill.discountPercent : 0;
+  const discAmt =
+    bill.discountAmountRupees !== undefined ? bill.discountAmountRupees : bill.discountRupees || 0;
 
-    // Discount with percentage
-    const discountLabel = bill.discountPercent ? `Discount (${bill.discountPercent}%):` : 'Discount:';
-    page.drawText(discountLabel, { x: pageWidth / 2 - 5, y: currentTotalsY, size: 8.5, font: fontRegular, color: rgb(0.8, 0.2, 0.2) });
-    const discAmount = bill.discountAmountRupees !== undefined ? bill.discountAmountRupees : (bill.discountRupees || 0);
-    const discStr = `- Rs. ${discAmount.toFixed(2)}`;
-    const discW = fontRegular.widthOfTextAtSize(discStr, 8.5);
-    page.drawText(discStr, { x: pageWidth - 28 - discW, y: currentTotalsY, size: 8.5, font: fontRegular, color: rgb(0.8, 0.2, 0.2) });
-    currentTotalsY -= 18;
-  }
-
-  // Final Grand Total
-  page.drawText('FINAL TOTAL', {
-    x: pageWidth / 2 - 5,
-    y: currentTotalsY - 2,
-    size: 10,
+  // Row 1: Subtotal
+  page.drawText(`Subtotal (${totalItemsQty} ${totalItemsQty === 1 ? 'item' : 'items'}):`, {
+    x: sumLeftX,
+    y: sumY,
+    size: 9,
+    font: fontRegular,
+    color: darkInk,
+  });
+  const subVal = `Rs. ${bill.subtotalRupees.toFixed(2)}`;
+  page.drawText(subVal, {
+    x: sumRightX - fontBold.widthOfTextAtSize(subVal, 9),
+    y: sumY,
+    size: 9,
     font: fontBold,
-    color: primaryBlue,
+    color: darkInk,
   });
 
-  const grandTotalText = `Rs. ${bill.grandTotalRupees.toFixed(2)}`;
-  const grandTotalWidth = fontBold.widthOfTextAtSize(grandTotalText, 15);
-  page.drawText(grandTotalText, {
-    x: pageWidth - 28 - grandTotalWidth,
-    y: currentTotalsY - 4,
-    size: 15,
+  sumY -= 16;
+  // Row 2: Discount Percentage
+  page.drawText('Discount Percentage:', {
+    x: sumLeftX,
+    y: sumY,
+    size: 8.5,
+    font: fontRegular,
+    color: slateMuted,
+  });
+  const pctVal = `${discPct}%`;
+  page.drawText(pctVal, {
+    x: sumRightX - fontBold.widthOfTextAtSize(pctVal, 8.5),
+    y: sumY,
+    size: 8.5,
     font: fontBold,
-    color: highlightGreen,
+    color: discPct > 0 ? discountRed : slateMuted,
   });
 
-  y -= totalsBoxHeight + 35;
+  sumY -= 16;
+  // Row 3: Discount Amount in Rupees
+  page.drawText('Discount Amount (INR):', {
+    x: sumLeftX,
+    y: sumY,
+    size: 8.5,
+    font: fontRegular,
+    color: slateMuted,
+  });
+  const discVal = `- Rs. ${discAmt.toFixed(2)}`;
+  page.drawText(discVal, {
+    x: sumRightX - fontBold.widthOfTextAtSize(discVal, 8.5),
+    y: sumY,
+    size: 8.5,
+    font: fontBold,
+    color: discAmt > 0 ? discountRed : slateMuted,
+  });
 
-  // Status notes
-  page.drawText(`PAYMENT: ${bill.paymentMethod || 'Cash'}  |  STATUS: COMPLETED & PAID`, {
-    x: 24,
+  sumY -= 12;
+  page.drawLine({
+    start: { x: sumLeftX, y: sumY },
+    end: { x: sumRightX, y: sumY },
+    thickness: 1,
+    color: borderGray,
+  });
+
+  sumY -= 24;
+  // Row 4: Final Payable Amount (Prominent)
+  page.drawText('FINAL PAYABLE AMOUNT', {
+    x: sumLeftX,
+    y: sumY + 2,
+    size: 11,
+    font: fontBold,
+    color: brandNavy,
+  });
+  const finalVal = `Rs. ${bill.grandTotalRupees.toFixed(2)}`;
+  const finalW = fontBold.widthOfTextAtSize(finalVal, 16);
+  page.drawText(finalVal, {
+    x: sumRightX - finalW,
+    y: sumY,
+    size: 16,
+    font: fontBold,
+    color: emeraldPaid,
+  });
+
+  y -= summaryBoxHeight + 22;
+
+  // 5. Footer & Thank-You Section
+  page.drawLine({
+    start: { x: margin, y },
+    end: { x: pageWidth - margin, y },
+    thickness: 0.75,
+    color: borderGray,
+  });
+
+  y -= 18;
+  const thankYou1 = 'Thank you for dining with ANNAPURNA CHOLE BHATURE!';
+  const ty1W = fontBold.widthOfTextAtSize(thankYou1, 9.5);
+  page.drawText(thankYou1, {
+    x: (pageWidth - ty1W) / 2,
+    y,
+    size: 9.5,
+    font: fontBold,
+    color: darkInk,
+  });
+
+  y -= 14;
+  const thankYou2 = 'We appreciate your patronage. Visit us again soon!';
+  const ty2W = fontRegular.widthOfTextAtSize(thankYou2, 8);
+  page.drawText(thankYou2, {
+    x: (pageWidth - ty2W) / 2,
     y,
     size: 8,
-    font: fontBold,
-    color: highlightGreen,
+    font: fontRegular,
+    color: slateMuted,
   });
 
-  if (bill.savedToSheets) {
-    page.drawText('RECORDED IN GOOGLE SHEETS', {
-      x: 24,
-      y: y - 12,
-      size: 7.5,
-      font: fontRegular,
-      color: mutedGray,
-    });
-  }
-
-  // Footer business notes
-  const footerNote = 'Thank you for your visit! For queries or feedback, contact +91 8800896679.';
-  const footerWidth = fontRegular.widthOfTextAtSize(footerNote, 7.5);
-  page.drawText(footerNote, {
-    x: (pageWidth - footerWidth) / 2,
-    y: 20,
+  y -= 14;
+  const footerMeta = `Order ID: ${bill.orderId || bill.id}  |  WhatsApp & Support: +91 8800896679`;
+  const fmW = fontRegular.widthOfTextAtSize(footerMeta, 7.5);
+  page.drawText(footerMeta, {
+    x: (pageWidth - fmW) / 2,
+    y,
     size: 7.5,
     font: fontRegular,
-    color: mutedGray,
+    color: slateMuted,
   });
 
   return await pdfDoc.save();
@@ -291,4 +444,3 @@ export function createBillPdfBlobUrl(pdfBytes: Uint8Array): string {
 export function createBillPdfFile(pdfBytes: Uint8Array, filename: string): File {
   return new File([pdfBytes as any], filename, { type: 'application/pdf' });
 }
-

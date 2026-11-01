@@ -19,6 +19,8 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { Bill, MonthlyReportData, DailySalesData } from '../types/billing';
+import { CopyMobileButton } from './CopyMobileButton';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
 
 interface MonthlySalesCalendarProps {
   adminToken: string;
@@ -477,11 +479,15 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                           {bill.orderTypeLabel || (bill.orderType === 'PACK' ? 'Pack' : 'Dine In')}
                         </span>
                       </div>
-                      <div className="text-slate-800 font-semibold mt-0.5 flex items-center gap-1">
+                      <div className="text-slate-800 font-semibold mt-1 flex items-center gap-1.5 flex-wrap">
                         <User className="w-3 h-3 text-slate-400" />
-                        <span>{bill.customerName}</span>
-                        <span className="text-slate-400">•</span>
-                        <span className="text-slate-500">{bill.mobileNumber}</span>
+                        <span>{formatCustomerNameWithJi(bill.customerName)}</span>
+                        <span className="text-slate-300">•</span>
+                        <span className="text-slate-600 font-mono">{bill.countryCode || '+91'} {bill.mobileNumber}</span>
+                        <CopyMobileButton
+                          countryCode={bill.countryCode || '+91'}
+                          mobileNumber={bill.mobileNumber}
+                        />
                       </div>
                     </div>
 

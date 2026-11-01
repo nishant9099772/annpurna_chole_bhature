@@ -5,7 +5,7 @@
     "billNumber": "ACB-20261101-0005",
     "orderType": "PACK",
     "orderTypeLabel": "Pack",
-    "customerName": "Vikram Singh",
+    "customerName": "Vikram Singh Ji",
     "countryCode": "+91",
     "mobileNumber": "9876543210",
     "items": [
@@ -49,7 +49,7 @@
     "billNumber": "ACB-20261101-0004",
     "orderType": "PACK",
     "orderTypeLabel": "Pack",
-    "customerName": "rahul",
+    "customerName": "rahul Ji",
     "countryCode": "+91",
     "mobileNumber": "7867990828",
     "items": [
@@ -87,7 +87,7 @@
     "billNumber": "ACB-20261101-0003",
     "orderType": "PACK",
     "orderTypeLabel": "Pack",
-    "customerName": "harsh",
+    "customerName": "harsh Ji",
     "countryCode": "+91",
     "mobileNumber": "8978891252",
     "items": [
@@ -125,7 +125,7 @@
     "billNumber": "ACB-20261101-0002",
     "orderType": "DINE_IN",
     "orderTypeLabel": "Dine In",
-    "customerName": "arpit",
+    "customerName": "arpit Ji",
     "countryCode": "+91",
     "mobileNumber": "45457893428",
     "items": [
@@ -163,7 +163,7 @@
     "billNumber": "ACB-20261101-0001",
     "orderType": "DINE_IN",
     "orderTypeLabel": "Dine In",
-    "customerName": "Pooja Verma",
+    "customerName": "Pooja Verma Ji",
     "countryCode": "+91",
     "mobileNumber": "9876543210",
     "items": [

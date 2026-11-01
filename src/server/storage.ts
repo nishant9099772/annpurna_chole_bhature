@@ -6,42 +6,72 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { Bill, BusinessMetrics, MonthlyReportData, DailySalesData } from '../types/billing';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const BILLS_FILE = path.resolve(DATA_DIR, 'bills.json');
+const PRIMARY_DATA_DIR = path.resolve(process.cwd(), 'data');
+const PRIMARY_BILLS_FILE = path.resolve(PRIMARY_DATA_DIR, 'bills.json');
+const TMP_DATA_DIR = path.resolve(os.tmpdir(), 'annpurna-billing-data');
+const TMP_BILLS_FILE = path.resolve(TMP_DATA_DIR, 'bills.json');
 
 class BillStorage {
   private bills: Map<string, Bill> = new Map();
   private isLoaded = false;
   private sequence = 1;
+  private activeDataDir = PRIMARY_DATA_DIR;
+  private activeBillsFile = PRIMARY_BILLS_FILE;
 
   constructor() {
     this.init();
   }
 
+  private normalizeBillRecord(b: Bill): Bill {
+    return {
+      ...b,
+      customerName: formatCustomerNameWithJi(b.customerName),
+    };
+  }
+
   private init() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+      // Load from primary data file if present, or fallback to tmp file in serverless environments
+      let sourceFile: string | null = null;
+      if (fs.existsSync(PRIMARY_BILLS_FILE)) {
+        sourceFile = PRIMARY_BILLS_FILE;
+      } else if (fs.existsSync(TMP_BILLS_FILE)) {
+        sourceFile = TMP_BILLS_FILE;
+        this.activeDataDir = TMP_DATA_DIR;
+        this.activeBillsFile = TMP_BILLS_FILE;
       }
 
-      if (fs.existsSync(BILLS_FILE)) {
-        const raw = fs.readFileSync(BILLS_FILE, 'utf-8');
+      let needsNormalizedFlush = false;
+
+      if (sourceFile) {
+        const raw = fs.readFileSync(sourceFile, 'utf-8');
         if (raw.trim()) {
           const list: Bill[] = JSON.parse(raw);
           list.forEach((b) => {
-            this.bills.set(b.id, b);
+            const formattedName = formatCustomerNameWithJi(b.customerName);
+            if (formattedName !== b.customerName) {
+              needsNormalizedFlush = true;
+            }
+            this.bills.set(b.id, this.normalizeBillRecord(b));
           });
           this.sequence = list.length + 1;
-          console.log(`[Storage] Loaded ${this.bills.size} persistent bills from ${BILLS_FILE}`);
+          console.log(`[Storage] Loaded ${this.bills.size} persistent bills from ${sourceFile}`);
         }
       } else {
-        fs.writeFileSync(BILLS_FILE, JSON.stringify([], null, 2), 'utf-8');
-        console.log(`[Storage] Initialized new persistent bills file at ${BILLS_FILE}`);
+        this.flushToDisk();
+        console.log(`[Storage] Initialized new persistent bills file at ${this.activeBillsFile}`);
       }
+
+      if (needsNormalizedFlush) {
+        this.flushToDisk();
+      }
+
       this.isLoaded = true;
     } catch (err: any) {
       console.error('[Storage] Error initializing persistent bills store:', err);
@@ -50,16 +80,28 @@ class BillStorage {
   }
 
   private flushToDisk() {
+    const allBills = Array.from(this.bills.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const payload = JSON.stringify(allBills, null, 2);
+
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+      if (!fs.existsSync(this.activeDataDir)) {
+        fs.mkdirSync(this.activeDataDir, { recursive: true });
       }
-      const allBills = Array.from(this.bills.values()).sort((a, b) => b.timestamp - a.timestamp);
-      const tmpFile = `${BILLS_FILE}.${Date.now()}.tmp`;
-      fs.writeFileSync(tmpFile, JSON.stringify(allBills, null, 2), 'utf-8');
-      fs.renameSync(tmpFile, BILLS_FILE);
-    } catch (err) {
-      console.error('[Storage] Error persisting bills to disk:', err);
+      const tmpFile = `${this.activeBillsFile}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmpFile, payload, 'utf-8');
+      fs.renameSync(tmpFile, this.activeBillsFile);
+    } catch (err: any) {
+      // Fallback to os.tmpdir() if running in a read-only serverless container (e.g. Netlify Functions)
+      try {
+        this.activeDataDir = TMP_DATA_DIR;
+        this.activeBillsFile = TMP_BILLS_FILE;
+        if (!fs.existsSync(this.activeDataDir)) {
+          fs.mkdirSync(this.activeDataDir, { recursive: true });
+        }
+        fs.writeFileSync(this.activeBillsFile, payload, 'utf-8');
+      } catch (fallbackErr) {
+        console.error('[Storage] Error persisting bills to disk:', fallbackErr);
+      }
     }
   }
 
@@ -87,9 +129,10 @@ class BillStorage {
    * Saves a new bill permanently
    */
   public async saveBill(bill: Bill): Promise<Bill> {
-    this.bills.set(bill.id, bill);
+    const normalized = this.normalizeBillRecord(bill);
+    this.bills.set(normalized.id, normalized);
     this.flushToDisk();
-    return bill;
+    return normalized;
   }
 
   /**
@@ -99,11 +142,11 @@ class BillStorage {
     const existing = this.bills.get(id);
     if (!existing) return null;
 
-    const updated: Bill = {
+    const updated: Bill = this.normalizeBillRecord({
       ...existing,
       ...updates,
       id: existing.id, // prevent accidental ID change
-    };
+    });
 
     this.bills.set(id, updated);
     this.flushToDisk();
@@ -134,6 +177,47 @@ class BillStorage {
     }
 
     return null;
+  }
+
+  /**
+   * Merges bills fetched from Google Sheets (or client pending sync queue) idempotently
+   * by Order ID / Bill Number / ID so historical data is permanently preserved across serverless cold starts.
+   */
+  public mergeBillsFromSheets(remoteBills: Bill[]): number {
+    if (!Array.isArray(remoteBills) || remoteBills.length === 0) return 0;
+    let addedOrUpdatedCount = 0;
+
+    for (const remote of remoteBills) {
+      if (!remote || (!remote.orderId && !remote.billNumber && !remote.id)) continue;
+      const existing =
+        this.getBill(remote.orderId) ||
+        this.getBill(remote.billNumber) ||
+        this.getBill(remote.id);
+
+      if (!existing) {
+        const normalized = this.normalizeBillRecord(remote);
+        this.bills.set(normalized.id, normalized);
+        addedOrUpdatedCount++;
+      } else if (remote.savedToSheets && !existing.savedToSheets) {
+        const updated = this.normalizeBillRecord({
+          ...existing,
+          savedToSheets: true,
+          sheetsSyncStatus: 'synced',
+          sheetsSyncError: undefined,
+          spreadsheetId: remote.spreadsheetId || existing.spreadsheetId,
+          spreadsheetUrl: remote.spreadsheetUrl || existing.spreadsheetUrl,
+        });
+        this.bills.set(existing.id, updated);
+        addedOrUpdatedCount++;
+      }
+    }
+
+    if (addedOrUpdatedCount > 0) {
+      this.sequence = Math.max(this.sequence, this.bills.size + 1);
+      this.flushToDisk();
+    }
+
+    return addedOrUpdatedCount;
   }
 
   /**

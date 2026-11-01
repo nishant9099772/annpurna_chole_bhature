@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import { Bill, PaymentMethod } from '../types/billing';
 import { BillDetailsModal } from './BillDetailsModal';
+import { CopyMobileButton } from './CopyMobileButton';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
 
 interface BillHistoryViewProps {
   adminToken: string;
@@ -111,15 +113,12 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     return () => clearTimeout(timeout);
   }, [fetchBills]);
 
-  // Handle Retry Sync
+  // Handle Retry Sync (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
   const handleRetrySync = async (bill: Bill) => {
-    if (!googleToken) {
-      alert('Please connect Google Sheets in the header to retry synchronization.');
-      return;
-    }
-
     setRetryingBillId(bill.id);
+    setErrorMessage(null);
     try {
+      const customSheetId = localStorage.getItem('annpurna_custom_sheet_id') || undefined;
       const res = await fetch(`/api/bills/${bill.id}/retry-sheets`, {
         method: 'POST',
         headers: {
@@ -127,7 +126,9 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
           Authorization: `Bearer ${adminToken}`,
         },
         body: JSON.stringify({
-          googleAccessToken: googleToken,
+          googleAccessToken: googleToken || undefined,
+          customSpreadsheetId: customSheetId,
+          billPayload: bill,
         }),
       });
 
@@ -136,22 +137,41 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         throw new Error(data.error || 'Sync retry failed');
       }
 
+      const syncedBill: Bill = data.bill || {
+        ...bill,
+        savedToSheets: true,
+        sheetsSyncStatus: 'synced',
+      };
+
       // Update local state with the synced bill
       setBills((prev) =>
-        prev.map((b) => (b.id === bill.id ? { ...b, savedToSheets: true, sheetsSyncStatus: 'synced' } : b))
+        prev.map((b) => (b.id === bill.id ? syncedBill : b))
       );
 
       if (selectedBillForDetails && selectedBillForDetails.id === bill.id) {
-        setSelectedBillForDetails({
-          ...selectedBillForDetails,
-          savedToSheets: true,
-          sheetsSyncStatus: 'synced',
-        });
+        setSelectedBillForDetails(syncedBill);
       }
+
+      try {
+        const raw = localStorage.getItem('annpurna_pending_sync_bills');
+        if (raw) {
+          const list: Bill[] = JSON.parse(raw);
+          const remaining = list.filter((b) => b.orderId !== bill.orderId && b.id !== bill.id);
+          localStorage.setItem('annpurna_pending_sync_bills', JSON.stringify(remaining));
+        }
+      } catch {
+        // ignore
+      }
+
+      window.dispatchEvent(
+        new CustomEvent('annpurna:toast', {
+          detail: { message: `Bill ${bill.orderId || bill.billNumber} synced to Google Sheets!` },
+        })
+      );
 
       if (onRefreshMetrics) onRefreshMetrics();
     } catch (err: any) {
-      alert(`Sync failed: ${err.message}`);
+      setErrorMessage(`Sync failed for ${bill.orderId || bill.billNumber}: ${err.message}`);
     } finally {
       setRetryingBillId(null);
     }
@@ -362,10 +382,16 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                       )}
                     </div>
 
-                    <div className="flex items-center gap-2 text-xs text-slate-600 pt-0.5">
-                      <span className="font-bold text-slate-900">{bill.customerName}</span>
+                    <div className="flex items-center gap-2 text-xs text-slate-600 pt-0.5 flex-wrap">
+                      <span className="font-bold text-slate-900">{formatCustomerNameWithJi(bill.customerName)}</span>
                       <span className="text-slate-300">•</span>
-                      <span className="font-mono">{bill.countryCode} {bill.mobileNumber}</span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="font-mono">{bill.countryCode} {bill.mobileNumber}</span>
+                        <CopyMobileButton
+                          countryCode={bill.countryCode}
+                          mobileNumber={bill.mobileNumber}
+                        />
+                      </span>
                       <span className="text-slate-300">•</span>
                       <span className="text-slate-400 text-[11px]">{bill.dateTimeKolkata}</span>
                     </div>

@@ -1,0 +1,22 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["express", "pdf-lib"]
+  included_files = ["data/**"]
+
+# Route all /api/* requests to the backend Netlify Serverless Function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# SPA fallback for frontend routes
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

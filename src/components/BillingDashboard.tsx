@@ -40,6 +40,8 @@ import { User as FirebaseUser } from 'firebase/auth';
 import { BillHistoryView } from './BillHistoryView';
 import { MonthlySalesCalendar } from './MonthlySalesCalendar';
 import { BillDetailsModal } from './BillDetailsModal';
+import { CopyMobileButton } from './CopyMobileButton';
+import { formatCustomerNameWithJi } from '../utils/customerFormat';
 
 interface BillingDashboardProps {
   adminUsername: string;
@@ -52,6 +54,7 @@ interface BillingDashboardProps {
   onGoogleAuthChange: (user: FirebaseUser | null, token: string | null) => void;
   onShareWhatsApp: (bill: Bill) => void;
   onPreviewPdf?: (bill: Bill) => void;
+  onShowToast?: (message: string) => void;
 }
 
 export const BillingDashboard: React.FC<BillingDashboardProps> = ({
@@ -65,6 +68,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   onGoogleAuthChange,
   onShareWhatsApp,
   onPreviewPdf,
+  onShowToast,
 }) => {
   // Navigation View: 'terminal' (New Bill), 'history' (Bill Records), or 'calendar' (Monthly Sales Calendar)
   const [activeTab, setActiveTab] = useState<'terminal' | 'history' | 'calendar'>('terminal');
@@ -106,6 +110,15 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [showSheetSettings, setShowSheetSettings] = useState(false);
   const [isBatchSyncing, setIsBatchSyncing] = useState(false);
   const [batchSyncFeedback, setBatchSyncFeedback] = useState<string | null>(null);
+  const [serverSheetsStatus, setServerSheetsStatus] = useState<{
+    configured: boolean;
+    mode: string;
+    modeLabel: string;
+    spreadsheetId: string;
+    spreadsheetUrl: string;
+  } | null>(null);
+
+  const isSheetsConnected = Boolean(googleToken || serverSheetsStatus?.configured);
 
   // Calendar Bill Inspection Modal
   const [calendarSelectedBill, setCalendarSelectedBill] = useState<Bill | null>(null);
@@ -132,22 +145,39 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
   const [currentTimeStr, setCurrentTimeStr] = useState('');
 
-  // Fetch Business Metrics
+  // Fetch Business Metrics & Server Google Sheets Status
   const refreshMetrics = useCallback(async () => {
     try {
-      const res = await fetch('/api/metrics', {
-        headers: { Authorization: `Bearer ${adminToken}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${adminToken}`,
+      };
+      if (googleToken) {
+        headers['x-google-token'] = googleToken;
+      }
+
+      const [metricsRes, statusRes] = await Promise.all([
+        fetch('/api/metrics', { headers }),
+        fetch('/api/sheets/status', { headers }),
+      ]);
+
+      if (metricsRes.status === 401) {
+        onLogout();
+        return;
+      }
+      if (metricsRes.ok) {
+        const data = await metricsRes.json();
         if (data?.metrics) {
           setMetrics(data.metrics);
         }
       }
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setServerSheetsStatus(statusData);
+      }
     } catch (err) {
       console.log('Metrics load error:', err);
     }
-  }, [adminToken]);
+  }, [adminToken, googleToken, onLogout]);
 
   useEffect(() => {
     refreshMetrics();
@@ -327,15 +357,23 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     }
   };
 
-  // Batch Sync Handler
+  // Batch Sync Handler (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
   const handleBatchSyncSheets = async () => {
-    if (!googleToken) {
+    if (!isSheetsConnected) {
       handleGoogleConnect();
       return;
     }
     setIsBatchSyncing(true);
     setBatchSyncFeedback(null);
     try {
+      let clientPendingBills: Bill[] = [];
+      try {
+        const raw = localStorage.getItem('annpurna_pending_sync_bills');
+        if (raw) clientPendingBills = JSON.parse(raw);
+      } catch {
+        // ignore
+      }
+
       const res = await fetch('/api/bills/batch-sync-sheets', {
         method: 'POST',
         headers: {
@@ -343,13 +381,18 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           Authorization: `Bearer ${adminToken}`,
         },
         body: JSON.stringify({
-          googleAccessToken: googleToken,
+          googleAccessToken: googleToken || undefined,
           customSpreadsheetId: customSpreadsheetId.trim() || undefined,
+          clientPendingBills,
         }),
       });
       const data = await res.json();
       if (res.ok) {
+        if (data.failedCount === 0) {
+          localStorage.removeItem('annpurna_pending_sync_bills');
+        }
         setBatchSyncFeedback(data.message || 'Batch sync completed successfully.');
+        if (onShowToast) onShowToast(data.message || 'Google Sheets synchronized!');
         refreshMetrics();
       } else {
         setBatchSyncFeedback(`Sync error: ${data.error}`);
@@ -456,9 +499,12 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         coldDrinkUnitPriceRupees: line.key === 'COLD_DRINK' ? parseFloat(coldDrinkMRP) : undefined,
       }));
 
+      const formattedCustomerName = formatCustomerNameWithJi(customerName);
+      setCustomerName(formattedCustomerName);
+
       const payload = {
         orderType,
-        customerName: customerName.trim(),
+        customerName: formattedCustomerName,
         countryCode: countryCode.trim(),
         mobileNumber: cleanMobile,
         items: itemsPayload,
@@ -471,7 +517,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         customSpreadsheetId: customSpreadsheetId.trim() || undefined,
       };
 
-      let response = await fetch('/api/bills', {
+      const response = await fetch('/api/bills', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -481,23 +527,13 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         body: JSON.stringify(payload),
       });
 
-      // Self-healing auth if token expired
-      if (response.status === 401 && adminToken !== 'annpurna-admin-session-active') {
-        localStorage.setItem('annpurna_admin_token', 'annpurna-admin-session-active');
-        response = await fetch('/api/bills', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-            Authorization: 'Bearer annpurna-admin-session-active',
-          },
-          body: JSON.stringify(payload),
-        });
+      if (response.status === 401) {
+        onLogout();
+        throw new Error('Your session has expired. Please log in again.');
       }
 
       const contentType = response.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
-        const errorText = await response.text();
         throw new Error(
           `Server returned an invalid response (HTTP ${response.status}). Expected JSON. The bill draft has been kept.`
         );
@@ -634,7 +670,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             </div>
 
             {/* Google Sheets Connection Status */}
-            {googleToken ? (
+            {isSheetsConnected ? (
               <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 rounded-xl text-xs text-emerald-800">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                 <span className="font-semibold hidden md:inline">Sheets Connected</span>
@@ -662,10 +698,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             {/* Admin Logout */}
             <button
               onClick={onLogout}
-              className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer"
-              title="Logout"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition cursor-pointer"
+              title={`Logout (${adminUsername})`}
             >
-              <LogOut className="w-4 h-4" />
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Logout</span>
             </button>
           </div>
         </div>
@@ -676,7 +713,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         {/* Google Sheets Synchronization Status Banner */}
         <div
           className={`p-3.5 sm:p-4 rounded-2xl border text-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-3 ${
-            googleToken
+            isSheetsConnected
               ? 'bg-emerald-50/80 border-emerald-200 text-emerald-950'
               : 'bg-amber-50/80 border-amber-200 text-amber-950'
           }`}
@@ -684,7 +721,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           <div className="flex items-center gap-3">
             <div
               className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
-                googleToken
+                isSheetsConnected
                   ? 'bg-emerald-100 text-emerald-700'
                   : 'bg-amber-100 text-amber-700'
               }`}
@@ -692,30 +729,47 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
               <FileSpreadsheet className="w-5 h-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-extrabold text-sm">
-                  {googleToken ? 'Google Sheets Auto-Sync Active' : 'Google Sheets Not Connected'}
+                  {isSheetsConnected
+                    ? 'Google Sheets Auto-Sync Active'
+                    : 'Local Database Mode (Google Sheets Sync Pending)'}
                 </span>
                 <span
                   className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                    googleToken
+                    isSheetsConnected
                       ? 'bg-emerald-200/80 text-emerald-800'
                       : 'bg-amber-200/80 text-amber-800'
                   }`}
                 >
-                  {googleToken ? 'Connected' : 'Offline Mode'}
+                  {serverSheetsStatus?.configured
+                    ? serverSheetsStatus.modeLabel
+                    : googleToken
+                    ? 'Google Workspace Connected'
+                    : 'Offline Queue Active'}
                 </span>
               </div>
               <p className="text-[11px] text-slate-600 mt-0.5">
-                {googleToken
-                  ? `Every bill is automatically saved to your Google Sheet with all 16 canonical columns. (${metrics.syncedBillsCount} bills recorded)`
-                  : 'Bills will be saved securely to the local database. Connect your Google account to sync all bills to Google Sheets automatically.'}
+                {isSheetsConnected
+                  ? `Every bill is verified and recorded in your Google Sheet across all required columns (${metrics.syncedBillsCount} bills synced).`
+                  : 'Bills are saved locally and queued safely. Connect your Google Account or configure Service Account environment variables in Netlify for automatic Google Sheets recording.'}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 flex-wrap w-full md:w-auto justify-end">
-            {!googleToken ? (
+            {metrics.failedBillsCount > 0 && isSheetsConnected && (
+              <button
+                type="button"
+                onClick={handleBatchSyncSheets}
+                disabled={isBatchSyncing}
+                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isBatchSyncing ? 'animate-spin' : ''}`} />
+                <span>Sync {metrics.failedBillsCount} Pending Bills</span>
+              </button>
+            )}
+            {!isSheetsConnected && (
               <button
                 type="button"
                 onClick={handleGoogleConnect}
@@ -724,28 +778,14 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                 <FileSpreadsheet className="w-3.5 h-3.5" />
                 <span>Connect Google Account</span>
               </button>
-            ) : (
-              <>
-                {metrics.failedBillsCount > 0 && (
-                  <button
-                    type="button"
-                    onClick={handleBatchSyncSheets}
-                    disabled={isBatchSyncing}
-                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs disabled:opacity-50"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isBatchSyncing ? 'animate-spin' : ''}`} />
-                    <span>Sync {metrics.failedBillsCount} Pending Bills</span>
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setShowSheetSettings(!showSheetSettings)}
-                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 font-semibold rounded-lg transition text-xs cursor-pointer"
-                >
-                  {showSheetSettings ? 'Hide Settings' : 'Sheet Settings'}
-                </button>
-              </>
             )}
+            <button
+              type="button"
+              onClick={() => setShowSheetSettings(!showSheetSettings)}
+              className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 font-semibold rounded-lg transition text-xs cursor-pointer"
+            >
+              {showSheetSettings ? 'Hide Settings' : 'Sheet Settings'}
+            </button>
           </div>
         </div>
 
@@ -929,9 +969,14 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
                   {/* Customer Name */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                      Customer Name <span className="text-rose-500">*</span>
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                        Customer Name <span className="text-rose-500">*</span>
+                      </label>
+                      <span className="text-[10px] font-semibold text-blue-600">
+                        Auto-adds &ldquo;Ji&rdquo;
+                      </span>
+                    </div>
                     <div className="relative">
                       <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
                         <User className="w-4 h-4" />
@@ -943,7 +988,12 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                           setCustomerName(e.target.value);
                           if (nameError) setNameError(null);
                         }}
-                        placeholder="e.g. Rahul Sharma"
+                        onBlur={() => {
+                          if (customerName.trim().length >= 2) {
+                            setCustomerName(formatCustomerNameWithJi(customerName));
+                          }
+                        }}
+                        placeholder="e.g. Rahul → Rahul Ji"
                         className={`w-full pl-9 pr-3 py-2 bg-slate-50 border rounded-xl text-sm font-medium focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
                           nameError ? 'border-rose-400 bg-rose-50/50' : 'border-slate-200'
                         }`}
@@ -954,9 +1004,18 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                   {/* Customer Mobile */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                      Mobile Number <span className="text-rose-500">*</span>
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                        Mobile Number <span className="text-rose-500">*</span>
+                      </label>
+                      {mobileNumber.length > 0 && (
+                        <CopyMobileButton
+                          countryCode={countryCode}
+                          mobileNumber={mobileNumber}
+                          onCopied={onShowToast}
+                        />
+                      )}
+                    </div>
                     <div className="flex">
                       <span className="inline-flex items-center px-2.5 py-2 rounded-l-xl border border-r-0 border-slate-200 bg-slate-100 text-slate-600 font-mono text-xs font-bold">
                         {countryCode}
