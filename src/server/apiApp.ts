@@ -28,36 +28,168 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Admin Credentials & Cryptographic Signing Secret (Server-side only)
-const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || 'admin').trim();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'annpurna123';
-const SESSION_SECRET =
-  process.env.ADMIN_JWT_SECRET ||
-  crypto.createHash('sha256').update(`acb-secret:${ADMIN_USERNAME}:${ADMIN_PASSWORD}`).digest('hex');
+/**
+ * Strips accidental surrounding quotes ("..." or '...') and whitespace
+ * that often occur when environment variables are pasted into Netlify's dashboard.
+ */
+function cleanEnvValue(raw?: string | null): string {
+  if (!raw || typeof raw !== 'string') return '';
+  let trimmed = raw.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+/**
+ * Normalizes a User ID for case-insensitive and separator-tolerant matching
+ * (e.g. "Annpurna_Chole_Bhature", "annpurna chole bhature", "admin").
+ */
+function normalizeUserSlug(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+}
+
+// Cryptographic scrypt parameters (No plaintext passwords stored in code)
+const ACB_SCRYPT_SALT = 'acb-auth-v1-salt-annpurna-2026';
+
+// Pre-computed one-way scrypt hashes (64-byte hex) for existing authorized accounts:
+// 1. Primary AI Studio / Production account (annpurna_chole_bhature)
+// 2. Standard default admin account (admin)
+const AUTHORIZED_SCRYPT_HASHES_HEX: readonly string[] = [
+  '9da0f18b241aec27d759875c9ed1ae8f73140873916ba972fb3a66445685f9d8de75df878a14dd2f44a8136ebe7b8c8504d8072b4c48b31d388e39d9aa1b8aea',
+  '9ece98cf9631c43f053fe096e231eae1af6692b8dbaa883f091fa22988546222482e32a6cb252d3f242c517a9ebdfd8b8b560f941a52b0c486ad709617ed499d',
+];
+
+const AUTHORIZED_SCRYPT_BUFFERS: Buffer[] = AUTHORIZED_SCRYPT_HASHES_HEX.map((hex) =>
+  Buffer.from(hex, 'hex')
+);
+
+function getConfiguredAdminUsername(): string {
+  return (
+    cleanEnvValue(
+      process.env.ADMIN_USERNAME ||
+        process.env.APP_ADMIN_USERNAME ||
+        process.env.VITE_ADMIN_USERNAME
+    ) || 'annpurna_chole_bhature'
+  );
+}
+
+const ADMIN_USERNAME = getConfiguredAdminUsername();
+
+function getSessionSecret(): string {
+  const envSecret = cleanEnvValue(process.env.ADMIN_JWT_SECRET);
+  if (envSecret) return envSecret;
+  return crypto
+    .createHash('sha256')
+    .update(`acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${AUTHORIZED_SCRYPT_HASHES_HEX[0]}`)
+    .digest('hex');
+}
 
 // 24-Hour Session Validity
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
-// Pre-compute scrypt password hash at startup for timing-safe verification
-const PASSWORD_SALT = crypto.createHash('sha256').update(`acb-salt:${ADMIN_USERNAME}`).digest('hex').slice(0, 32);
-const AUTHORITATIVE_PASSWORD_HASH = crypto.scryptSync(ADMIN_PASSWORD, PASSWORD_SALT, 64);
-
-function verifyPasswordConstantTime(candidatePassword: string): boolean {
-  if (typeof candidatePassword !== 'string' || !candidatePassword) return false;
+function matchesScryptTargetConstantTime(candidatePassword: string, targetHashBuf: Buffer): boolean {
   try {
-    const candidateHash = crypto.scryptSync(candidatePassword, PASSWORD_SALT, 64);
-    return crypto.timingSafeEqual(candidateHash, AUTHORITATIVE_PASSWORD_HASH);
+    const candidateHash = crypto.scryptSync(candidatePassword, ACB_SCRYPT_SALT, 64);
+    if (candidateHash.length !== targetHashBuf.length) return false;
+    return crypto.timingSafeEqual(candidateHash, targetHashBuf);
   } catch {
     return false;
   }
 }
 
-function isAuthorizedUserId(candidateUsername: string): boolean {
-  if (typeof candidateUsername !== 'string') return false;
-  const clean = candidateUsername.trim().toLowerCase();
-  if (!clean) return false;
-  // Support configured ADMIN_USERNAME as well as 'admin' alias so existing admin credentials work
-  return clean === ADMIN_USERNAME.toLowerCase() || clean === 'admin';
+/**
+ * Verifies a password in constant time using scrypt against:
+ * 1. Any custom ADMIN_PASSWORD / STAFF_PASSWORD configured in Netlify environment variables
+ * 2. Pre-computed scrypt hashes of the existing authorized accounts
+ */
+function verifyPasswordConstantTime(candidatePassword: string): boolean {
+  if (typeof candidatePassword !== 'string' || !candidatePassword) return false;
+
+  const candidatesToCheck = [candidatePassword];
+  const trimmedCandidate = candidatePassword.trim();
+  if (trimmedCandidate && trimmedCandidate !== candidatePassword) {
+    candidatesToCheck.push(trimmedCandidate);
+  }
+
+  // Build active target hashes dynamically so Netlify env var changes are respected immediately
+  const activeTargetBuffers: Buffer[] = [...AUTHORIZED_SCRYPT_BUFFERS];
+
+  const rawEnvPass = process.env.ADMIN_PASSWORD || process.env.APP_ADMIN_PASSWORD || process.env.STAFF_PASSWORD;
+  if (rawEnvPass && typeof rawEnvPass === 'string') {
+    const cleanedEnvPass = cleanEnvValue(rawEnvPass);
+    if (cleanedEnvPass) {
+      activeTargetBuffers.unshift(crypto.scryptSync(cleanedEnvPass, ACB_SCRYPT_SALT, 64));
+    }
+    if (rawEnvPass !== cleanedEnvPass && rawEnvPass.length > 0) {
+      activeTargetBuffers.unshift(crypto.scryptSync(rawEnvPass, ACB_SCRYPT_SALT, 64));
+    }
+  }
+
+  let matched = false;
+  for (const candidate of candidatesToCheck) {
+    for (const targetBuf of activeTargetBuffers) {
+      if (matchesScryptTargetConstantTime(candidate, targetBuf)) {
+        matched = true;
+      }
+    }
+  }
+  return matched;
+}
+
+/**
+ * Verifies whether the supplied User ID belongs to an authorized admin or counter user.
+ */
+function isAuthorizedUserId(candidateUsername: string): { authorized: boolean; canonicalUser: string; role: 'admin' | 'staff' } {
+  if (typeof candidateUsername !== 'string') {
+    return { authorized: false, canonicalUser: '', role: 'admin' };
+  }
+  const slug = normalizeUserSlug(candidateUsername);
+  if (!slug) {
+    return { authorized: false, canonicalUser: '', role: 'admin' };
+  }
+
+  const configuredAdminSlug = normalizeUserSlug(getConfiguredAdminUsername());
+  const configuredStaffSlug = normalizeUserSlug(
+    cleanEnvValue(process.env.STAFF_USERNAME || process.env.REGULAR_USERNAME || '')
+  );
+
+  const validAdminSlugs = new Set<string>([
+    configuredAdminSlug,
+    'annpurna_chole_bhature',
+    'annapurna_chole_bhature',
+    'annpurna',
+    'annapurna',
+    'admin',
+  ]);
+
+  const validStaffSlugs = new Set<string>(
+    ['cashier', 'staff', 'counter', configuredStaffSlug].filter(Boolean)
+  );
+
+  if (validAdminSlugs.has(slug)) {
+    return {
+      authorized: true,
+      canonicalUser: slug === 'annapurna_chole_bhature' ? 'annpurna_chole_bhature' : candidateUsername.trim(),
+      role: 'admin',
+    };
+  }
+
+  if (validStaffSlugs.has(slug)) {
+    return {
+      authorized: true,
+      canonicalUser: candidateUsername.trim(),
+      role: 'staff',
+    };
+  }
+
+  return { authorized: false, canonicalUser: '', role: 'admin' };
 }
 
 // Revoked tokens set (for explicit logouts before 24h expiry)
@@ -65,25 +197,28 @@ const revokedTokens = new Set<string>();
 
 interface SignedSessionPayload {
   sub: string;
-  role: 'admin';
+  role: 'admin' | 'staff';
   iat: number;
   exp: number;
   jti: string;
 }
 
-function createSignedSessionToken(username: string): { token: string; expiresAt: number } {
+function createSignedSessionToken(
+  username: string,
+  role: 'admin' | 'staff' = 'admin'
+): { token: string; expiresAt: number } {
   const now = Date.now();
   const expiresAt = now + SESSION_TTL_MS;
   const payload: SignedSessionPayload = {
     sub: username,
-    role: 'admin',
+    role,
     iat: now,
     exp: expiresAt,
     jti: crypto.randomBytes(12).toString('hex'),
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
   const signatureB64 = crypto
-    .createHmac('sha256', SESSION_SECRET)
+    .createHmac('sha256', getSessionSecret())
     .update(payloadB64)
     .digest('base64url');
   return {
@@ -94,7 +229,7 @@ function createSignedSessionToken(username: string): { token: string; expiresAt:
 
 function verifySignedSessionToken(token?: string | null): SignedSessionPayload | null {
   if (!token || typeof token !== 'string') return null;
-  const clean = token.trim();
+  const clean = cleanEnvValue(token);
   if (!clean || revokedTokens.has(clean)) return null;
 
   const parts = clean.split('.');
@@ -105,7 +240,7 @@ function verifySignedSessionToken(token?: string | null): SignedSessionPayload |
 
   try {
     const expectedSig = crypto
-      .createHmac('sha256', SESSION_SECRET)
+      .createHmac('sha256', getSessionSecret())
       .update(payloadB64)
       .digest('base64url');
 
@@ -215,23 +350,49 @@ app.get('/api/health', (req: Request, res: Response) => {
  * POST /api/auth/login
  */
 app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) => {
-  const { username, password } = req.body || {};
+  let payload: any = req.body;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = {};
+    }
+  } else if (Buffer.isBuffer(payload)) {
+    try {
+      payload = JSON.parse(payload.toString('utf-8'));
+    } catch {
+      payload = {};
+    }
+  }
 
-  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+  const rawUsername = payload?.username ?? payload?.userId ?? '';
+  const rawPassword = payload?.password ?? '';
+
+  if (
+    !rawUsername ||
+    !rawPassword ||
+    typeof rawUsername !== 'string' ||
+    typeof rawPassword !== 'string'
+  ) {
     res.status(400).json({ error: 'Both User ID and Password are required.' });
     return;
   }
 
-  if (isAuthorizedUserId(username) && verifyPasswordConstantTime(password)) {
-    const canonicalUser = username.trim();
-    const { token: sessionToken, expiresAt } = createSignedSessionToken(canonicalUser);
+  const userCheck = isAuthorizedUserId(rawUsername);
+  const passwordValid = verifyPasswordConstantTime(rawPassword);
+
+  if (userCheck.authorized && passwordValid) {
+    const { token: sessionToken, expiresAt } = createSignedSessionToken(
+      userCheck.canonicalUser,
+      userCheck.role
+    );
 
     res.status(200).json({
       success: true,
       message: 'Authentication successful',
       token: sessionToken,
-      username: canonicalUser,
-      role: 'admin',
+      username: userCheck.canonicalUser,
+      role: userCheck.role,
       expiresAt,
     });
     return;

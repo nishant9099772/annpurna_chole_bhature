@@ -47,18 +47,38 @@ export async function handler(event: any) {
     const targetUrl = `http://127.0.0.1:${port}${rawPath}${qs}`;
     const method = (event.httpMethod || 'GET').toUpperCase();
 
+    const blockedHeaders = new Set([
+      'host',
+      'content-length',
+      'content-encoding',
+      'transfer-encoding',
+      'connection',
+      'accept-encoding',
+    ]);
+
     const headers: Record<string, string> = {};
     if (event.headers) {
       for (const [k, v] of Object.entries(event.headers)) {
-        if (typeof v === 'string' && k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') {
+        if (typeof v === 'string' && !blockedHeaders.has(k.toLowerCase())) {
           headers[k] = v;
         }
       }
     }
 
-    let body: Buffer | string | undefined = undefined;
-    if (method !== 'GET' && method !== 'HEAD' && event.body) {
-      body = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : event.body;
+    let body: string | Buffer | undefined = undefined;
+    if (method !== 'GET' && method !== 'HEAD' && event.body !== undefined && event.body !== null) {
+      if (typeof event.body === 'object' && !Buffer.isBuffer(event.body)) {
+        body = JSON.stringify(event.body);
+      } else if (event.isBase64Encoded && typeof event.body === 'string') {
+        body = Buffer.from(event.body, 'base64').toString('utf-8');
+      } else {
+        body = event.body;
+      }
+
+      const hasContentType = Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');
+      if (!hasContentType) {
+        headers['Content-Type'] = 'application/json';
+      }
     }
 
     const response = await fetch(targetUrl, {

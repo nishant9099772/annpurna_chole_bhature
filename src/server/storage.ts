@@ -327,7 +327,12 @@ class BillStorage {
    */
   public getMetrics(userId?: string): BusinessMetrics {
     let list = Array.from(this.bills.values());
-    if (userId && userId !== 'all' && userId !== 'admin') {
+    if (
+      userId &&
+      !['all', 'admin', 'annpurna_chole_bhature', 'annapurna_chole_bhature', 'cashier', 'staff'].includes(
+        userId.trim().toLowerCase()
+      )
+    ) {
       list = list.filter((b) => !b.userId || b.userId === userId);
     }
 
@@ -396,7 +401,12 @@ class BillStorage {
    */
   public getMonthlyReport(year: number, month: number, userId?: string): MonthlyReportData {
     let list = Array.from(this.bills.values());
-    if (userId && userId !== 'all' && userId !== 'admin') {
+    if (
+      userId &&
+      !['all', 'admin', 'annpurna_chole_bhature', 'annapurna_chole_bhature', 'cashier', 'staff'].includes(
+        userId.trim().toLowerCase()
+      )
+    ) {
       list = list.filter((b) => !b.userId || b.userId === userId);
     }
 
