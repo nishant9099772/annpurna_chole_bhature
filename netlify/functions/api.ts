@@ -1,14 +1,14 @@
 /**
  * Netlify Serverless Function Entry Point (/.netlify/functions/api)
- * Bridges Netlify Functions (v1 Lambda event & v2 Web Request) to the authoritative Express app in server.ts.
+ * Bridges Netlify Functions (v1 Lambda event) to the pure production Express API in src/server/apiApp.ts.
  */
 import http from 'http';
 import { AddressInfo } from 'net';
 
-// Ensure server.ts knows it is running inside a Netlify serverless environment
+// Ensure apiApp knows it is running inside a Netlify serverless environment
 process.env.NETLIFY = 'true';
 
-import { app } from '../../server';
+import { app } from '../../src/server/apiApp';
 
 let serverPromise: Promise<number> | null = null;
 
