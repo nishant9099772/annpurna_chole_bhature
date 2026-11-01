@@ -1,0 +1,6 @@
+{
+  "name": "Annpurna Chole Bhature Billing",
+  "description": "Admin-only fast billing and receipt generation system for Annpurna Chole Bhature with Google Sheets sync, PDF generation, and WhatsApp sharing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
