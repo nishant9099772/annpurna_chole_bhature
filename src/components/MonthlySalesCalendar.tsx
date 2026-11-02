@@ -7,12 +7,7 @@ import {
   Receipt,
   Award,
   DollarSign,
-  Clock,
   User,
-  Phone,
-  CheckCircle2,
-  AlertCircle,
-  ExternalLink,
   Eye,
   FileText,
   RefreshCw,
@@ -27,7 +22,7 @@ import {
   loadPersistentBills,
   savePersistentBills,
 } from '../utils/persistentBillsStorage';
-import { parseApiJsonResponse } from '../utils/apiClient';
+import { apiFetch, parseApiJsonResponse } from '../utils/apiClient';
 
 interface MonthlySalesCalendarProps {
   adminToken: string;
@@ -45,9 +40,10 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
   const now = new Date();
   const [currentYear, setCurrentYear] = useState<number>(now.getFullYear());
   const [currentMonth, setCurrentMonth] = useState<number>(now.getMonth() + 1); // 1-12
-  const [report, setReport] = useState<MonthlyReportData | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [report, setReport] = useState<MonthlyReportData | null>(() =>
+    buildMonthlyReportFromBills(loadPersistentBills(), now.getFullYear(), now.getMonth() + 1)
+  );
+  const [isLoading, setIsLoading] = useState(false);
   const [selectedDayNumber, setSelectedDayNumber] = useState<number>(now.getDate());
 
   const monthNames = [
@@ -66,14 +62,16 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
   ];
 
   const fetchMonthlyReport = useCallback(
-    async (year: number, month: number) => {
-      setIsLoading(true);
-      setError(null);
-      try {
-        // Hydrate server with any persistent client bills first so cold-started serverless instances have full history
-        await hydrateAndSyncBillsWithServer(adminToken);
+    async (year: number, month: number, forceHydrate: boolean = false) => {
+      // Immediately render from persistent ledger so switching months feels instantaneous
+      const immediateLocal = loadPersistentBills();
+      setReport(buildMonthlyReportFromBills(immediateLocal, year, month));
 
-        const res = await fetch(`/api/reports/monthly?year=${year}&month=${month}`, {
+      setIsLoading(true);
+      try {
+        await hydrateAndSyncBillsWithServer(adminToken, undefined, undefined, forceHydrate);
+
+        const res = await apiFetch(`/api/reports/monthly?year=${year}&month=${month}`, {
           headers: {
             Authorization: `Bearer ${adminToken}`,
             Accept: 'application/json',
@@ -87,7 +85,6 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
         }
 
         if (data?.report) {
-          // Merge any bills returned in the report into the persistent ledger
           const reportBills: Bill[] = [];
           if (Array.isArray(data.report.dailyData)) {
             for (const day of data.report.dailyData) {
@@ -100,17 +97,10 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
             savePersistentBills(reportBills);
           }
           setReport(data.report);
-        } else {
-          throw new Error('Invalid monthly report response');
         }
       } catch (err: any) {
-        console.error('Error fetching monthly report, using persistent ledger fallback:', err);
         const localPersistent = loadPersistentBills();
-        if (localPersistent.length > 0) {
-          setReport(buildMonthlyReportFromBills(localPersistent, year, month));
-        } else {
-          setError(err.message || 'Could not load sales report');
-        }
+        setReport(buildMonthlyReportFromBills(localPersistent, year, month));
       } finally {
         setIsLoading(false);
       }
@@ -119,7 +109,7 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
   );
 
   useEffect(() => {
-    fetchMonthlyReport(currentYear, currentMonth);
+    fetchMonthlyReport(currentYear, currentMonth, false);
   }, [fetchMonthlyReport, currentYear, currentMonth]);
 
   const handlePrevMonth = () => {
@@ -149,28 +139,26 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
     setSelectedDayNumber(today.getDate());
   };
 
-  // Find first day of the week (0 = Sunday, 1 = Monday, etc.)
   const firstDayOfWeek = new Date(Date.UTC(currentYear, currentMonth - 1, 1)).getUTCDay();
 
-  // Selected Day info
   const selectedDayData: DailySalesData | undefined = report?.dailyData.find(
     (d) => d.dayNumber === selectedDayNumber
   );
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3.5 sm:space-y-5">
       {/* Calendar Header with Controls */}
-      <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold">
-            <CalendarIcon className="w-5 h-5" />
+      <div className="bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3.5 sm:p-5 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold shrink-0">
+            <CalendarIcon className="w-4 h-4 sm:w-5 sm:h-5" />
           </div>
           <div>
-            <h2 className="text-xl font-bold text-slate-900 tracking-tight">
+            <h2 className="text-base sm:text-lg font-bold text-slate-900 tracking-tight">
               Monthly Sales Calendar
             </h2>
-            <p className="text-xs text-slate-500">
-              Interactive sales analytics & daily transaction drill-down • Auto-resets on the 1st
+            <p className="text-[11px] sm:text-xs text-slate-500">
+              Daily transaction drill-down • Asia/Kolkata (IST)
             </p>
           </div>
         </div>
@@ -179,21 +167,21 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
         <div className="flex items-center flex-wrap gap-2 w-full md:w-auto justify-between md:justify-end">
           <button
             onClick={handleCurrentMonthJump}
-            className="px-3 py-1.5 text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors"
+            className="px-2.5 py-1.5 text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors cursor-pointer"
           >
             This Month
           </button>
 
-          <div className="flex items-center bg-slate-100 rounded-lg p-1 border border-slate-200">
+          <div className="flex items-center bg-slate-100 rounded-md p-1 border border-slate-200">
             <button
               onClick={handlePrevMonth}
               title="Previous Month"
-              className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded-md transition-colors"
+              className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded transition-colors cursor-pointer"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
 
-            <div className="flex items-center gap-1 px-2">
+            <div className="flex items-center gap-1 px-1.5">
               <select
                 value={currentMonth}
                 onChange={(e) => {
@@ -228,17 +216,17 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
             <button
               onClick={handleNextMonth}
               title="Next Month"
-              className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded-md transition-colors"
+              className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-white rounded transition-colors cursor-pointer"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
           </div>
 
           <button
-            onClick={() => fetchMonthlyReport(currentYear, currentMonth)}
+            onClick={() => fetchMonthlyReport(currentYear, currentMonth, true)}
             disabled={isLoading}
             title="Refresh Report"
-            className="p-2 text-slate-600 hover:text-blue-600 bg-slate-100 hover:bg-blue-50 border border-slate-200 rounded-lg transition-colors disabled:opacity-50"
+            className="p-2 text-slate-600 hover:text-blue-600 bg-slate-100 hover:bg-blue-50 border border-slate-200 rounded-md transition-colors disabled:opacity-50 cursor-pointer"
           >
             <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
           </button>
@@ -246,96 +234,92 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
       </div>
 
       {/* Monthly Summary Metric Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
-        {/* Total Revenue */}
-        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
-          <div className="flex items-center justify-between text-slate-500 mb-2">
-            <span className="text-xs font-medium uppercase tracking-wider">
-              {report?.monthLabel || 'Month'} Revenue
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
+        <div className="bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3 sm:p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 mb-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider truncate">
+              {monthNames[currentMonth - 1]} Revenue
             </span>
-            <div className="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
-              <DollarSign className="w-4 h-4" />
+            <div className="w-6 h-6 rounded-md bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+              <DollarSign className="w-3.5 h-3.5" />
             </div>
           </div>
-          <div className="text-2xl font-black text-slate-900">
+          <div className="text-base sm:text-2xl font-black text-slate-900 font-mono truncate">
             ₹{(report?.totalRevenueRupees || 0).toLocaleString('en-IN', { minimumFractionDigits: 0 })}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">
-            Total sales across {report?.totalBills || 0} completed orders
+          <div className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
+            Across {report?.totalBills || 0} completed orders
           </div>
         </div>
 
-        {/* Total Bills */}
-        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
-          <div className="flex items-center justify-between text-slate-500 mb-2">
-            <span className="text-xs font-medium uppercase tracking-wider">Total Bills</span>
-            <div className="w-7 h-7 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center">
-              <Receipt className="w-4 h-4" />
+        <div className="bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3 sm:p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 mb-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Total Bills</span>
+            <div className="w-6 h-6 rounded-md bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+              <Receipt className="w-3.5 h-3.5" />
             </div>
           </div>
-          <div className="text-2xl font-black text-slate-900">
+          <div className="text-base sm:text-2xl font-black text-slate-900 font-mono">
             {report?.totalBills || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">
-            Orders processed in {monthNames[currentMonth - 1]}
+          <div className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
+            Orders in {monthNames[currentMonth - 1]}
           </div>
         </div>
 
-        {/* Average Bill Value */}
-        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
-          <div className="flex items-center justify-between text-slate-500 mb-2">
-            <span className="text-xs font-medium uppercase tracking-wider">Avg Order Value</span>
-            <div className="w-7 h-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center">
-              <TrendingUp className="w-4 h-4" />
+        <div className="bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3 sm:p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 mb-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Avg Ticket</span>
+            <div className="w-6 h-6 rounded-md bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
+              <TrendingUp className="w-3.5 h-3.5" />
             </div>
           </div>
-          <div className="text-2xl font-black text-slate-900">
+          <div className="text-base sm:text-2xl font-black text-slate-900 font-mono">
             ₹{(report?.averageBillValueRupees || 0).toFixed(0)}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">
-            Average ticket size per customer
+          <div className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
+            Average order value
           </div>
         </div>
 
-        {/* Best Sales Day */}
-        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
-          <div className="flex items-center justify-between text-slate-500 mb-2">
-            <span className="text-xs font-medium uppercase tracking-wider">Best Sales Day</span>
-            <div className="w-7 h-7 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center">
-              <Award className="w-4 h-4" />
+        <div className="bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3 sm:p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 mb-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider">Best Day</span>
+            <div className="w-6 h-6 rounded-md bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
+              <Award className="w-3.5 h-3.5" />
             </div>
           </div>
           {report?.bestSalesDay ? (
             <div>
-              <div className="text-2xl font-black text-amber-600">
+              <div className="text-base sm:text-2xl font-black text-amber-600 font-mono truncate">
                 ₹{report.bestSalesDay.revenueRupees.toLocaleString('en-IN')}
               </div>
-              <div className="text-[11px] font-semibold text-slate-700 mt-1">
+              <div className="text-[10px] sm:text-[11px] font-semibold text-slate-700 mt-0.5 truncate">
                 Day {report.bestSalesDay.dayNumber} ({report.bestSalesDay.billsCount} orders)
               </div>
             </div>
           ) : (
             <div>
-              <div className="text-xl font-bold text-slate-400">—</div>
-              <div className="text-[11px] text-slate-400 mt-1">No sales recorded yet</div>
+              <div className="text-base sm:text-xl font-bold text-slate-400">—</div>
+              <div className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5">No sales yet</div>
             </div>
           )}
         </div>
       </div>
 
       {/* Main Grid & Transaction Breakdown Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Calendar Grid (8 cols on lg) */}
-        <div className="lg:col-span-7 bg-white rounded-xl border border-slate-200 p-4 md:p-6 shadow-xs">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 sm:gap-5">
+        {/* Calendar Grid (7 cols on lg) */}
+        <div className="lg:col-span-7 bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3 sm:p-5 shadow-xs">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-1.5">
+            <h3 className="font-bold text-slate-900 text-xs sm:text-sm flex items-center gap-1.5">
               <span>{report?.monthLabel || `${monthNames[currentMonth - 1]} ${currentYear}`}</span>
-              <span className="text-xs text-slate-400 font-normal">
-                (Click any date to view orders)
+              <span className="text-[11px] text-slate-400 font-normal hidden sm:inline">
+                (Tap any date to inspect bills)
               </span>
             </h3>
             {report?.bestSalesDay && (
-              <span className="text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200 flex items-center gap-1">
+              <span className="text-[10px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 flex items-center gap-1">
                 <Sparkles className="w-3 h-3 text-amber-500" />
                 Peak: Day {report.bestSalesDay.dayNumber} (₹{report.bestSalesDay.revenueRupees})
               </span>
@@ -343,7 +327,7 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
           </div>
 
           {/* Weekday Headers */}
-          <div className="grid grid-cols-7 gap-1.5 mb-2 text-center text-xs font-bold text-slate-400">
+          <div className="grid grid-cols-7 gap-1 mb-1.5 text-center text-[10px] sm:text-xs font-bold text-slate-400">
             <span>SUN</span>
             <span>MON</span>
             <span>TUE</span>
@@ -354,16 +338,14 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
           </div>
 
           {/* Calendar Day Cells */}
-          <div className="grid grid-cols-7 gap-1.5">
-            {/* Blank leading cells */}
+          <div className="grid grid-cols-7 gap-1 sm:gap-1.5">
             {Array.from({ length: firstDayOfWeek }).map((_, i) => (
               <div
                 key={`empty-${i}`}
-                className="h-16 md:h-20 rounded-lg bg-slate-50/60 border border-transparent"
+                className="h-14 sm:h-20 rounded-md bg-slate-50/60 border border-transparent"
               />
             ))}
 
-            {/* Days of the month */}
             {report?.dailyData.map((day) => {
               const isSelected = day.dayNumber === selectedDayNumber;
               const isPeakDay = report.bestSalesDay?.dayNumber === day.dayNumber;
@@ -377,9 +359,9 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                 <button
                   key={day.date}
                   onClick={() => setSelectedDayNumber(day.dayNumber)}
-                  className={`h-16 md:h-20 p-1.5 md:p-2 rounded-lg text-left transition-all relative flex flex-col justify-between border cursor-pointer ${
+                  className={`h-14 sm:h-20 p-1 sm:p-2 rounded-md text-left transition-all relative flex flex-col justify-between border cursor-pointer overflow-hidden ${
                     isSelected
-                      ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-300 shadow-md'
+                      ? 'bg-blue-600 text-white border-blue-600 ring-1 ring-blue-300 shadow-xs'
                       : isPeakDay
                       ? 'bg-amber-50/70 border-amber-300 text-slate-800 hover:border-amber-400'
                       : hasSales
@@ -387,26 +369,22 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                       : 'bg-white border-slate-100 hover:border-slate-300 text-slate-700'
                   }`}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between w-full">
                     <span
-                      className={`text-xs font-black ${
+                      className={`text-[11px] sm:text-xs font-black leading-none ${
                         isSelected
                           ? 'text-white'
                           : isToday
-                          ? 'w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center'
+                          ? 'px-1 py-0.5 rounded bg-blue-100 text-blue-700'
                           : 'text-slate-800'
                       }`}
                     >
                       {day.dayNumber}
                     </span>
 
-                    {isPeakDay && !isSelected && (
-                      <span className="text-[10px] font-bold text-amber-600">★</span>
-                    )}
-
                     {day.billsCount > 0 && (
                       <span
-                        className={`text-[10px] font-bold px-1 rounded-sm ${
+                        className={`text-[9px] font-bold px-1 rounded-xs ${
                           isSelected
                             ? 'bg-white/20 text-white'
                             : 'bg-slate-200/80 text-slate-700'
@@ -417,10 +395,10 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                     )}
                   </div>
 
-                  <div className="mt-auto">
+                  <div className="mt-auto w-full">
                     {hasSales ? (
                       <div
-                        className={`text-[11px] md:text-xs font-black tracking-tight leading-none ${
+                        className={`text-[9px] sm:text-xs font-black tracking-tight leading-none truncate ${
                           isSelected ? 'text-white' : 'text-emerald-700'
                         }`}
                       >
@@ -428,7 +406,7 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                       </div>
                     ) : (
                       <div
-                        className={`text-[10px] ${
+                        className={`text-[9px] ${
                           isSelected ? 'text-blue-200' : 'text-slate-300'
                         }`}
                       >
@@ -441,28 +419,28 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
             })}
           </div>
 
-          <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
+          <div className="mt-3 pt-2.5 border-t border-slate-100 flex items-center justify-between flex-wrap gap-2 text-[11px] text-slate-500">
             <div className="flex items-center gap-3">
-              <span className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1">
                 <span className="w-2.5 h-2.5 rounded-xs bg-emerald-100 border border-emerald-300 inline-block" />
-                Sales Recorded
+                Sales
               </span>
-              <span className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1">
                 <span className="w-2.5 h-2.5 rounded-xs bg-amber-100 border border-amber-300 inline-block" />
-                Peak Sales Day
+                Peak Day
               </span>
-              <span className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1">
                 <span className="w-2.5 h-2.5 rounded-xs bg-blue-600 inline-block" />
                 Selected
               </span>
             </div>
-            <div className="text-[11px] text-slate-400">Timezone: Asia/Kolkata (IST)</div>
+            <div className="text-[10px] text-slate-400">Asia/Kolkata (IST)</div>
           </div>
         </div>
 
         {/* Selected Day Transactions Drill-down (5 cols on lg) */}
-        <div className="lg:col-span-5 bg-white rounded-xl border border-slate-200 p-4 md:p-6 shadow-xs flex flex-col">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
+        <div className="lg:col-span-5 bg-white rounded-lg sm:rounded-xl border border-slate-200 p-3.5 sm:p-5 shadow-xs flex flex-col">
+          <div className="flex items-center justify-between pb-2.5 border-b border-slate-100 mb-3">
             <div>
               <h3 className="font-bold text-slate-900 text-sm">
                 Day {selectedDayNumber} Transactions
@@ -475,7 +453,7 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
             </div>
             {selectedDayData && (
               <div className="text-right">
-                <div className="text-sm font-black text-slate-900">
+                <div className="text-sm font-black text-slate-900 font-mono">
                   ₹{selectedDayData.revenueRupees.toLocaleString('en-IN')}
                 </div>
                 <div className="text-[11px] text-slate-500">
@@ -486,19 +464,21 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
           </div>
 
           {/* Transactions List */}
-          <div className="flex-1 overflow-y-auto max-h-[460px] space-y-3 pr-1">
+          <div className="flex-1 overflow-y-auto max-h-[420px] space-y-2.5 pr-0.5">
             {selectedDayData && selectedDayData.bills.length > 0 ? (
               selectedDayData.bills.map((bill) => (
                 <div
                   key={bill.id}
                   className="p-3 rounded-lg border border-slate-200 bg-slate-50/50 hover:bg-slate-50 hover:border-blue-300 transition-all text-xs space-y-2"
                 >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-black text-blue-600">{bill.billNumber}</span>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-mono font-black text-blue-600">
+                          {bill.orderId || bill.billNumber}
+                        </span>
                         <span
-                          className={`text-[10px] font-bold px-1.5 py-0.5 rounded-sm ${
+                          className={`text-[10px] font-bold px-1.5 py-0.5 rounded-xs ${
                             bill.orderType === 'PACK'
                               ? 'bg-amber-100 text-amber-800'
                               : 'bg-emerald-100 text-emerald-800'
@@ -508,10 +488,12 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                         </span>
                       </div>
                       <div className="text-slate-800 font-semibold mt-1 flex items-center gap-1.5 flex-wrap">
-                        <User className="w-3 h-3 text-slate-400" />
+                        <User className="w-3 h-3 text-slate-400 shrink-0" />
                         <span>{formatCustomerNameWithJi(bill.customerName)}</span>
                         <span className="text-slate-300">•</span>
-                        <span className="text-slate-600 font-mono">{bill.countryCode || '+91'} {bill.mobileNumber}</span>
+                        <span className="text-slate-600 font-mono">
+                          {bill.countryCode || '+91'} {bill.mobileNumber}
+                        </span>
                         <CopyMobileButton
                           countryCode={bill.countryCode || '+91'}
                           mobileNumber={bill.mobileNumber}
@@ -519,12 +501,12 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                       </div>
                     </div>
 
-                    <div className="text-right">
-                      <div className="text-sm font-black text-slate-900">
+                    <div className="text-right shrink-0">
+                      <div className="text-sm font-black text-slate-900 font-mono">
                         ₹{bill.grandTotalRupees}
                       </div>
                       <span
-                        className={`text-[10px] font-medium px-1.5 py-0.5 rounded-sm inline-block mt-0.5 ${
+                        className={`text-[10px] font-medium px-1.5 py-0.5 rounded-xs inline-block mt-0.5 ${
                           bill.savedToSheets || bill.sheetsSyncStatus === 'synced'
                             ? 'bg-emerald-100 text-emerald-700'
                             : 'bg-amber-100 text-amber-700'
@@ -537,45 +519,43 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                     </div>
                   </div>
 
-                  {/* Items summary */}
-                  <div className="bg-white rounded-md p-2 border border-slate-100 text-[11px] text-slate-600">
+                  <div className="bg-white rounded p-2 border border-slate-100 text-[11px] text-slate-600">
                     <span className="font-semibold text-slate-700">Items: </span>
                     {bill.itemDetailsSummary ||
                       bill.items.map((i) => `${i.name} (${i.quantity})`).join(', ')}
                   </div>
 
-                  {/* Pricing Breakdown: Subtotal, Discount %, Final */}
-                  <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1">
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
                     <span>
                       Subtotal: ₹{bill.subtotalRupees}
-                      {(bill.discountPercent || bill.discountRupees) ? (
+                      {bill.discountPercent || bill.discountRupees ? (
                         <span className="text-rose-600 ml-1">
-                          (Disc {bill.discountPercent || 0}%: -₹{bill.discountAmountRupees ?? bill.discountRupees})
+                          (Disc {bill.discountPercent || 0}%: -₹
+                          {bill.discountAmountRupees ?? bill.discountRupees})
                         </span>
                       ) : null}
                     </span>
                     <span className="text-slate-400">{bill.billTime || bill.dateTimeKolkata}</span>
                   </div>
 
-                  {/* Action Buttons */}
-                  <div className="flex items-center gap-2 pt-1 border-t border-slate-200">
+                  <div className="flex items-center gap-1.5 pt-1 border-t border-slate-200">
                     <button
                       onClick={() => onSelectBill(bill)}
-                      className="flex-1 py-1 px-2 rounded-md bg-white border border-slate-200 text-slate-700 font-semibold text-[11px] hover:bg-slate-100 flex items-center justify-center gap-1 transition-colors"
+                      className="flex-1 py-1.5 px-2 rounded bg-white border border-slate-200 text-slate-700 font-semibold text-[11px] hover:bg-slate-100 flex items-center justify-center gap-1 transition-colors cursor-pointer"
                     >
                       <Eye className="w-3 h-3 text-slate-500" />
-                      View Bill
+                      View
                     </button>
                     <button
                       onClick={() => onPreviewPdf(bill)}
-                      className="py-1 px-2 rounded-md bg-blue-50 text-blue-700 border border-blue-200 font-semibold text-[11px] hover:bg-blue-100 flex items-center justify-center gap-1 transition-colors"
+                      className="py-1.5 px-2.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-semibold text-[11px] hover:bg-blue-100 flex items-center justify-center gap-1 transition-colors cursor-pointer"
                     >
                       <FileText className="w-3 h-3" />
-                      PDF
+                      Receipt
                     </button>
                     <button
                       onClick={() => onShareWhatsApp(bill)}
-                      className="py-1 px-2 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[11px] hover:bg-emerald-100 flex items-center justify-center gap-1 transition-colors"
+                      className="py-1.5 px-2.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[11px] hover:bg-emerald-100 flex items-center justify-center gap-1 transition-colors cursor-pointer"
                     >
                       WhatsApp
                     </button>
@@ -583,7 +563,7 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
                 </div>
               ))
             ) : (
-              <div className="py-12 text-center text-slate-400">
+              <div className="py-10 text-center text-slate-400">
                 <Receipt className="w-8 h-8 mx-auto mb-2 text-slate-300 stroke-1" />
                 <p className="font-semibold text-xs text-slate-500">No transactions on this date</p>
                 <p className="text-[11px] text-slate-400 mt-0.5">

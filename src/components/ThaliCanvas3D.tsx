@@ -160,13 +160,16 @@ export const ThaliCanvas3D: React.FC<ThaliCanvas3DProps> = ({ onClose, isModal =
     const width = container.clientWidth || 800;
     const height = container.clientHeight || 500;
 
+    const isMobileScreen = window.innerWidth < 768;
     const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl,
+      antialias: !isSoftwareGl && !isMobileScreen,
       powerPreference: 'high-performance',
       alpha: true,
     });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(
+      isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, isMobileScreen ? 1.5 : 2)
+    );
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.15;
@@ -491,6 +494,11 @@ export const ThaliCanvas3D: React.FC<ThaliCanvas3DProps> = ({ onClose, isModal =
       const dt = Math.min((now - lastTime) / 1000, 0.1);
       lastTime = now;
 
+      if (document.hidden) {
+        frameId = requestAnimationFrame(tick);
+        return;
+      }
+
       // Auto rotation when enabled and user not dragging
       if (autoRotateRef.current && !isPointerDown.current) {
         orbitAngle.current.theta += 0.35 * dt;
@@ -574,17 +582,17 @@ export const ThaliCanvas3D: React.FC<ThaliCanvas3DProps> = ({ onClose, isModal =
   };
 
   return (
-    <div className={`relative w-full overflow-hidden bg-amber-50/40 select-none ${isModal ? 'h-[85vh] rounded-2xl shadow-2xl border border-amber-200' : 'h-[360px] md:h-[420px] rounded-2xl border border-amber-200/80 shadow-sm'}`}>
+    <div className={`relative w-full overflow-hidden bg-amber-50/40 select-none ${isModal ? 'h-[82dvh] rounded-xl shadow-2xl border border-amber-200' : 'h-[320px] md:h-[400px] rounded-xl border border-amber-200/80 shadow-sm'}`}>
       {/* 3D Canvas Mount Point */}
       <div ref={containerRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
 
       {/* Top Header Badge (Non-occluding, static, no pulsating dot) */}
-      <div className="absolute top-4 left-4 z-10 flex items-center gap-2 bg-white/90 border border-amber-200/80 px-3.5 py-1.5 rounded-full shadow-sm">
+      <div className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-white/95 border border-amber-200/80 px-3 py-1.5 rounded-lg shadow-sm">
         <Sparkles className="w-4 h-4 text-amber-600" />
         <span className="text-xs font-semibold tracking-wide text-amber-950 uppercase">
           Annpurna Signature Thali 3D
         </span>
-        <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full">
+        <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-md">
           Live Render
         </span>
       </div>
@@ -593,7 +601,7 @@ export const ThaliCanvas3D: React.FC<ThaliCanvas3DProps> = ({ onClose, isModal =
       {onClose && (
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 z-10 p-2 bg-white/90 hover:bg-white border border-slate-200 rounded-full text-slate-700 shadow-sm transition"
+          className="absolute top-3 right-3 z-10 p-2 bg-white/95 hover:bg-white border border-slate-200 rounded-lg text-slate-700 shadow-sm transition cursor-pointer"
           title="Close 3D View"
         >
           <X className="w-5 h-5" />

@@ -526,14 +526,21 @@ export async function handleCapacitorLocalApiRequest(
     const hasGoogleToken = Boolean(headersObj['x-google-token']);
     const customSheetId =
       typeof window !== 'undefined' ? window.localStorage.getItem('annpurna_custom_sheet_id') || '' : '';
+    const configuredBackend =
+      typeof window !== 'undefined' ? window.localStorage.getItem('annpurna_api_base_url') || '' : '';
     return jsonResponse(200, {
       configured: hasGoogleToken,
       mode: hasGoogleToken ? 'oauth_token' : 'unconfigured',
-      modeLabel: hasGoogleToken ? 'Google Workspace OAuth' : 'Local Persistent Storage',
+      modeLabel: hasGoogleToken
+        ? 'Google Workspace OAuth'
+        : configuredBackend
+        ? 'Netlify Backend Offline (Local Fallback)'
+        : 'Set Netlify Backend URL in Settings for Auto-Sync',
       spreadsheetId: customSheetId,
       spreadsheetUrl: customSheetId
         ? `https://docs.google.com/spreadsheets/d/${customSheetId}/edit`
         : '',
+      requiresBackendUrl: !configuredBackend && !hasGoogleToken,
     });
   }
 
@@ -554,7 +561,7 @@ export async function handleCapacitorLocalApiRequest(
   if (pathname === '/api/metrics' && method === 'GET') {
     const allBills = loadPersistentBills();
     const metrics = computeBusinessMetricsFromBills(allBills, Date.now());
-    return jsonResponse(200, metrics);
+    return jsonResponse(200, { metrics, bills: allBills });
   }
 
   // 8. Monthly Sales Calendar Report
@@ -564,7 +571,7 @@ export async function handleCapacitorLocalApiRequest(
     const month = parseInt(parsedUrl.searchParams.get('month') || String(now.getMonth() + 1), 10);
     const allBills = loadPersistentBills();
     const report = buildMonthlyReportFromBills(allBills, year, month);
-    return jsonResponse(200, { report });
+    return jsonResponse(200, { success: true, report });
   }
 
   // 9. Get Bills (with search, filter, pagination)
@@ -746,6 +753,8 @@ export async function handleCapacitorLocalApiRequest(
       userId: bodyData?.userId || session.sub || 'admin',
       savedToSheets: false,
       sheetsSyncStatus: 'pending',
+      sheetsSyncError:
+        'Saved locally on device. Enter your Netlify Backend URL in Server Settings to sync with Google Sheets.',
     };
 
     upsertPersistentBill(newBill);
@@ -770,13 +779,14 @@ export async function handleCapacitorLocalApiRequest(
     (pathname.endsWith('/retry-sheets') || pathname === '/api/bills/batch-sync-sheets') &&
     method === 'POST'
   ) {
-    return jsonResponse(200, {
+    return jsonResponse(400, {
       success: false,
       failedCount: 1,
       error:
-        'Configure your Netlify Server URL in Server Settings or connect Google Account to sync with Google Sheets.',
+        'Netlify Backend URL is not configured in this APK. Open "Server & Sheet Settings" and enter your live Netlify HTTPS URL (e.g. https://your-site.netlify.app) so the Android app can sync with Google Sheets via your Netlify backend.',
     });
   }
 
   return jsonResponse(404, { error: `API endpoint not found: ${pathname}` });
 }
+

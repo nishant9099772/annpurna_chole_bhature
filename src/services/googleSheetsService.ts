@@ -92,6 +92,39 @@ export const CANONICAL_ITEMS_HEADERS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Timeout-Guarded Fetch & Spreadsheet Structure Cache (Prevents Hanging / Timeouts)
+// ---------------------------------------------------------------------------
+const GOOGLE_API_TIMEOUT_MS = 8_500;
+const STRUCTURE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+const verifiedSpreadsheetCache = new Map<
+  string,
+  { billsHeaders: string[]; itemsHeaders: string[]; expiresAt: number }
+>();
+
+async function fetchGoogleApi(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = GOOGLE_API_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Google Sheets API request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Server-Side Google Service Account JWT Minting (Native Node crypto)
 // ---------------------------------------------------------------------------
 let cachedServiceAccountToken: { accessToken: string; expiresAt: number } | null = null;
@@ -158,7 +191,7 @@ export async function getServiceAccountAccessToken(): Promise<string> {
   const signature = signer.sign(creds.privateKey, 'base64url');
   const assertion = `${unsignedJwt}.${signature}`;
 
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+  const tokenRes = await fetchGoogleApi('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -242,7 +275,8 @@ export function getSheetsConnectionStatus(
 
 /**
  * Checks if a spreadsheet has the required 'Bills' and 'Bill Items' sheets.
- * Safely extends headers without overwriting existing data.
+ * Safely extends headers without overwriting existing data, and caches verified headers
+ * for 10 minutes to minimize latency on serverless functions and mobile connections.
  */
 export async function ensureSpreadsheetStructure(
   accessToken: string,
@@ -253,8 +287,16 @@ export async function ensureSpreadsheetStructure(
     throw new Error('Invalid Google Spreadsheet ID provided.');
   }
 
+  const cached = verifiedSpreadsheetCache.get(spreadsheetId);
+  if (cached && Date.now() < cached.expiresAt) {
+    return {
+      billsHeaders: cached.billsHeaders,
+      itemsHeaders: cached.itemsHeaders,
+    };
+  }
+
   const getUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
-  const response = await fetch(getUrl, {
+  const response = await fetchGoogleApi(getUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
 
@@ -318,7 +360,7 @@ export async function ensureSpreadsheetStructure(
 
   if (requests.length > 0) {
     const updateUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`;
-    await fetch(updateUrl, {
+    await fetchGoogleApi(updateUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -330,7 +372,7 @@ export async function ensureSpreadsheetStructure(
 
   // --- Ensure & Safely Migrate Headers for Bills ---
   const billsHeaderRange = 'Bills!1:1';
-  const billsHeaderCheck = await fetch(
+  const billsHeaderCheck = await fetchGoogleApi(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${billsHeaderRange}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
@@ -339,7 +381,7 @@ export async function ensureSpreadsheetStructure(
 
   if (currentBillsHeaders.length === 0) {
     const endCol = getColumnLetter(CANONICAL_BILLS_HEADERS.length - 1);
-    await fetch(
+    await fetchGoogleApi(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Bills!A1:${endCol}1?valueInputOption=USER_ENTERED`,
       {
         method: 'PUT',
@@ -357,7 +399,7 @@ export async function ensureSpreadsheetStructure(
       const nextColIndex = currentBillsHeaders.length;
       const startColLetter = getColumnLetter(nextColIndex);
       const endColLetter = getColumnLetter(nextColIndex + missingHeaders.length - 1);
-      await fetch(
+      await fetchGoogleApi(
         `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Bills!${startColLetter}1:${endColLetter}1?valueInputOption=USER_ENTERED`,
         {
           method: 'PUT',
@@ -374,7 +416,7 @@ export async function ensureSpreadsheetStructure(
 
   // --- Ensure & Safely Migrate Headers for Bill Items ---
   const itemsHeaderRange = "'Bill Items'!1:1";
-  const itemsHeaderCheck = await fetch(
+  const itemsHeaderCheck = await fetchGoogleApi(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${itemsHeaderRange}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
@@ -382,7 +424,7 @@ export async function ensureSpreadsheetStructure(
   let currentItemsHeaders: string[] = itemsHeaderData.values?.[0] || [];
 
   if (currentItemsHeaders.length === 0) {
-    await fetch(
+    await fetchGoogleApi(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/'Bill Items'!A1:L1?valueInputOption=USER_ENTERED`,
       {
         method: 'PUT',
@@ -400,7 +442,7 @@ export async function ensureSpreadsheetStructure(
       const nextColIndex = currentItemsHeaders.length;
       const startColLetter = getColumnLetter(nextColIndex);
       const endColLetter = getColumnLetter(nextColIndex + missingItemsHeaders.length - 1);
-      await fetch(
+      await fetchGoogleApi(
         `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/'Bill Items'!${startColLetter}1:${endColLetter}1?valueInputOption=USER_ENTERED`,
         {
           method: 'PUT',
@@ -414,6 +456,12 @@ export async function ensureSpreadsheetStructure(
       currentItemsHeaders.push(...missingItemsHeaders);
     }
   }
+
+  verifiedSpreadsheetCache.set(spreadsheetId, {
+    billsHeaders: currentBillsHeaders,
+    itemsHeaders: currentItemsHeaders,
+    expiresAt: Date.now() + STRUCTURE_CACHE_TTL_MS,
+  });
 
   return { billsHeaders: currentBillsHeaders, itemsHeaders: currentItemsHeaders };
 }
@@ -527,7 +575,7 @@ export async function appendBillToSheets(
 
   // 1. DUPLICATE CHECK: inspect existing rows in Bills sheet
   const checkRange = 'Bills!A:Z';
-  const checkRes = await fetch(
+  const checkRes = await fetchGoogleApi(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${checkRange}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
@@ -613,7 +661,7 @@ export async function appendBillToSheets(
   });
 
   const billsAppendUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Bills!A:Z:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
-  const billsAppendRes = await fetch(billsAppendUrl, {
+  const billsAppendRes = await fetchGoogleApi(billsAppendUrl, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -667,7 +715,7 @@ export async function appendBillToSheets(
   });
 
   const itemsAppendUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/'Bill Items'!A:Z:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
-  const itemsAppendRes = await fetch(itemsAppendUrl, {
+  const itemsAppendRes = await fetchGoogleApi(itemsAppendUrl, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -704,7 +752,7 @@ async function appendBillViaAppsScript(appsScriptUrl: string, bill: Bill): Promi
   const formattedCustomerName = formatCustomerNameWithJi(bill.customerName);
   const secret = process.env.GOOGLE_APPS_SCRIPT_SECRET?.trim() || '';
 
-  const response = await fetch(appsScriptUrl, {
+  const response = await fetchGoogleApi(appsScriptUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -921,7 +969,7 @@ export async function fetchBillsFromGoogleSheets(options?: {
         if (process.env.GOOGLE_APPS_SCRIPT_SECRET) {
           url.searchParams.set('secret', process.env.GOOGLE_APPS_SCRIPT_SECRET.trim());
         }
-        const res = await fetch(url.toString(), { redirect: 'follow' });
+        const res = await fetchGoogleApi(url.toString(), { redirect: 'follow' });
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data?.bills)) {
@@ -937,7 +985,7 @@ export async function fetchBillsFromGoogleSheets(options?: {
 
   try {
     const batchGetUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?ranges=Bills!A:Z&ranges='Bill Items'!A:Z`;
-    const response = await fetch(batchGetUrl, {
+    const response = await fetchGoogleApi(batchGetUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
 

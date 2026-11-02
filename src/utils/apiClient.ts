@@ -1,20 +1,33 @@
 /**
  * Centralized API Client, Response Parser & Capacitor Android Networking Layer
  *
- * Solves two critical issues in Capacitor Android APKs:
- * 1. Android WebView / CapacitorHttp bridges may normalize, omit, or alter `Content-Type`
- *    headers on HTTP 200 responses, causing header-only checks (`contentType.includes('application/json')`)
- *    to falsely reject valid HTTP 200 JSON responses with `(HTTP 200)` errors.
- * 2. In a Capacitor Android APK, `window.location.origin` is `https://localhost` (or `capacitor://localhost`).
- *    Relative `fetch('/api/...')` calls hit Capacitor's local `WebViewLocalServer`, which serves the SPA
- *    `index.html` fallback with `HTTP 200 OK` (`text/html`). This module routes `/api/*` calls to the
- *    configured remote API base URL (if provided) and automatically falls back to the embedded
- *    production API engine (`capacitorLocalApi.ts`) when `/api/*` returns an HTML SPA fallback in the APK.
+ * Architecture:
+ *   Netlify Website & Android APK -> https://annpurnacholebhature.netlify.app/api/* -> Google Sheets API v4
+ *
+ * Uses `import.meta.env.VITE_API_BASE_URL` (defined in `.env.production` as
+ * `https://annpurnacholebhature.netlify.app`) as the production API base URL for all backend requests.
+ *
+ * Key Guarantees:
+ * 1. Production Base URL: Every backend request is resolved via `resolveApiUrl('/api/...')` / `apiFetch('/api/...')`
+ *    against `import.meta.env.VITE_API_BASE_URL` (`https://annpurnacholebhature.netlify.app`).
+ *    No relative `/api/...` paths are ever sent in the Android Capacitor app.
+ * 2. Infinite loading protection: Every `/api/*` request is guarded by an `AbortController` timeout
+ *    (12s for standard endpoints, 20s for Google Sheets sync endpoints) so Android WebView requests
+ *    can never hang indefinitely.
+ * 3. Cross-origin CORS compatibility: Uses stateless `Authorization: Bearer <token>` headers with
+ *    `credentials: 'omit'` and `mode: 'cors'` on cross-origin requests so Netlify's CORS headers
+ *    work seamlessly with Android WebView and standard browsers.
+ * 4. Resilient JSON parsing: Always parses HTTP 200 JSON payloads even when Android WebView bridges
+ *    alter or omit `Content-Type` headers, while accurately detecting HTML SPA fallbacks.
  */
 
 import { handleCapacitorLocalApiRequest } from './capacitorLocalApi';
 
 export const API_BASE_URL_STORAGE_KEY = 'annpurna_api_base_url';
+export const DEFAULT_PRODUCTION_API_BASE_URL = 'https://annpurnacholebhature.netlify.app';
+
+const STANDARD_API_TIMEOUT_MS = 12_000;
+const SHEETS_SYNC_TIMEOUT_MS = 20_000;
 
 /**
  * Normalizes a configured API base URL (strips quotes, trailing slashes, and accidental `/api` suffix).
@@ -22,21 +35,35 @@ export const API_BASE_URL_STORAGE_KEY = 'annpurna_api_base_url';
 export function normalizeApiBaseUrl(raw?: string | null): string {
   if (!raw || typeof raw !== 'string') return '';
   let cleaned = raw.trim().replace(/^["']+|["']+$/g, '').trim();
-  if (!cleaned || cleaned === 'MY_APP_URL' || cleaned === 'undefined' || cleaned === 'null') {
+  if (
+    !cleaned ||
+    cleaned === 'MY_APP_URL' ||
+    cleaned === 'undefined' ||
+    cleaned === 'null' ||
+    cleaned === 'http://localhost' ||
+    cleaned === 'https://localhost'
+  ) {
     return '';
   }
   if (!/^https?:\/\//i.test(cleaned)) {
     cleaned = `https://${cleaned}`;
   }
   cleaned = cleaned.replace(/\/+$/, '');
-  if (cleaned.toLowerCase().endsWith('/api')) {
-    cleaned = cleaned.slice(0, -4);
-  }
   if (cleaned.toLowerCase().endsWith('/.netlify/functions/api')) {
     cleaned = cleaned.slice(0, -'/.netlify/functions/api'.length);
   }
-  return cleaned;
+  if (cleaned.toLowerCase().endsWith('/api')) {
+    cleaned = cleaned.slice(0, -4);
+  }
+  return cleaned.replace(/\/+$/, '');
 }
+
+/**
+ * Authoritative production API base URL resolved directly from `import.meta.env.VITE_API_BASE_URL`
+ * (`.env.production`: `VITE_API_BASE_URL=https://annpurnacholebhature.netlify.app`).
+ */
+export const API_BASE_URL: string =
+  normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
 
 /**
  * Detects whether the app is running inside a Capacitor native container or Android WebView.
@@ -80,9 +107,11 @@ export function isCapacitorOrAndroidWebView(): boolean {
 }
 
 /**
- * Returns the active remote API base URL if configured via localStorage or Vite environment variables.
+ * Returns the active production Netlify API base URL (`import.meta.env.VITE_API_BASE_URL` or custom override).
  */
 export function getConfiguredApiBaseUrl(): string {
+  const envBaseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
+
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
       const saved = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_URL_STORAGE_KEY));
@@ -92,48 +121,120 @@ export function getConfiguredApiBaseUrl(): string {
     }
   }
 
-  const envMeta = (import.meta as any)?.env || {};
-  const envUrl = normalizeApiBaseUrl(
-    envMeta.VITE_API_BASE_URL || envMeta.VITE_BACKEND_URL || envMeta.VITE_NETLIFY_URL || ''
-  );
-  if (envUrl) return envUrl;
-
-  return '';
+  if (envBaseUrl) return envBaseUrl;
+  return API_BASE_URL;
 }
 
 /**
- * Saves or clears a custom remote API base URL in localStorage.
+ * Saves or resets a custom remote Netlify API base URL in localStorage.
+ * When cleared, falls back to `import.meta.env.VITE_API_BASE_URL` (`API_BASE_URL`).
  */
 export function setConfiguredApiBaseUrl(url: string): string {
   const normalized = normalizeApiBaseUrl(url);
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
-      if (normalized) {
+      if (normalized && normalized !== API_BASE_URL) {
         window.localStorage.setItem(API_BASE_URL_STORAGE_KEY, normalized);
       } else {
         window.localStorage.removeItem(API_BASE_URL_STORAGE_KEY);
       }
+      const effective = normalized || getConfiguredApiBaseUrl();
+      window.dispatchEvent(
+        new CustomEvent('annpurna:backend-url-changed', { detail: { baseUrl: effective } })
+      );
+      return effective;
     } catch {
       // ignore
     }
   }
-  return normalized;
+  return normalized || getConfiguredApiBaseUrl();
 }
 
 /**
- * Resolves an `/api/...` path against the configured remote API base URL if applicable.
+ * Resolves any `/api/...` endpoint to the full production Netlify URL using `import.meta.env.VITE_API_BASE_URL`.
+ * Ensures relative `/api/...` paths are never used in the Android Capacitor app.
  */
 export function resolveApiUrl(pathOrUrl: string): string {
   if (!pathOrUrl || typeof pathOrUrl !== 'string') return pathOrUrl;
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
 
-  if (pathOrUrl.startsWith('/api')) {
-    const baseUrl = getConfiguredApiBaseUrl();
-    if (baseUrl) {
-      return `${baseUrl}${pathOrUrl}`;
-    }
+  const cleanPath = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
+  const baseUrl = getConfiguredApiBaseUrl() || API_BASE_URL;
+  return `${baseUrl}${cleanPath}`;
+}
+
+/**
+ * Executes an API request against the production Netlify backend URL (`import.meta.env.VITE_API_BASE_URL`).
+ * Works identically on both the Netlify website and the Android Capacitor APK.
+ */
+export function apiFetch(endpoint: string, init?: RequestInit): Promise<Response> {
+  const fullUrl = resolveApiUrl(endpoint);
+  return window.fetch(fullUrl, init);
+}
+
+/**
+ * Tests connectivity to a candidate Netlify Backend URL by calling `/api/health`.
+ */
+export async function verifyNetlifyBackendUrl(rawUrl: string): Promise<{
+  reachable: boolean;
+  normalizedUrl: string;
+  latencyMs?: number;
+  error?: string;
+}> {
+  const normalizedUrl = normalizeApiBaseUrl(rawUrl) || getConfiguredApiBaseUrl();
+  if (!normalizedUrl) {
+    return {
+      reachable: false,
+      normalizedUrl: '',
+      error: 'Please enter a valid Netlify URL (e.g. https://annpurnacholebhature.netlify.app).',
+    };
   }
-  return pathOrUrl;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8_000);
+  const startMs = Date.now();
+
+  try {
+    const res = await window.fetch(`${normalizedUrl}/api/health`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      mode: 'cors',
+      credentials: 'omit',
+      signal: controller.signal,
+    });
+    const { ok, data, isHtml } = await parseApiJsonResponse<any>(res);
+    if (ok && !isHtml && data?.status === 'UP') {
+      return {
+        reachable: true,
+        normalizedUrl,
+        latencyMs: Date.now() - startMs,
+      };
+    }
+    if (isHtml) {
+      return {
+        reachable: false,
+        normalizedUrl,
+        error:
+          'URL returned an HTML page instead of the Netlify API function. Check your Netlify deployment.',
+      };
+    }
+    return {
+      reachable: false,
+      normalizedUrl,
+      error: `Server responded with HTTP ${res.status}.`,
+    };
+  } catch (err: any) {
+    const isTimeout = err?.name === 'AbortError';
+    return {
+      reachable: false,
+      normalizedUrl,
+      error: isTimeout
+        ? 'Connection timed out after 8 seconds. Check the URL and internet connection.'
+        : `Could not reach ${normalizedUrl}: ${err?.message || 'Network error'}`,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -183,7 +284,6 @@ export async function parseApiJsonResponse<T = any>(
   }
 
   try {
-    // Clone if possible so body stream isn't locked if inspected elsewhere
     const target = typeof response.clone === 'function' ? response.clone() : response;
     rawText = await target.text();
   } catch {
@@ -208,7 +308,6 @@ export async function parseApiJsonResponse<T = any>(
     try {
       parsedData = JSON.parse(trimmed);
     } catch {
-      // Sometimes proxies wrap JSON or add trailing characters; try extracting outer JSON object/array
       const firstBrace = trimmed.indexOf('{');
       const lastBrace = trimmed.lastIndexOf('}');
       if (firstBrace !== -1 && lastBrace > firstBrace) {
@@ -233,13 +332,13 @@ export async function parseApiJsonResponse<T = any>(
 let fetchInterceptorInstalled = false;
 
 /**
- * Installs a transparent global `window.fetch` wrapper for `/api/*` requests.
+ * Installs a global `window.fetch` wrapper for all backend API requests.
  *
- * - Automatically prepends the configured remote API base URL when running in Capacitor.
- * - Ensures `Accept: application/json` header is included on API calls.
- * - If a `/api/*` request hits Capacitor's local Android WebView (`https://localhost`) and returns
- *   the SPA `index.html` with HTTP 200 (or fails with a connection error when no remote server is set),
- *   automatically executes the request via the embedded Capacitor local API engine (`capacitorLocalApi.ts`).
+ * - Ensures any `/api/*` request is always resolved to the full production Netlify URL
+ *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`).
+ * - Enforces an `AbortController` timeout on every API call so Android WebView requests never hang forever.
+ * - Uses `credentials: 'omit'` and `mode: 'cors'` on cross-origin requests so Bearer token auth
+ *   works across Capacitor (`https://localhost`) -> Netlify (`https://annpurnacholebhature.netlify.app`) without CORS failures.
  */
 export function installCapacitorApiFetchInterceptor(): void {
   if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
@@ -258,7 +357,6 @@ export function installCapacitorApiFetchInterceptor(): void {
       rawUrl = (input as Request).url;
     }
 
-    // Check if this is an internal `/api/` request
     const isRelativeApi = rawUrl.startsWith('/api/') || rawUrl === '/api';
     let apiPathWithQuery = '';
     if (isRelativeApi) {
@@ -278,50 +376,122 @@ export function installCapacitorApiFetchInterceptor(): void {
       return originalFetch(input, init);
     }
 
-    const resolvedUrl = isRelativeApi ? resolveApiUrl(apiPathWithQuery) : rawUrl;
+    const configuredBaseUrl = getConfiguredApiBaseUrl();
+    const inCapacitor = isCapacitorOrAndroidWebView();
+    const resolvedUrl = resolveApiUrl(apiPathWithQuery);
 
-    // Ensure Accept: application/json is present without mutating caller's headers
+    const isCrossOrigin =
+      /^https?:\/\//i.test(resolvedUrl) &&
+      typeof window !== 'undefined' &&
+      !resolvedUrl.startsWith(window.location.origin);
+
     const mergedHeaders = new Headers(init?.headers || {});
     if (!mergedHeaders.has('Accept')) {
       mergedHeaders.set('Accept', 'application/json');
     }
 
+    const isSheetsHeavyRoute =
+      apiPathWithQuery.includes('/batch-sync-sheets') ||
+      apiPathWithQuery.includes('/retry-sheets') ||
+      apiPathWithQuery.includes('/hydrate') ||
+      (apiPathWithQuery.startsWith('/api/bills') && (init?.method || 'GET').toUpperCase() === 'POST');
+
+    const timeoutMs = isSheetsHeavyRoute ? SHEETS_SYNC_TIMEOUT_MS : STANDARD_API_TIMEOUT_MS;
+    const controller = new AbortController();
+    const callerSignal = init?.signal;
+    const onCallerAbort = () => controller.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        controller.abort();
+      } else {
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     const updatedInit: RequestInit = {
       ...init,
       headers: mergedHeaders,
+      signal: controller.signal,
+      ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
     };
 
     try {
       const response = await originalFetch(resolvedUrl, updatedInit);
       const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
 
-      // If PDF endpoint returned a PDF, return directly
       if (contentType.includes('application/pdf')) {
         return response;
       }
 
-      // Inspect a clone of the response to check if Capacitor's local WebView server
-      // returned `index.html` (HTTP 200 text/html) for an `/api/*` route
       if (typeof response.clone === 'function') {
         const clonedText = await response
           .clone()
           .text()
           .catch(() => '');
         if (isHtmlPayload(clonedText)) {
-          // Capacitor WebView returned index.html with HTTP 200 for `/api/*`!
-          // Route through the embedded local API engine so the Android APK works seamlessly.
+          if (
+            configuredBaseUrl &&
+            (apiPathWithQuery.includes('/retry-sheets') ||
+              apiPathWithQuery.includes('/batch-sync-sheets'))
+          ) {
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: `Backend URL (${configuredBaseUrl}) returned an HTML page instead of the Netlify API. Verify your Netlify deployment.`,
+              }),
+              { status: 502, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
           return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
         }
       }
 
       return response;
-    } catch (networkErr) {
-      // If running inside Capacitor / Android WebView (or localhost without a backend server),
-      // handle the `/api/*` request locally rather than failing the Android APK.
-      if (isCapacitorOrAndroidWebView() || !getConfiguredApiBaseUrl()) {
+    } catch (networkErr: any) {
+      const isTimeout = networkErr?.name === 'AbortError';
+
+      // When running inside a local dev/preview server (e.g. localhost:3000 or *.run.app) and not Capacitor,
+      // allow fallback to the local Express backend if the remote production server is unreachable
+      if (!inCapacitor && isCrossOrigin && typeof window !== 'undefined') {
+        try {
+          const localDevRes = await originalFetch(`${window.location.origin}${apiPathWithQuery}`, {
+            ...init,
+            headers: mergedHeaders,
+          });
+          return localDevRes;
+        } catch {
+          // continue to standard fallback
+        }
+      }
+
+      // For explicit Google Sheets retry/batch-sync actions, surface the exact timeout/connection error
+      if (
+        configuredBaseUrl &&
+        (apiPathWithQuery.includes('/retry-sheets') ||
+          apiPathWithQuery.includes('/batch-sync-sheets'))
+      ) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: isTimeout
+              ? `Google Sheets sync timed out after ${Math.round(timeoutMs / 1000)}s contacting ${configuredBaseUrl}. Please check your internet connection and retry.`
+              : `Could not reach Netlify backend (${configuredBaseUrl}): ${networkErr?.message || 'Network error'}.`,
+          }),
+          { status: 504, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // For offline resilience in Capacitor Android APK, fall back to local persistent engine if offline
+      if (inCapacitor) {
         return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
       }
       throw networkErr;
+    } finally {
+      clearTimeout(timeoutId);
+      if (callerSignal) {
+        callerSignal.removeEventListener('abort', onCallerAbort);
+      }
     }
   };
 }

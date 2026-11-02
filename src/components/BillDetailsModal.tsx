@@ -62,21 +62,21 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
   const isSynced = bill.savedToSheets === true && bill.sheetsSyncStatus === 'synced';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
-      <div className="bg-white rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200 max-h-[92vh] flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-5 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
+      <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200 max-h-[93dvh] flex flex-col">
         {/* Modal Header */}
-        <div className="p-5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600">
+        <div className="p-3.5 sm:p-5 bg-slate-50 border-b border-slate-200 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600 shrink-0">
               <Receipt className="w-5 h-5" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-mono font-bold text-sm text-slate-900">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-mono font-bold text-xs sm:text-sm text-slate-900">
                   {bill.orderId || bill.billNumber}
                 </span>
                 <span
-                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${
                     isPack
                       ? 'bg-blue-100 text-blue-800'
                       : 'bg-emerald-100 text-emerald-800'
@@ -85,7 +85,7 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
                   {bill.orderTypeLabel}
                 </span>
               </div>
-              <p className="text-xs text-slate-500 font-mono mt-0.5">
+              <p className="text-[11px] sm:text-xs text-slate-500 font-mono mt-0.5 truncate">
                 ANNAPURNA CHOLE BHATURE • Bill #{bill.billNumber}
               </p>
             </div>
@@ -93,7 +93,7 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded-full transition cursor-pointer"
+            className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded-lg transition cursor-pointer shrink-0"
             title="Close"
           >
             <X className="w-5 h-5" />
@@ -101,9 +101,9 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
         </div>
 
         {/* Scrollable Content */}
-        <div className="p-5 overflow-y-auto space-y-4 text-sm flex-1">
+        <div className="p-3.5 sm:p-5 overflow-y-auto space-y-3.5 text-sm flex-1">
           {/* Customer & Payment Bar */}
-          <div className="grid grid-cols-2 gap-3 bg-slate-50/80 p-3.5 rounded-xl border border-slate-200/80">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50/80 p-3 rounded-lg border border-slate-200/80">
             <div>
               <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
                 Customer Details
@@ -142,8 +142,8 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
           </div>
 
           {/* Items Table */}
-          <div className="border border-slate-200 rounded-xl overflow-hidden">
-            <div className="bg-slate-100/80 px-3.5 py-2 text-xs font-semibold text-slate-600 grid grid-cols-12">
+          <div className="border border-slate-200 rounded-lg overflow-hidden">
+            <div className="bg-slate-100/80 px-3 py-2 text-xs font-semibold text-slate-600 grid grid-cols-12">
               <span className="col-span-6">Item</span>
               <span className="col-span-2 text-center">Qty</span>
               <span className="col-span-2 text-right">Price</span>
@@ -151,14 +151,14 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
             </div>
             <div className="divide-y divide-slate-100">
               {bill.items.map((item) => (
-                <div key={item.id} className="px-3.5 py-2 text-xs grid grid-cols-12 items-center">
-                  <span className="col-span-6 font-medium text-slate-800">{item.name}</span>
+                <div key={item.id} className="px-3 py-2 text-xs grid grid-cols-12 items-center">
+                  <span className="col-span-6 font-medium text-slate-800 truncate">{item.name}</span>
                   <span className="col-span-2 text-center font-mono text-slate-600">{item.quantity}</span>
                   <span className="col-span-2 text-right font-mono text-slate-600">
-                    ₹{item.unitPriceRupees.toFixed(2)}
+                    ₹{item.unitPriceRupees.toFixed(0)}
                   </span>
                   <span className="col-span-2 text-right font-mono font-bold text-slate-900">
-                    ₹{item.lineTotalRupees.toFixed(2)}
+                    ₹{item.lineTotalRupees.toFixed(0)}
                   </span>
                 </div>
               ))}
@@ -166,7 +166,7 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
           </div>
 
           {/* Pricing Totals Box (Always displays Subtotal, Discount %, Discount Amount, Final Payable) */}
-          <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-1.5 text-xs">
+          <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 space-y-1.5 text-xs">
             <div className="flex justify-between text-slate-600">
               <span>Subtotal:</span>
               <span className="font-mono font-semibold">₹{bill.subtotalRupees.toFixed(2)}</span>
@@ -191,19 +191,19 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
           </div>
 
           {/* Sync Status Banner */}
-          <div className="p-3 rounded-xl border flex items-center justify-between text-xs bg-white">
-            <div className="flex items-center gap-2">
+          <div className="p-3 rounded-lg border flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs bg-white">
+            <div className="flex items-start sm:items-center gap-2 min-w-0">
               {isSynced ? (
                 <>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <div>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5 sm:mt-0" />
+                  <div className="min-w-0">
                     <span className="font-bold text-emerald-800">Saved in Google Sheets</span>
                     {bill.spreadsheetUrl && (
                       <a
                         href={bill.spreadsheetUrl}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline block text-[11px] flex items-center gap-1"
+                        className="text-blue-600 hover:underline text-[11px] flex items-center gap-1"
                       >
                         <span>Open Spreadsheet</span>
                         <ExternalLink className="w-3 h-3" />
@@ -213,10 +213,10 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
                 </>
               ) : (
                 <>
-                  <AlertCircle className="w-4 h-4 text-amber-600" />
-                  <div>
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5 sm:mt-0" />
+                  <div className="min-w-0">
                     <span className="font-bold text-amber-900">Saved Locally — Pending Sheets Sync</span>
-                    <p className="text-[11px] text-slate-500">
+                    <p className="text-[11px] text-slate-500 break-words">
                       {bill.sheetsSyncError || 'Not yet recorded in connected Google Sheet'}
                     </p>
                   </div>
@@ -228,35 +228,35 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
               <button
                 onClick={() => onRetrySync(bill)}
                 disabled={isRetryingSync}
-                className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold rounded-lg text-xs flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold rounded-md text-xs flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer shrink-0 self-end sm:self-center"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isRetryingSync ? 'animate-spin' : ''}`} />
-                <span>Retry Sync</span>
+                <span>{isRetryingSync ? 'Syncing...' : 'Retry Sync'}</span>
               </button>
             )}
           </div>
         </div>
 
         {/* Modal Actions Footer */}
-        <div className="p-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
+        <div className="p-3.5 sm:p-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
             <button
               onClick={handleDownloadPdf}
-              className="px-3 py-2 bg-white hover:bg-slate-100 text-slate-700 font-semibold rounded-xl border border-slate-300 text-xs flex items-center gap-1.5 transition shadow-xs cursor-pointer"
+              className="px-3 py-2 bg-white hover:bg-slate-100 text-slate-700 font-semibold rounded-lg border border-slate-300 text-xs flex items-center gap-1.5 transition shadow-xs cursor-pointer"
             >
               <Download className="w-4 h-4 text-slate-500" />
               <span>PDF</span>
             </button>
             <button
               onClick={() => printPosReceipt(bill, '80mm')}
-              className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer"
+              className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 font-semibold rounded-lg text-xs flex items-center gap-1.5 transition cursor-pointer"
             >
               <Printer className="w-4 h-4 text-blue-700" />
               <span>Print 80mm</span>
             </button>
             <button
               onClick={() => printPosReceipt(bill, 'A4')}
-              className="px-3 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer"
+              className="px-3 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-semibold rounded-lg text-xs flex items-center gap-1.5 transition cursor-pointer"
             >
               <Printer className="w-4 h-4 text-slate-600" />
               <span>Print A4</span>
@@ -265,7 +265,7 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
 
           <button
             onClick={() => onShareWhatsApp(bill)}
-            className="px-4 py-2 bg-[#25D366] hover:bg-[#20ba59] text-white font-bold rounded-xl text-xs flex items-center gap-1.5 transition shadow-sm cursor-pointer"
+            className="px-4 py-2 bg-[#25D366] hover:bg-[#20ba59] text-white font-bold rounded-lg text-xs flex items-center gap-1.5 transition shadow-sm cursor-pointer"
           >
             <Share2 className="w-4 h-4" />
             <span>Send WhatsApp</span>

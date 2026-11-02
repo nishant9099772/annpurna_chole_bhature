@@ -6,7 +6,6 @@ import {
   Trash2,
   Receipt,
   User,
-  Phone,
   LogOut,
   Sparkles,
   FileSpreadsheet,
@@ -20,12 +19,11 @@ import {
   TrendingUp,
   DollarSign,
   Calendar,
-  Layers,
   CreditCard,
   Banknote,
   Smartphone,
-  ExternalLink,
-  Search,
+  Server,
+  Settings2,
 } from 'lucide-react';
 import {
   Bill,
@@ -48,7 +46,53 @@ import {
   loadPersistentBills,
   upsertPersistentBill,
 } from '../utils/persistentBillsStorage';
-import { parseApiJsonResponse } from '../utils/apiClient';
+import {
+  apiFetch,
+  parseApiJsonResponse,
+  getConfiguredApiBaseUrl,
+  setConfiguredApiBaseUrl,
+  verifyNetlifyBackendUrl,
+  isCapacitorOrAndroidWebView,
+} from '../utils/apiClient';
+
+/**
+ * Isolated memoized IST Clock component so 1-second ticks never re-render BillingDashboard.
+ */
+const LiveIstClock: React.FC = React.memo(() => {
+  const [timeStr, setTimeStr] = useState<string>(() =>
+    new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(new Date())
+  );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      setTimeStr(
+        new Intl.DateTimeFormat('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: true,
+        }).format(new Date())
+      );
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="hidden lg:flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs text-slate-600 font-mono">
+      <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+      <span>{timeStr} IST</span>
+    </div>
+  );
+});
+LiveIstClock.displayName = 'LiveIstClock';
 
 interface BillingDashboardProps {
   adminUsername: string;
@@ -91,7 +135,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
   // Customer Inputs
   const [customerName, setCustomerName] = useState('');
-  const [countryCode, setCountryCode] = useState('+91');
+  const [countryCode] = useState('+91');
   const [mobileNumber, setMobileNumber] = useState('');
 
   // Payment Method
@@ -101,11 +145,17 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [discountPercentInput, setDiscountPercentInput] = useState<string>('0');
   const [discountError, setDiscountError] = useState<string | null>(null);
 
-  // Custom Spreadsheet ID (persisted in localStorage)
+  // Custom Spreadsheet ID & Netlify Backend URL (persisted in localStorage)
+  const isNativeApk = useMemo(() => isCapacitorOrAndroidWebView(), []);
+  const [backendUrlInput, setBackendUrlInput] = useState<string>(() => getConfiguredApiBaseUrl());
+  const [isTestingBackend, setIsTestingBackend] = useState(false);
+
   const [customSpreadsheetId, setCustomSpreadsheetId] = useState<string>(() => {
     return localStorage.getItem('annpurna_custom_sheet_id') || '';
   });
-  const [showSheetSettings, setShowSheetSettings] = useState(false);
+  const [showSheetSettings, setShowSheetSettings] = useState<boolean>(
+    () => isCapacitorOrAndroidWebView() && !getConfiguredApiBaseUrl()
+  );
   const [isBatchSyncing, setIsBatchSyncing] = useState(false);
   const [batchSyncFeedback, setBatchSyncFeedback] = useState<string | null>(null);
   const [serverSheetsStatus, setServerSheetsStatus] = useState<{
@@ -114,6 +164,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     modeLabel: string;
     spreadsheetId: string;
     spreadsheetUrl: string;
+    requiresBackendUrl?: boolean;
   } | null>(null);
 
   const isSheetsConnected = Boolean(googleToken || serverSheetsStatus?.configured);
@@ -141,65 +192,68 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   // Submission & Saving States
   const [isSaving, setIsSaving] = useState(false);
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
-  const [currentTimeStr, setCurrentTimeStr] = useState('');
 
   // Fetch & Bidirectionally Hydrate Business Metrics & Server Google Sheets Status
-  const refreshMetrics = useCallback(async () => {
-    try {
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${adminToken}`,
-      };
-      if (googleToken) {
-        headers['x-google-token'] = googleToken;
-      }
-
-      const [hydratedResult, statusRes] = await Promise.all([
-        hydrateAndSyncBillsWithServer(adminToken, googleToken, customSpreadsheetId),
-        fetch('/api/sheets/status', { headers }),
-      ]);
-
-      if (statusRes.status === 401) {
-        onLogout();
-        return;
-      }
-
-      if (hydratedResult?.metrics) {
-        setMetrics(hydratedResult.metrics);
-      }
-
-      if (statusRes.ok) {
-        const { data: statusData } = await parseApiJsonResponse(statusRes);
-        if (statusData) {
-          setServerSheetsStatus(statusData);
+  const refreshMetrics = useCallback(
+    async (forceHydrate: boolean = false) => {
+      try {
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${adminToken}`,
+        };
+        if (googleToken) {
+          headers['x-google-token'] = googleToken;
         }
+
+        const sheetQuery = customSpreadsheetId.trim()
+          ? `?sheetId=${encodeURIComponent(customSpreadsheetId.trim())}`
+          : '';
+
+        const [hydratedResult, statusRes] = await Promise.all([
+          hydrateAndSyncBillsWithServer(adminToken, googleToken, customSpreadsheetId, forceHydrate),
+          apiFetch(`/api/sheets/status${sheetQuery}`, { headers }),
+        ]);
+
+        if (statusRes.status === 401) {
+          onLogout();
+          return;
+        }
+
+        if (hydratedResult?.metrics) {
+          setMetrics(hydratedResult.metrics);
+        }
+
+        if (statusRes.ok) {
+          const { data: statusData } = await parseApiJsonResponse(statusRes);
+          if (statusData) {
+            setServerSheetsStatus(statusData);
+          }
+        }
+      } catch (err: any) {
+        if (err?.status === 401) {
+          onLogout();
+          return;
+        }
+        setMetrics(computeBusinessMetricsFromBills(loadPersistentBills(), Date.now()));
       }
-    } catch (err: any) {
-      if (err?.status === 401) {
-        onLogout();
-        return;
-      }
-      console.log('Metrics load error:', err);
-      // Fallback to persistent local calculation so dashboard never blanks out
-      setMetrics(computeBusinessMetricsFromBills(loadPersistentBills(), Date.now()));
-    }
-  }, [adminToken, googleToken, customSpreadsheetId, onLogout]);
+    },
+    [adminToken, googleToken, customSpreadsheetId, onLogout]
+  );
 
   useEffect(() => {
-    refreshMetrics();
+    refreshMetrics(false);
   }, [refreshMetrics]);
 
-  // Automatic 24-hour rolling window evaluator:
-  // Re-evaluates the 24h rolling window every 15 seconds against actual transaction timestamps
-  // so transactions older than 24 hours automatically stop contributing to the 24h dashboard stats,
-  // and syncs with the server every 45 seconds.
+  // Automatic 24-hour rolling window evaluator
   useEffect(() => {
     const rollingTick = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       const currentPersistent = loadPersistentBills();
       setMetrics(computeBusinessMetricsFromBills(currentPersistent, Date.now()));
     }, 15_000);
 
     const serverSyncTick = setInterval(() => {
-      refreshMetrics();
+      if (typeof document !== 'undefined' && document.hidden) return;
+      refreshMetrics(false);
     }, 45_000);
 
     return () => {
@@ -208,42 +262,23 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     };
   }, [refreshMetrics]);
 
-  // Live Asia/Kolkata Clock
-  useEffect(() => {
-    const updateTime = () => {
-      const now = new Date();
-      const formatted = new Intl.DateTimeFormat('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: true,
-      }).format(now);
-      setCurrentTimeStr(formatted);
-    };
-
-    updateTime();
-    const timer = setInterval(updateTime, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
   // Quick Quantity Helpers
-  const updateQuantity = (key: MenuItemKey, delta: number) => {
+  const updateQuantity = useCallback((key: MenuItemKey, delta: number) => {
     setDraftItems((prev) => {
       const current = prev[key] || 0;
       const next = Math.max(0, current + delta);
       return { ...prev, [key]: next };
     });
     setItemsError(null);
-  };
+  }, []);
 
-  const setDirectQuantity = (key: MenuItemKey, value: number) => {
+  const setDirectQuantity = useCallback((key: MenuItemKey, value: number) => {
     const sanitized = Math.max(0, Math.floor(value));
     setDraftItems((prev) => ({ ...prev, [key]: sanitized }));
     setItemsError(null);
-  };
+  }, []);
 
-  const clearEntireBill = () => {
+  const clearEntireBill = useCallback(() => {
     setDraftItems({
       CHOLE_BHATURE: 0,
       LASSI: 0,
@@ -263,7 +298,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     setItemsError(null);
     setDiscountError(null);
     setSaveErrorMessage(null);
-  };
+  }, []);
 
   // Immediate Client-Side Calculations in Integer Paise
   const billSummary = useMemo(() => {
@@ -330,8 +365,68 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     };
   }, [draftItems, coldDrinkMRP, discountPercentInput]);
 
-  // Google Sign In action for Workspace
+  // Save & Verify Netlify Backend URL for Android APK -> Netlify Backend -> Google Sheets
+  const handleSaveBackendUrl = async () => {
+    const trimmed = backendUrlInput.trim();
+    if (!trimmed) {
+      setConfiguredApiBaseUrl('');
+      setBackendUrlInput('');
+      setBatchSyncFeedback('Cleared custom Netlify Backend URL.');
+      await refreshMetrics(true);
+      return;
+    }
+
+    setIsTestingBackend(true);
+    setBatchSyncFeedback(null);
+    try {
+      const check = await verifyNetlifyBackendUrl(trimmed);
+      const savedUrl = setConfiguredApiBaseUrl(check.normalizedUrl || trimmed);
+      setBackendUrlInput(savedUrl);
+
+      if (check.reachable) {
+        setBatchSyncFeedback(
+          `Connected to Netlify Backend (${savedUrl})! Refreshing Google Sheets status...`
+        );
+        if (onShowToast) {
+          onShowToast(`Connected to Netlify Server (${savedUrl})`);
+        }
+        await refreshMetrics(true);
+      } else {
+        setBatchSyncFeedback(
+          check.error || `Saved ${savedUrl}, but could not verify /api/health.`
+        );
+      }
+    } finally {
+      setIsTestingBackend(false);
+    }
+  };
+
+  // Google Sign In action (for desktop web browser OAuth; on Android APK, guides to Netlify Backend URL)
   const handleGoogleConnect = async () => {
+    if (isNativeApk && !getConfiguredApiBaseUrl()) {
+      setShowSheetSettings(true);
+      setBatchSyncFeedback(
+        'In the Android APK, enter your deployed Netlify HTTPS URL below to connect to Google Sheets via your Netlify backend.'
+      );
+      if (onShowToast) {
+        onShowToast('Enter your Netlify Backend URL in Settings to enable Google Sheets sync.');
+      }
+      return;
+    }
+
+    if (isNativeApk && getConfiguredApiBaseUrl()) {
+      await refreshMetrics(true);
+      if (serverSheetsStatus?.configured) {
+        if (onShowToast) onShowToast('Google Sheets is connected via your Netlify backend!');
+        return;
+      }
+      setShowSheetSettings(true);
+      setBatchSyncFeedback(
+        'Your Netlify backend is reachable, but Google Sheets credentials are not set in Netlify environment variables yet.'
+      );
+      return;
+    }
+
     try {
       const res = await googleSignIn();
       if (res) {
@@ -351,7 +446,6 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     } else if (raw.startsWith('0') && raw.length > 10) {
       raw = raw.slice(1);
     }
-    // Limit to 10 digits
     const cleaned = raw.slice(0, 10);
     setMobileNumber(cleaned);
     if (mobileError) setMobileError(null);
@@ -382,24 +476,29 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     }
   };
 
-  // Batch Sync Handler (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
+  // Batch Sync Handler (Android APK -> Netlify Backend -> Google Sheets API)
   const handleBatchSyncSheets = async () => {
-    if (!isSheetsConnected) {
-      handleGoogleConnect();
+    if (backendUrlInput.trim() && backendUrlInput.trim() !== getConfiguredApiBaseUrl()) {
+      setConfiguredApiBaseUrl(backendUrlInput.trim());
+    }
+
+    if (isNativeApk && !getConfiguredApiBaseUrl()) {
+      setShowSheetSettings(true);
+      setBatchSyncFeedback(
+        'Please enter your live Netlify Backend URL (e.g. https://your-site.netlify.app) first so the Android APK can sync with Google Sheets.'
+      );
       return;
     }
+
     setIsBatchSyncing(true);
     setBatchSyncFeedback(null);
     try {
-      let clientPendingBills: Bill[] = [];
-      try {
-        const raw = localStorage.getItem('annpurna_pending_sync_bills');
-        if (raw) clientPendingBills = JSON.parse(raw);
-      } catch {
-        // ignore
-      }
+      const allLocalBills = loadPersistentBills();
+      const unsyncedBills = allLocalBills.filter(
+        (b) => !b.savedToSheets || b.sheetsSyncStatus !== 'synced'
+      );
 
-      const res = await fetch('/api/bills/batch-sync-sheets', {
+      const res = await apiFetch('/api/bills/batch-sync-sheets', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -408,17 +507,17 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         body: JSON.stringify({
           googleAccessToken: googleToken || undefined,
           customSpreadsheetId: customSpreadsheetId.trim() || undefined,
-          clientPendingBills,
+          clientPendingBills: unsyncedBills,
         }),
       });
       const { ok, data } = await parseApiJsonResponse(res);
-      if (ok && data) {
+      if (ok && data?.success) {
         if (data.failedCount === 0) {
           localStorage.removeItem('annpurna_pending_sync_bills');
         }
         setBatchSyncFeedback(data.message || 'Batch sync completed successfully.');
         if (onShowToast) onShowToast(data.message || 'Google Sheets synchronized!');
-        refreshMetrics();
+        await refreshMetrics(true);
       } else {
         setBatchSyncFeedback(`Sync error: ${data?.error || 'Could not sync with Google Sheets'}`);
       }
@@ -439,13 +538,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     setItemsError(null);
     setDiscountError(null);
 
-    // 1. Order Type is required
     if (!orderType) {
       setOrderTypeError('Select Dine In or Pack');
       isValid = false;
     }
 
-    // 2. Customer Name
     const trimmedName = customerName.trim();
     if (!trimmedName) {
       setNameError('Name required');
@@ -455,8 +552,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       isValid = false;
     }
 
-    // 3. Mobile Number - STRICT 10 DIGIT INDIAN NUMBER
-    let rawMobile = mobileNumber.trim();
+    const rawMobile = mobileNumber.trim();
     let cleanMobile = rawMobile.replace(/\D/g, '');
     if (cleanMobile.startsWith('91') && cleanMobile.length === 12) {
       cleanMobile = cleanMobile.slice(2);
@@ -475,7 +571,6 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       isValid = false;
     }
 
-    // 4. Discount Percentage Validation
     const parsedPct = parseFloat(discountPercentInput);
     if (!isNaN(parsedPct)) {
       if (parsedPct < 0 || parsedPct > 100) {
@@ -484,13 +579,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       }
     }
 
-    // 5. Menu Items
     if (billSummary.lines.length === 0) {
       setItemsError('Add at least 1 item');
       isValid = false;
     }
 
-    // 6. Cold Drink MRP if selected
     if (draftItems.COLD_DRINK > 0) {
       const parsedMRP = parseFloat(coldDrinkMRP);
       if (isNaN(parsedMRP) || parsedMRP <= 0) {
@@ -510,7 +603,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     setSaveErrorMessage(null);
 
     try {
-      let rawMobile = mobileNumber.trim();
+      const rawMobile = mobileNumber.trim();
       let cleanMobile = rawMobile.replace(/\D/g, '');
       if (cleanMobile.startsWith('91') && cleanMobile.length === 12) {
         cleanMobile = cleanMobile.slice(2);
@@ -542,7 +635,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         customSpreadsheetId: customSpreadsheetId.trim() || undefined,
       };
 
-      const response = await fetch('/api/bills', {
+      const response = await apiFetch('/api/bills', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -598,15 +691,12 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         spreadsheetUrl: data.spreadsheetUrl,
       };
 
-      // Immediately persist the completed bill into the permanent ledger and update 24h rolling metrics
       const updatedPersistent = upsertPersistentBill(authoritativeBill);
       setMetrics(computeBusinessMetricsFromBills(updatedPersistent, Date.now()));
 
-      // Reset local billing inputs
       clearEntireBill();
-      refreshMetrics();
+      refreshMetrics(false);
 
-      // Trigger success modal
       onBillCompleted(authoritativeBill);
     } catch (err: any) {
       console.error('Save bill failed:', err);
@@ -617,35 +707,35 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col text-slate-800">
-      {/* SaaS Top Navigation Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+    <div className="min-h-dvh bg-slate-50 flex flex-col text-slate-800 pb-16 md:pb-0">
+      {/* Top Navigation Header */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs safe-top">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-4">
           {/* Brand Identity */}
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center font-black shadow-sm">
-              <UtensilsCrossed className="w-5 h-5" />
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg bg-blue-600 text-white flex items-center justify-center font-black shadow-xs shrink-0">
+              <UtensilsCrossed className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <h1 className="font-extrabold text-slate-900 tracking-tight text-base sm:text-lg">
+                <h1 className="font-extrabold text-slate-900 tracking-tight text-sm sm:text-lg truncate">
                   Annpurna Chole Bhature
                 </h1>
-                <span className="hidden sm:inline-block text-[11px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full">
-                  Billing Suite
+                <span className="hidden lg:inline-block text-[11px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-md shrink-0">
+                  POS Billing
                 </span>
               </div>
-              <p className="text-xs text-slate-500 font-medium hidden sm:block">
-                Admin POS • Google Sheets Sync • WhatsApp Receipts
+              <p className="text-[11px] text-slate-500 font-medium hidden sm:block truncate">
+                Admin Counter • Google Sheets Sync • WhatsApp Receipts
               </p>
             </div>
           </div>
 
-          {/* Navigation View Switcher (New Bill vs History vs Sales Calendar) */}
-          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200">
+          {/* Desktop Navigation View Switcher (Hidden on mobile where Bottom Nav is used) */}
+          <div className="hidden md:flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200">
             <button
               onClick={() => setActiveTab('terminal')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-1.5 rounded-md text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
                 activeTab === 'terminal'
                   ? 'bg-white text-blue-700 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -657,7 +747,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
             <button
               onClick={() => setActiveTab('history')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-1.5 rounded-md text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
                 activeTab === 'history'
                   ? 'bg-white text-blue-700 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -666,7 +756,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
               <History className="w-3.5 h-3.5" />
               <span>Bill History</span>
               {metrics.totalBills > 0 && (
-                <span className="bg-blue-100 text-blue-800 text-[10px] px-1.5 py-0.2 rounded-full font-mono">
+                <span className="bg-blue-100 text-blue-800 text-[10px] px-1.5 py-0.2 rounded font-mono">
                   {metrics.totalBills}
                 </span>
               )}
@@ -674,7 +764,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
             <button
               onClick={() => setActiveTab('calendar')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-1.5 rounded-md text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
                 activeTab === 'calendar'
                   ? 'bg-white text-blue-700 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -685,35 +775,37 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             </button>
           </div>
 
-          {/* Right Header Controls (Clock, Google Sheets connection, 3D Dish, Logout) */}
-          <div className="flex items-center gap-2 sm:gap-3">
-            {/* Live Kolkata Clock */}
-            <div className="hidden lg:flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl text-xs text-slate-600 font-mono">
-              <Clock className="w-3.5 h-3.5 text-blue-600" />
-              <span>{currentTimeStr} IST</span>
-            </div>
+          {/* Right Header Controls */}
+          <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+            <LiveIstClock />
 
             {/* Google Sheets Connection Status */}
             {isSheetsConnected ? (
-              <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 rounded-xl text-xs text-emerald-800">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                <span className="font-semibold hidden md:inline">Sheets Connected</span>
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowSheetSettings((prev) => !prev)}
+                className="flex items-center gap-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2.5 py-1.5 rounded-lg text-xs text-emerald-800 cursor-pointer transition"
+                title="Google Sheets Connected (Click for Settings)"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                <span className="font-semibold hidden sm:inline">Sheets Active</span>
+              </button>
             ) : (
               <button
-                onClick={handleGoogleConnect}
-                className="flex items-center gap-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 font-semibold px-2.5 py-1.5 rounded-xl text-xs transition cursor-pointer"
-                title="Connect Google Sheets"
+                type="button"
+                onClick={() => setShowSheetSettings((prev) => !prev)}
+                className="flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 font-semibold px-2.5 py-1.5 rounded-lg text-xs transition cursor-pointer"
+                title="Configure Google Sheets / Server Connection"
               >
-                <FileSpreadsheet className="w-3.5 h-3.5 text-blue-600" />
-                <span className="hidden sm:inline">Connect Sheets</span>
+                <FileSpreadsheet className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span className="hidden sm:inline">Setup Sheets</span>
               </button>
             )}
 
             {/* 3D Thali Preview */}
             <button
               onClick={onOpen3DModal}
-              className="p-2 text-slate-600 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition cursor-pointer"
+              className="p-2 text-slate-600 hover:text-blue-600 hover:bg-blue-50 rounded-lg border border-slate-200/80 transition cursor-pointer"
               title="Interactive 3D Dish View"
             >
               <Sparkles className="w-4 h-4 text-amber-500" />
@@ -722,7 +814,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             {/* Admin Logout */}
             <button
               onClick={onLogout}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition cursor-pointer"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition cursor-pointer"
               title={`Logout (${adminUsername})`}
             >
               <LogOut className="w-3.5 h-3.5" />
@@ -733,34 +825,36 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       </header>
 
       {/* Main Container */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-5 flex-1 w-full space-y-5">
+      <main className="max-w-7xl mx-auto px-3 sm:px-6 py-3.5 sm:py-5 flex-1 w-full space-y-3.5 sm:space-y-5">
         {/* Google Sheets Synchronization Status Banner */}
         <div
-          className={`p-3.5 sm:p-4 rounded-2xl border text-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-3 ${
+          className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border text-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-2.5 sm:gap-3 ${
             isSheetsConnected
               ? 'bg-emerald-50/80 border-emerald-200 text-emerald-950'
               : 'bg-amber-50/80 border-amber-200 text-amber-950'
           }`}
         >
-          <div className="flex items-center gap-3">
+          <div className="flex items-start sm:items-center gap-2.5">
             <div
-              className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+              className={`w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center shrink-0 ${
                 isSheetsConnected
                   ? 'bg-emerald-100 text-emerald-700'
                   : 'bg-amber-100 text-amber-700'
               }`}
             >
-              <FileSpreadsheet className="w-5 h-5" />
+              <FileSpreadsheet className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-extrabold text-sm">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-extrabold text-xs sm:text-sm">
                   {isSheetsConnected
                     ? 'Google Sheets Auto-Sync Active'
+                    : isNativeApk && !getConfiguredApiBaseUrl()
+                    ? 'Android APK: Connect Netlify Backend for Google Sheets'
                     : 'Local Database Mode (Google Sheets Sync Pending)'}
                 </span>
                 <span
-                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${
                     isSheetsConnected
                       ? 'bg-emerald-200/80 text-emerald-800'
                       : 'bg-amber-200/80 text-amber-800'
@@ -770,156 +864,207 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                     ? serverSheetsStatus.modeLabel
                     : googleToken
                     ? 'Google Workspace Connected'
+                    : getConfiguredApiBaseUrl()
+                    ? `Server: ${getConfiguredApiBaseUrl().replace(/^https?:\/\//, '')}`
                     : 'Offline Queue Active'}
                 </span>
               </div>
-              <p className="text-[11px] text-slate-600 mt-0.5">
+              <p className="text-[11px] text-slate-600 mt-0.5 leading-snug">
                 {isSheetsConnected
-                  ? `Every bill is verified and recorded in your Google Sheet across all required columns (${metrics.syncedBillsCount} bills synced).`
-                  : 'Bills are saved locally and queued safely. Connect your Google Account or configure Service Account environment variables in Netlify for automatic Google Sheets recording.'}
+                  ? `Every bill is verified and recorded in your Google Sheet (${metrics.syncedBillsCount} bills synced).`
+                  : isNativeApk && !getConfiguredApiBaseUrl()
+                  ? 'Enter your deployed Netlify HTTPS URL in Server & Sheet Settings below so this Android app routes all Google Sheets operations through your Netlify backend.'
+                  : 'Bills are saved locally and queued safely. Configure Netlify backend or Service Account variables for automatic Google Sheets recording.'}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 flex-wrap w-full md:w-auto justify-end">
-            {metrics.failedBillsCount > 0 && isSheetsConnected && (
+            {metrics.failedBillsCount > 0 && (
               <button
                 type="button"
                 onClick={handleBatchSyncSheets}
                 disabled={isBatchSyncing}
-                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs disabled:opacity-50"
+                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-md shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isBatchSyncing ? 'animate-spin' : ''}`} />
-                <span>Sync {metrics.failedBillsCount} Pending Bills</span>
+                <span>Sync {metrics.failedBillsCount} Pending</span>
               </button>
             )}
-            {!isSheetsConnected && (
+            {!isSheetsConnected && !isNativeApk && (
               <button
                 type="button"
                 onClick={handleGoogleConnect}
-                className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs"
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-md shadow-xs transition flex items-center gap-1.5 cursor-pointer text-xs"
               >
                 <FileSpreadsheet className="w-3.5 h-3.5" />
-                <span>Connect Google Account</span>
+                <span>Connect Google</span>
               </button>
             )}
             <button
               type="button"
               onClick={() => setShowSheetSettings(!showSheetSettings)}
-              className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 font-semibold rounded-lg transition text-xs cursor-pointer"
+              className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 font-semibold rounded-md transition text-xs cursor-pointer flex items-center gap-1"
             >
-              {showSheetSettings ? 'Hide Settings' : 'Sheet Settings'}
+              <Settings2 className="w-3.5 h-3.5 text-slate-500" />
+              <span>{showSheetSettings ? 'Hide Settings' : 'Server & Sheet Settings'}</span>
             </button>
           </div>
         </div>
 
-        {/* Collapsible Custom Sheet ID Settings */}
+        {/* Collapsible Netlify Backend URL & Custom Sheet ID Settings */}
         {showSheetSettings && (
-          <div className="bg-white p-4 rounded-2xl border border-slate-200 text-xs space-y-2">
-            <h4 className="font-bold text-slate-900">Custom Google Sheet Configuration</h4>
-            <p className="text-slate-500">
-              By default, bills are saved to a dedicated Google Sheet named &quot;Annpurna Chole Bhature - Billing Records&quot;.
-              You can also specify a custom Spreadsheet ID or full Google Sheets URL below:
-            </p>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={customSpreadsheetId}
-                onChange={(e) => {
-                  setCustomSpreadsheetId(e.target.value);
-                  localStorage.setItem('annpurna_custom_sheet_id', e.target.value);
-                }}
-                placeholder="Paste Spreadsheet ID or full Google Sheet URL..."
-                className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl font-mono text-xs focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-              />
-              <button
-                type="button"
-                onClick={handleBatchSyncSheets}
-                disabled={isBatchSyncing}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs disabled:opacity-50 transition"
-              >
-                Save &amp; Sync
-              </button>
+          <div className="bg-white p-3.5 sm:p-4 rounded-lg sm:rounded-xl border border-slate-200 text-xs space-y-3 shadow-xs">
+            {/* Netlify Backend URL (Critical for Android APK -> Netlify Backend -> Google Sheets) */}
+            <div className="space-y-1.5 pb-3 border-b border-slate-100">
+              <div className="flex items-center justify-between">
+                <h4 className="font-bold text-slate-900 flex items-center gap-1.5">
+                  <Server className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Production Netlify Backend URL (Android APK → Netlify → Google Sheets)</span>
+                </h4>
+                {getConfiguredApiBaseUrl() && (
+                  <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
+                    Active
+                  </span>
+                )}
+              </div>
+              <p className="text-slate-500 text-[11px]">
+                All Google Sheets credentials remain securely on your Netlify backend. Enter your deployed Netlify site URL (e.g. <code className="font-mono text-slate-700">https://your-site.netlify.app</code>) so the Android APK communicates with Google Sheets through Netlify:
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="url"
+                  value={backendUrlInput}
+                  onChange={(e) => setBackendUrlInput(e.target.value)}
+                  placeholder="https://your-site-name.netlify.app"
+                  className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveBackendUrl}
+                  disabled={isTestingBackend}
+                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-lg text-xs disabled:opacity-50 transition cursor-pointer flex items-center justify-center gap-1.5 shrink-0"
+                >
+                  {isTestingBackend ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
+                  <span>{isTestingBackend ? 'Verifying Server...' : 'Connect & Verify Server'}</span>
+                </button>
+              </div>
             </div>
+
+            {/* Custom Google Sheet ID */}
+            <div className="space-y-1.5">
+              <h4 className="font-bold text-slate-900">Custom Google Sheet ID (Optional Override)</h4>
+              <p className="text-slate-500 text-[11px]">
+                Leave blank to use the <code className="font-mono text-slate-700">GOOGLE_SHEET_ID</code> configured in your Netlify environment variables, or paste a specific Spreadsheet ID / URL:
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  value={customSpreadsheetId}
+                  onChange={(e) => {
+                    setCustomSpreadsheetId(e.target.value);
+                    localStorage.setItem('annpurna_custom_sheet_id', e.target.value);
+                  }}
+                  placeholder="Optional: Paste Spreadsheet ID or full Google Sheet URL..."
+                  className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleBatchSyncSheets}
+                  disabled={isBatchSyncing}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg text-xs disabled:opacity-50 transition cursor-pointer flex items-center justify-center gap-1.5 shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isBatchSyncing ? 'animate-spin' : ''}`} />
+                  <span>{isBatchSyncing ? 'Syncing with Sheets...' : 'Save & Sync All Bills'}</span>
+                </button>
+              </div>
+            </div>
+
             {batchSyncFeedback && (
-              <p className="text-xs font-semibold text-blue-700 mt-1">{batchSyncFeedback}</p>
+              <div className="p-2.5 rounded-md bg-blue-50 border border-blue-200 text-xs font-semibold text-blue-800">
+                {batchSyncFeedback}
+              </div>
             )}
           </div>
         )}
 
-        {/* SaaS Metrics Dashboard Cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
+        {/* Metrics Dashboard Cards (Compact 2x2 grid on mobile, 4-col on desktop) */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4">
           {/* Card 1: Rolling 24-Hour Sales */}
-          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-            <div>
-              <div className="flex items-center gap-1.5">
-                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                  24-Hour Sales
+          <div className="bg-white p-3 sm:p-4 rounded-lg sm:rounded-xl border border-slate-200 shadow-xs flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                  24h Sales
                 </p>
-                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
-                  Rolling 24h
+                <span className="text-[9px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
+                  Rolling
                 </span>
               </div>
-              <h3 className="text-xl sm:text-2xl font-black text-slate-900 font-mono mt-1">
+              <h3 className="text-base sm:text-2xl font-black text-slate-900 font-mono mt-0.5 truncate">
                 ₹{metrics.todaySalesRupees.toFixed(2)}
               </h3>
-              <p className="text-[11px] text-slate-500 mt-0.5">
-                {metrics.todayBillsCount} {metrics.todayBillsCount === 1 ? 'bill' : 'bills'} in last 24h
+              <p className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
+                {metrics.todayBillsCount} {metrics.todayBillsCount === 1 ? 'bill' : 'bills'} in 24h
               </p>
             </div>
-            <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center">
-              <TrendingUp className="w-5 h-5" />
+            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+              <TrendingUp className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
           </div>
 
           {/* Card 2: Monthly Sales */}
-          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                {metrics.currentMonthName || 'Monthly'} Sales
+          <div className="bg-white p-3 sm:p-4 rounded-lg sm:rounded-xl border border-slate-200 shadow-xs flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider truncate">
+                {metrics.currentMonthName || 'Monthly'}
               </p>
-              <h3 className="text-xl sm:text-2xl font-black text-slate-900 font-mono mt-1">
+              <h3 className="text-base sm:text-2xl font-black text-slate-900 font-mono mt-0.5 truncate">
                 ₹{metrics.monthlySalesRupees.toFixed(2)}
               </h3>
-              <p className="text-[11px] text-slate-500 mt-0.5">
+              <p className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
                 {metrics.monthlyBillsCount} bills this month
               </p>
             </div>
-            <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
-              <Calendar className="w-5 h-5" />
+            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+              <Calendar className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
           </div>
 
           {/* Card 3: Total Bills */}
-          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Total Bills</p>
-              <h3 className="text-xl sm:text-2xl font-black text-slate-900 font-mono mt-1">
+          <div className="bg-white p-3 sm:p-4 rounded-lg sm:rounded-xl border border-slate-200 shadow-xs flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                Total Bills
+              </p>
+              <h3 className="text-base sm:text-2xl font-black text-slate-900 font-mono mt-0.5">
                 {metrics.totalBills}
               </h3>
-              <p className="text-[11px] text-slate-500 mt-0.5">
+              <p className="text-[10px] sm:text-[11px] text-slate-500 mt-0.5 truncate">
                 All time recorded
               </p>
             </div>
-            <div className="w-10 h-10 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
-              <Receipt className="w-5 h-5" />
+            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-purple-50 text-purple-600 flex items-center justify-center shrink-0">
+              <Receipt className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
           </div>
 
           {/* Card 4: Total Revenue & Sync Status */}
-          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Total Revenue</p>
-              <h3 className="text-xl sm:text-2xl font-black text-blue-700 font-mono mt-1">
+          <div className="bg-white p-3 sm:p-4 rounded-lg sm:rounded-xl border border-slate-200 shadow-xs flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                Total Revenue
+              </p>
+              <h3 className="text-base sm:text-2xl font-black text-blue-700 font-mono mt-0.5 truncate">
                 ₹{metrics.totalRevenueRupees.toFixed(2)}
               </h3>
-              <p className="text-[11px] text-emerald-600 font-medium mt-0.5 flex items-center gap-1">
-                <CheckCircle2 className="w-3 h-3 inline" />
+              <p className="text-[10px] sm:text-[11px] text-emerald-600 font-medium mt-0.5 flex items-center gap-1 truncate">
+                <CheckCircle2 className="w-3 h-3 inline shrink-0" />
                 <span>{metrics.syncedBillsCount} synced</span>
               </p>
             </div>
-            <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
-              <DollarSign className="w-5 h-5" />
+            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
+              <DollarSign className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
           </div>
         </div>
@@ -937,19 +1082,19 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             adminToken={adminToken}
             googleToken={googleToken}
             onShareWhatsApp={onShareWhatsApp}
-            onRefreshMetrics={refreshMetrics}
+            onRefreshMetrics={() => refreshMetrics(true)}
           />
         ) : (
-          /* Billing Terminal: 2 Column Layout (Left: Items & Customer, Right: Bill Summary & Checkout) */
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-            {/* Left Column (8 cols): Order Type, Customer Details & Menu Items */}
-            <div className="lg:col-span-7 space-y-4">
+          /* Billing Terminal: 2 Column Layout on Desktop, Clean Stacked Layout on Mobile */
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 sm:gap-5">
+            {/* Left Column (7 cols): Order Type, Customer Details & Menu Items */}
+            <div className="lg:col-span-7 space-y-3.5 sm:space-y-4">
               {/* Order Type & Customer Details Card */}
-              <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200 shadow-xs space-y-4">
+              <div className="bg-white rounded-lg sm:rounded-xl p-3.5 sm:p-5 border border-slate-200 shadow-xs space-y-3.5">
                 {/* 1. Order Type Selection (Required) */}
                 <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <label className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1">
                       <span>Order Type</span>
                       <span className="text-rose-500">*</span>
                     </label>
@@ -961,20 +1106,20 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                     )}
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-2 gap-2.5">
                     <button
                       type="button"
                       onClick={() => {
                         setOrderType('DINE_IN');
                         setOrderTypeError(null);
                       }}
-                      className={`py-3 px-4 rounded-xl border text-sm font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
+                      className={`py-2.5 px-3 rounded-lg border text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
                         orderType === 'DINE_IN'
-                          ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                          ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
                           : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
                       }`}
                     >
-                      <Utensils className="w-4 h-4" />
+                      <Utensils className="w-4 h-4 shrink-0" />
                       <span>Dine In</span>
                     </button>
 
@@ -984,20 +1129,20 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                         setOrderType('PACK');
                         setOrderTypeError(null);
                       }}
-                      className={`py-3 px-4 rounded-xl border text-sm font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
+                      className={`py-2.5 px-3 rounded-lg border text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition cursor-pointer ${
                         orderType === 'PACK'
-                          ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                          ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
                           : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
                       }`}
                     >
-                      <Package className="w-4 h-4" />
+                      <Package className="w-4 h-4 shrink-0" />
                       <span>Pack (Takeaway)</span>
                     </button>
                   </div>
                 </div>
 
                 {/* 2. Customer Name & Mobile */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-0.5">
                   {/* Customer Name */}
                   <div>
                     <div className="flex items-center justify-between mb-1">
@@ -1025,7 +1170,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                           }
                         }}
                         placeholder="e.g. Rahul → Rahul Ji"
-                        className={`w-full pl-9 pr-3 py-2 bg-slate-50 border rounded-xl text-sm font-medium focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
+                        className={`w-full pl-9 pr-3 py-2 bg-slate-50 border rounded-lg text-base sm:text-sm font-medium focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
                           nameError ? 'border-rose-400 bg-rose-50/50' : 'border-slate-200'
                         }`}
                       />
@@ -1048,17 +1193,18 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       )}
                     </div>
                     <div className="flex">
-                      <span className="inline-flex items-center px-2.5 py-2 rounded-l-xl border border-r-0 border-slate-200 bg-slate-100 text-slate-600 font-mono text-xs font-bold">
+                      <span className="inline-flex items-center px-2.5 py-2 rounded-l-lg border border-r-0 border-slate-200 bg-slate-100 text-slate-600 font-mono text-xs font-bold">
                         {countryCode}
                       </span>
                       <div className="relative flex-1">
                         <input
                           type="tel"
+                          inputMode="numeric"
                           value={mobileNumber}
                           onChange={handleMobileChange}
                           placeholder="9876543210 (10 digits)"
                           maxLength={10}
-                          className={`w-full px-3 py-2 bg-slate-50 border rounded-r-xl text-sm font-mono font-medium focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
+                          className={`w-full px-3 py-2 bg-slate-50 border rounded-r-lg text-base sm:text-sm font-mono font-medium focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
                             mobileError ? 'border-rose-400 bg-rose-50/50' : 'border-slate-200'
                           }`}
                         />
@@ -1069,8 +1215,8 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                 </div>
               </div>
 
-              {/* Menu Items Card (Single-Row Compact Steppers) */}
-              <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200 shadow-xs space-y-3">
+              {/* Menu Items Card (Touch-friendly Steppers) */}
+              <div className="bg-white rounded-lg sm:rounded-xl p-3.5 sm:p-5 border border-slate-200 shadow-xs space-y-2.5">
                 <div className="flex items-center justify-between">
                   <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
                     <UtensilsCrossed className="w-4 h-4 text-blue-600" />
@@ -1083,11 +1229,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                 <div className="divide-y divide-slate-100">
                   {/* Chole Bhature - ₹80 */}
-                  <div className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="py-2.5 flex items-center justify-between gap-2.5">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <h4 className="font-bold text-slate-900 text-sm">Chole Bhature</h4>
-                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md">
+                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded">
                           ₹80
                         </span>
                       </div>
@@ -1098,21 +1244,22 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       <button
                         type="button"
                         onClick={() => updateQuantity('CHOLE_BHATURE', -1)}
-                        className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Minus className="w-4 h-4" />
                       </button>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="0"
                         value={draftItems.CHOLE_BHATURE}
                         onChange={(e) => setDirectQuantity('CHOLE_BHATURE', Number(e.target.value))}
-                        className="w-12 h-8 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        className="w-12 h-9 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       />
                       <button
                         type="button"
                         onClick={() => updateQuantity('CHOLE_BHATURE', 1)}
-                        className="w-8 h-8 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Plus className="w-4 h-4" />
                       </button>
@@ -1120,11 +1267,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   </div>
 
                   {/* Lassi - ₹40 */}
-                  <div className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="py-2.5 flex items-center justify-between gap-2.5">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <h4 className="font-bold text-slate-900 text-sm">Lassi</h4>
-                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md">
+                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded">
                           ₹40
                         </span>
                       </div>
@@ -1135,21 +1282,22 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       <button
                         type="button"
                         onClick={() => updateQuantity('LASSI', -1)}
-                        className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Minus className="w-4 h-4" />
                       </button>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="0"
                         value={draftItems.LASSI}
                         onChange={(e) => setDirectQuantity('LASSI', Number(e.target.value))}
-                        className="w-12 h-8 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        className="w-12 h-9 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       />
                       <button
                         type="button"
                         onClick={() => updateQuantity('LASSI', 1)}
-                        className="w-8 h-8 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Plus className="w-4 h-4" />
                       </button>
@@ -1157,11 +1305,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   </div>
 
                   {/* Chole (Extra) - ₹40 */}
-                  <div className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="py-2.5 flex items-center justify-between gap-2.5">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <h4 className="font-bold text-slate-900 text-sm">Chole</h4>
-                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md">
+                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded">
                           ₹40
                         </span>
                       </div>
@@ -1172,21 +1320,22 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       <button
                         type="button"
                         onClick={() => updateQuantity('CHOLE', -1)}
-                        className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Minus className="w-4 h-4" />
                       </button>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="0"
                         value={draftItems.CHOLE}
                         onChange={(e) => setDirectQuantity('CHOLE', Number(e.target.value))}
-                        className="w-12 h-8 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        className="w-12 h-9 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       />
                       <button
                         type="button"
                         onClick={() => updateQuantity('CHOLE', 1)}
-                        className="w-8 h-8 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Plus className="w-4 h-4" />
                       </button>
@@ -1194,11 +1343,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   </div>
 
                   {/* Bhature (Single) - ₹25 */}
-                  <div className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="py-2.5 flex items-center justify-between gap-2.5">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <h4 className="font-bold text-slate-900 text-sm">Bhature</h4>
-                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md">
+                        <span className="font-mono font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded">
                           ₹25
                         </span>
                       </div>
@@ -1209,21 +1358,22 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       <button
                         type="button"
                         onClick={() => updateQuantity('BHATURE', -1)}
-                        className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Minus className="w-4 h-4" />
                       </button>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="0"
                         value={draftItems.BHATURE}
                         onChange={(e) => setDirectQuantity('BHATURE', Number(e.target.value))}
-                        className="w-12 h-8 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        className="w-12 h-9 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       />
                       <button
                         type="button"
                         onClick={() => updateQuantity('BHATURE', 1)}
-                        className="w-8 h-8 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Plus className="w-4 h-4" />
                       </button>
@@ -1231,44 +1381,57 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   </div>
 
                   {/* Cold Drink - Admin MRP Input */}
-                  <div className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="py-2.5 flex items-center justify-between gap-2.5">
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <h4 className="font-bold text-slate-900 text-sm">Cold Drink</h4>
-                        <span className="text-[11px] font-semibold text-slate-500">MRP:</span>
-                        <div className="relative w-16">
-                          <span className="absolute inset-y-0 left-1.5 flex items-center text-xs text-slate-400">₹</span>
-                          <input
-                            type="number"
-                            min="1"
-                            value={coldDrinkMRP}
-                            onChange={(e) => setColdDrinkMRP(e.target.value)}
-                            className="w-full pl-4 pr-1 py-0.5 bg-slate-50 border border-slate-200 rounded text-xs font-mono font-bold"
-                          />
+                        <div className="flex items-center gap-1">
+                          <span className="text-[11px] font-semibold text-slate-500">MRP:</span>
+                          <div className="relative w-16">
+                            <span className="absolute inset-y-0 left-1.5 flex items-center text-xs text-slate-400">
+                              ₹
+                            </span>
+                            <input
+                              type="number"
+                              inputMode="decimal"
+                              min="1"
+                              value={coldDrinkMRP}
+                              onChange={(e) => {
+                                setColdDrinkMRP(e.target.value);
+                                if (coldDrinkError) setColdDrinkError(null);
+                              }}
+                              className="w-full pl-4 pr-1 py-0.5 bg-slate-50 border border-slate-200 rounded text-xs font-mono font-bold"
+                            />
+                          </div>
                         </div>
                       </div>
-                      <p className="text-xs text-slate-400 truncate">Chilled Soft Drink bottle</p>
+                      {coldDrinkError ? (
+                        <p className="text-[11px] text-rose-600 font-semibold">{coldDrinkError}</p>
+                      ) : (
+                        <p className="text-xs text-slate-400 truncate">Chilled Soft Drink bottle</p>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
                         onClick={() => updateQuantity('COLD_DRINK', -1)}
-                        className="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Minus className="w-4 h-4" />
                       </button>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="0"
                         value={draftItems.COLD_DRINK}
                         onChange={(e) => setDirectQuantity('COLD_DRINK', Number(e.target.value))}
-                        className="w-12 h-8 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        className="w-12 h-9 text-center font-mono font-bold text-sm bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       />
                       <button
                         type="button"
                         onClick={() => updateQuantity('COLD_DRINK', 1)}
-                        className="w-8 h-8 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center transition cursor-pointer font-bold"
+                        className="w-9 h-9 rounded-md bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white flex items-center justify-center transition cursor-pointer font-bold"
                       >
                         <Plus className="w-4 h-4" />
                       </button>
@@ -1279,9 +1442,9 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             </div>
 
             {/* Right Column (5 cols): Bill Summary, Discount, Payment & Save */}
-            <div className="lg:col-span-5 space-y-4">
-              <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200 shadow-xs space-y-4">
-                <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div className="lg:col-span-5 space-y-3.5 sm:space-y-4">
+              <div className="bg-white rounded-lg sm:rounded-xl p-3.5 sm:p-5 border border-slate-200 shadow-xs space-y-3.5">
+                <div className="flex items-center justify-between pb-2.5 border-b border-slate-100">
                   <h3 className="font-extrabold text-slate-900 text-sm flex items-center gap-2">
                     <Receipt className="w-4 h-4 text-blue-600" />
                     <span>Bill Summary</span>
@@ -1290,7 +1453,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   {billSummary.lines.length > 0 && (
                     <button
                       onClick={clearEntireBill}
-                      className="text-xs text-rose-600 hover:text-rose-800 font-semibold flex items-center gap-1"
+                      className="text-xs text-rose-600 hover:text-rose-800 font-semibold flex items-center gap-1 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                       <span>Clear</span>
@@ -1300,13 +1463,13 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                 {/* Items Breakdown */}
                 {billSummary.lines.length === 0 ? (
-                  <div className="py-6 text-center text-slate-400">
-                    <UtensilsCrossed className="w-8 h-8 mx-auto text-slate-200 mb-1" />
+                  <div className="py-5 text-center text-slate-400">
+                    <UtensilsCrossed className="w-7 h-7 mx-auto text-slate-200 mb-1" />
                     <p className="text-xs">No items added yet</p>
                     <p className="text-[11px] text-slate-300">Tap + to add items from the menu</p>
                   </div>
                 ) : (
-                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-44 overflow-y-auto pr-1">
                     {billSummary.lines.map((line) => (
                       <div key={line.key} className="flex items-center justify-between text-xs">
                         <div className="flex items-center gap-2">
@@ -1323,7 +1486,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                 {/* Payment Method Selector */}
                 <div className="pt-2 border-t border-slate-100">
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
                     Payment Method
                   </label>
                   <div className="grid grid-cols-3 gap-2">
@@ -1332,15 +1495,15 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                         key={m}
                         type="button"
                         onClick={() => setPaymentMethod(m)}
-                        className={`py-2 px-2 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                        className={`py-2 px-2 rounded-lg border text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
                           paymentMethod === m
                             ? 'bg-blue-50 border-blue-600 text-blue-700 shadow-xs'
                             : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
                         }`}
                       >
-                        {m === 'Cash' && <Banknote className="w-3.5 h-3.5 text-emerald-600" />}
-                        {m === 'UPI' && <Smartphone className="w-3.5 h-3.5 text-blue-600" />}
-                        {m === 'Card' && <CreditCard className="w-3.5 h-3.5 text-purple-600" />}
+                        {m === 'Cash' && <Banknote className="w-3.5 h-3.5 text-emerald-600 shrink-0" />}
+                        {m === 'UPI' && <Smartphone className="w-3.5 h-3.5 text-blue-600 shrink-0" />}
+                        {m === 'Card' && <CreditCard className="w-3.5 h-3.5 text-purple-600 shrink-0" />}
                         <span>{m}</span>
                       </button>
                     ))}
@@ -1349,7 +1512,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                 {/* Discount Percentage Input */}
                 <div className="pt-2 border-t border-slate-100">
-                  <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center justify-between mb-1.5">
                     <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">
                       Discount (%)
                     </label>
@@ -1376,25 +1539,28 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   <div className="relative">
                     <input
                       type="number"
+                      inputMode="decimal"
                       min="0"
                       max="100"
                       step="any"
                       value={discountPercentInput}
                       onChange={handleDiscountPercentChange}
                       placeholder="0"
-                      className={`w-full pl-3 pr-8 py-1.5 bg-slate-50 border rounded-xl text-sm font-mono font-bold focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
+                      className={`w-full pl-3 pr-8 py-2 bg-slate-50 border rounded-lg text-base sm:text-sm font-mono font-bold focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500 ${
                         discountError ? 'border-rose-400 bg-rose-50/50' : 'border-slate-200'
                       }`}
                     />
-                    <span className="absolute inset-y-0 right-3 flex items-center text-xs font-bold text-slate-500">%</span>
+                    <span className="absolute inset-y-0 right-3 flex items-center text-xs font-bold text-slate-500">
+                      %
+                    </span>
                   </div>
                   {discountError && (
                     <p className="text-[11px] text-rose-600 font-semibold mt-1">{discountError}</p>
                   )}
                 </div>
 
-                {/* Totals Box: Subtotal, Discount %, Discount Amount (Rs), Final Payable Amount */}
-                <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2 text-xs">
+                {/* Totals Box */}
+                <div className="bg-slate-50 p-3 sm:p-3.5 rounded-lg border border-slate-200 space-y-1.5 text-xs">
                   <div className="flex justify-between text-slate-600">
                     <span className="font-medium">Subtotal:</span>
                     <span className="font-mono font-bold">₹{billSummary.subtotalRupees.toFixed(2)}</span>
@@ -1425,7 +1591,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
                 {/* Save Error Message */}
                 {saveErrorMessage && (
-                  <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2">
+                  <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-xs flex items-center gap-2">
                     <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
                     <span>{saveErrorMessage}</span>
                   </div>
@@ -1436,17 +1602,17 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   type="button"
                   onClick={handleSaveBill}
                   disabled={isSaving}
-                  className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 active:scale-[0.99] text-white font-extrabold rounded-xl shadow-md transition flex items-center justify-center gap-2 text-sm disabled:opacity-50 cursor-pointer"
+                  className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-extrabold rounded-lg shadow-sm transition flex items-center justify-center gap-2 text-sm disabled:opacity-50 cursor-pointer"
                 >
                   {isSaving ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Saving to Sheets & Database...</span>
+                      <span>Saving to Sheets &amp; Database...</span>
                     </>
                   ) : (
                     <>
                       <Receipt className="w-4 h-4" />
-                      <span>Generate & Save Bill</span>
+                      <span>Generate &amp; Save Bill</span>
                     </>
                   )}
                 </button>
@@ -1465,6 +1631,60 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           />
         )}
       </main>
+
+      {/* Mobile Bottom Navigation Bar (Ergonomic One-Handed POS Switching on Phone Screens) */}
+      <nav
+        aria-label="Mobile Primary Navigation"
+        className="md:hidden fixed bottom-0 inset-x-0 z-30 bg-white border-t border-slate-200 shadow-lg safe-bottom"
+      >
+        <div className="grid grid-cols-3 h-14">
+          <button
+            type="button"
+            onClick={() => setActiveTab('terminal')}
+            className={`flex flex-col items-center justify-center gap-0.5 text-[11px] font-bold transition cursor-pointer ${
+              activeTab === 'terminal'
+                ? 'text-blue-600 bg-blue-50/50'
+                : 'text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <Receipt className="w-4 h-4" />
+            <span>New Bill</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('history')}
+            className={`flex flex-col items-center justify-center gap-0.5 text-[11px] font-bold transition cursor-pointer relative ${
+              activeTab === 'history'
+                ? 'text-blue-600 bg-blue-50/50'
+                : 'text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <div className="relative flex items-center">
+              <History className="w-4 h-4" />
+              {metrics.totalBills > 0 && (
+                <span className="ml-1 bg-blue-100 text-blue-800 text-[9px] px-1.5 rounded font-mono">
+                  {metrics.totalBills}
+                </span>
+              )}
+            </div>
+            <span>Bill History</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('calendar')}
+            className={`flex flex-col items-center justify-center gap-0.5 text-[11px] font-bold transition cursor-pointer ${
+              activeTab === 'calendar'
+                ? 'text-blue-600 bg-blue-50/50'
+                : 'text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <Calendar className="w-4 h-4" />
+            <span>Sales Calendar</span>
+          </button>
+        </div>
+      </nav>
     </div>
   );
 };

@@ -1,10 +1,36 @@
 @import "tailwindcss";
 
 @layer base {
+  html,
   body {
-    @apply antialiased bg-[#FFFDF9] text-slate-800;
+    @apply antialiased bg-slate-50 text-slate-800;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+    text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
   }
+
+  #root {
+    min-height: 100dvh;
+    overflow-x: hidden;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    touch-action: manipulation;
+  }
+}
+
+/* Safe area helpers for Capacitor Android & notched mobile screens */
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* Official Google Sign-In Material Button Styling */
@@ -13,7 +39,7 @@
   appearance: none;
   background-color: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 0.75rem;
+  border-radius: 0.5rem;
   box-sizing: border-box;
   color: #1e293b;
   cursor: pointer;

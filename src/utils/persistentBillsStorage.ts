@@ -5,7 +5,7 @@ import {
   getKolkataDateString,
   resolveBillTimestampMs,
 } from './billTimestamp';
-import { parseApiJsonResponse } from './apiClient';
+import { apiFetch, parseApiJsonResponse } from './apiClient';
 
 export const PERSISTENT_BILLS_STORAGE_KEY = 'annpurna_persistent_bills_v1';
 export const LEGACY_PENDING_BILLS_KEY = 'annpurna_pending_sync_bills';
@@ -74,70 +74,100 @@ export function upsertPersistentBill(bill: Bill): Bill[] {
   return savePersistentBills([bill]);
 }
 
+let inFlightHydrationPromise: Promise<{ metrics: BusinessMetrics; bills: Bill[] }> | null = null;
+let lastClientHydrationAt = 0;
+const CLIENT_HYDRATION_COOLDOWN_MS = 15_000;
+
 /**
  * Bidirectionally synchronizes and hydrates bills between the browser's persistent ledger,
  * the backend database, and Google Sheets.
  * Guarantees that across logout, login, page refresh, and Netlify serverless cold starts,
  * no transaction is ever lost or duplicated.
+ * Deduplicates concurrent calls and throttles redundant calls within 15s unless `force` is true.
  */
 export async function hydrateAndSyncBillsWithServer(
   adminToken: string,
   googleToken?: string | null,
-  customSpreadsheetId?: string | null
+  customSpreadsheetId?: string | null,
+  force: boolean = false
 ): Promise<{ metrics: BusinessMetrics; bills: Bill[] }> {
+  const now = Date.now();
   const localBills = loadPersistentBills();
+
+  if (!force && now - lastClientHydrationAt < CLIENT_HYDRATION_COOLDOWN_MS && localBills.length > 0) {
+    return {
+      metrics: computeBusinessMetricsFromBills(localBills, now),
+      bills: localBills,
+    };
+  }
+
+  if (inFlightHydrationPromise && !force) {
+    return inFlightHydrationPromise;
+  }
+
   const effectiveSheetId =
     customSpreadsheetId ??
     (typeof window !== 'undefined' ? window.localStorage.getItem('annpurna_custom_sheet_id') : null) ??
     undefined;
 
-  try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      Authorization: `Bearer ${adminToken}`,
-    };
-    if (googleToken) {
-      headers['x-google-token'] = googleToken;
-    }
-
-    const res = await fetch('/api/bills/hydrate', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        clientBills: localBills,
-        googleAccessToken: googleToken || undefined,
-        customSpreadsheetId: effectiveSheetId || undefined,
-      }),
-    });
-
-    if (res.status === 401) {
-      const authError: any = new Error('Unauthorized');
-      authError.status = 401;
-      throw authError;
-    }
-
-    const { ok, data } = await parseApiJsonResponse<any>(res);
-    if (ok && data) {
-      const serverBills: Bill[] = Array.isArray(data?.bills) ? data.bills : [];
-      const mergedBills = savePersistentBills(serverBills);
-      // Compute rolling 24-hour metrics from the authoritative merged set
-      const computedMetrics = computeBusinessMetricsFromBills(mergedBills, Date.now());
-      return {
-        metrics: computedMetrics,
-        bills: mergedBills,
+  const task = (async (): Promise<{ metrics: BusinessMetrics; bills: Bill[] }> => {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${adminToken}`,
       };
-    }
-  } catch (err: any) {
-    if (err?.status === 401) throw err;
-    console.warn('Hydrate endpoint fallback to local persistent ledger:', err?.message);
-  }
+      if (googleToken) {
+        headers['x-google-token'] = googleToken;
+      }
 
-  const fallbackMetrics = computeBusinessMetricsFromBills(localBills, Date.now());
-  return {
-    metrics: fallbackMetrics,
-    bills: localBills,
-  };
+      const res = await apiFetch('/api/bills/hydrate', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          clientBills: localBills,
+          googleAccessToken: googleToken || undefined,
+          customSpreadsheetId: effectiveSheetId || undefined,
+        }),
+      });
+
+      if (res.status === 401) {
+        const authError: any = new Error('Unauthorized');
+        authError.status = 401;
+        throw authError;
+      }
+
+      const { ok, data } = await parseApiJsonResponse<any>(res);
+      if (ok && data) {
+        lastClientHydrationAt = Date.now();
+        const serverBills: Bill[] = Array.isArray(data?.bills) ? data.bills : [];
+        const mergedBills = savePersistentBills(serverBills);
+        const computedMetrics = computeBusinessMetricsFromBills(mergedBills, Date.now());
+        return {
+          metrics: computedMetrics,
+          bills: mergedBills,
+        };
+      }
+    } catch (err: any) {
+      if (err?.status === 401) throw err;
+      console.warn('Hydrate endpoint fallback to local persistent ledger:', err?.message);
+    }
+
+    const fallbackMetrics = computeBusinessMetricsFromBills(localBills, Date.now());
+    return {
+      metrics: fallbackMetrics,
+      bills: localBills,
+    };
+  })();
+
+  inFlightHydrationPromise = task;
+  try {
+    return await task;
+  } finally {
+    if (inFlightHydrationPromise === task) {
+      inFlightHydrationPromise = null;
+    }
+  }
 }
 
 /**

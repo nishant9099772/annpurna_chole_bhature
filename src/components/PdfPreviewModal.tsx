@@ -35,16 +35,16 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/65 backdrop-blur-xs animate-in fade-in duration-200">
-      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-6 bg-slate-950/65 backdrop-blur-xs animate-in fade-in duration-200">
+      <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl max-h-[93dvh] flex flex-col overflow-hidden">
         {/* Modal Top Bar */}
-        <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-slate-50">
-          <div>
+        <div className="px-3.5 sm:px-5 py-3 border-b border-slate-200 flex items-center justify-between bg-slate-50 shrink-0">
+          <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h3 className="font-extrabold text-slate-900 text-base sm:text-lg">
+              <h3 className="font-extrabold text-slate-900 text-sm sm:text-lg">
                 POS Customer Bill Preview
               </h3>
-              <span className="text-xs bg-blue-100 text-blue-900 font-mono font-bold px-2.5 py-0.5 rounded-md">
+              <span className="text-xs bg-blue-100 text-blue-900 font-mono font-bold px-2 py-0.5 rounded-md">
                 {bill.orderId || bill.billNumber}
               </span>
             </div>
@@ -62,7 +62,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {/* Switch between Live POS Receipt and Vector PDF */}
             <div className="hidden sm:flex bg-slate-200/80 p-0.5 rounded-lg text-xs font-bold">
               <button
@@ -89,7 +89,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
 
             <button
               onClick={onClose}
-              className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded-full transition cursor-pointer"
+              className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded-lg transition cursor-pointer"
               title="Close"
             >
               <X className="w-5 h-5" />
@@ -98,12 +98,12 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
         </div>
 
         {/* Receipt / PDF Viewer Area */}
-        <div className="flex-1 bg-slate-100 p-3 sm:p-5 overflow-y-auto flex justify-center items-start">
+        <div className="flex-1 bg-slate-100 p-2.5 sm:p-5 overflow-y-auto flex justify-center items-start">
           {viewMode === 'pos' ? (
-            <div className="w-full max-w-md bg-white border border-slate-300 rounded-xl shadow-md p-5 text-slate-900 font-sans">
+            <div className="w-full max-w-md bg-white border border-slate-300 rounded-lg shadow-sm p-3.5 sm:p-5 text-slate-900 font-sans">
               {/* Restaurant Branding Header */}
-              <div className="text-center border-b-2 border-dashed border-slate-300 pb-3.5 mb-3.5">
-                <h2 className="text-lg sm:text-xl font-black tracking-tight text-blue-900">
+              <div className="text-center border-b-2 border-dashed border-slate-300 pb-3 mb-3">
+                <h2 className="text-base sm:text-xl font-black tracking-tight text-blue-900">
                   ANNAPURNA CHOLE BHATURE
                 </h2>
                 <p className="text-[11px] font-semibold text-slate-500 mt-0.5">
@@ -113,7 +113,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
                   Contact / WhatsApp: +91 8800896679
                 </p>
                 <span
-                  className={`inline-block mt-2 px-2.5 py-0.5 rounded text-[11px] font-extrabold tracking-wide border ${
+                  className={`inline-block mt-2 px-2.5 py-0.5 rounded-md text-[11px] font-extrabold tracking-wide border ${
                     bill.orderType === 'PACK'
                       ? 'bg-blue-50 text-blue-800 border-blue-200'
                       : 'bg-emerald-50 text-emerald-800 border-emerald-200'
@@ -124,7 +124,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
               </div>
 
               {/* Bill Metadata */}
-              <div className="text-xs space-y-1.5 border-b-2 border-dashed border-slate-300 pb-3.5 mb-3.5">
+              <div className="text-xs space-y-1.5 border-b-2 border-dashed border-slate-300 pb-3 mb-3">
                 <div className="flex justify-between gap-2">
                   <span className="text-slate-500 font-semibold">Unique Order ID:</span>
                   <span className="font-mono font-bold text-blue-800">{bill.orderId || bill.id}</span>
@@ -162,13 +162,13 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
               </div>
 
               {/* Itemized Table */}
-              <table className="w-full text-xs mb-3.5 border-collapse">
+              <table className="w-full text-xs mb-3 border-collapse">
                 <thead>
                   <tr className="border-b-2 border-slate-800 text-slate-900 font-extrabold uppercase text-[11px]">
                     <th className="py-1.5 text-left">Item</th>
-                    <th className="py-1.5 text-center w-12">Qty</th>
-                    <th className="py-1.5 text-right w-20">Price</th>
-                    <th className="py-1.5 text-right w-24">Total</th>
+                    <th className="py-1.5 text-center w-10">Qty</th>
+                    <th className="py-1.5 text-right w-16">Price</th>
+                    <th className="py-1.5 text-right w-20">Total</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-dotted divide-slate-200 font-mono">
@@ -179,10 +179,10 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
                       </td>
                       <td className="py-2 text-center text-slate-700">{item.quantity}</td>
                       <td className="py-2 text-right text-slate-700">
-                        ₹{item.unitPriceRupees.toFixed(2)}
+                        ₹{item.unitPriceRupees.toFixed(0)}
                       </td>
                       <td className="py-2 text-right font-bold text-slate-900">
-                        ₹{item.lineTotalRupees.toFixed(2)}
+                        ₹{item.lineTotalRupees.toFixed(0)}
                       </td>
                     </tr>
                   ))}
@@ -206,7 +206,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
                   <span className="font-mono">- ₹{discAmt.toFixed(2)}</span>
                 </div>
 
-                <div className="mt-2.5 p-3 bg-emerald-50 border-2 border-emerald-600 rounded-xl flex justify-between items-center">
+                <div className="mt-2.5 p-3 bg-emerald-50 border-2 border-emerald-600 rounded-lg flex justify-between items-center">
                   <div>
                     <span className="font-black text-slate-900 text-xs sm:text-sm block">
                       FINAL PAYABLE AMOUNT
@@ -242,18 +242,18 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
         </div>
 
         {/* Modal Actions */}
-        <div className="px-5 py-3.5 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
+        <div className="px-3.5 sm:px-5 py-3 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
             <button
               onClick={handleDownload}
-              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl flex items-center gap-1.5 transition cursor-pointer"
+              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-lg flex items-center gap-1.5 transition cursor-pointer"
             >
               <Download className="w-4 h-4 text-slate-600" />
               <span>Download PDF</span>
             </button>
             <button
               onClick={() => printPosReceipt(bill, '80mm')}
-              className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 text-xs font-bold rounded-xl flex items-center gap-1.5 transition cursor-pointer"
+              className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 text-xs font-bold rounded-lg flex items-center gap-1.5 transition cursor-pointer"
               title="Print formatted for 80mm thermal POS printer"
             >
               <Printer className="w-4 h-4 text-blue-700" />
@@ -261,7 +261,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
             </button>
             <button
               onClick={() => printPosReceipt(bill, 'A4')}
-              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl flex items-center gap-1.5 transition cursor-pointer"
+              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-lg flex items-center gap-1.5 transition cursor-pointer"
               title="Print formatted for A4 paper"
             >
               <Printer className="w-4 h-4 text-slate-600" />
@@ -271,7 +271,7 @@ export const PdfPreviewModal: React.FC<PdfPreviewModalProps> = ({
 
           <button
             onClick={onShareWhatsApp}
-            className="px-4 py-2 bg-[#25D366] hover:bg-[#20BD5A] text-white text-xs sm:text-sm font-bold rounded-xl flex items-center gap-2 shadow-sm transition active:scale-95 cursor-pointer"
+            className="px-4 py-2 bg-[#25D366] hover:bg-[#20BD5A] text-white text-xs sm:text-sm font-bold rounded-lg flex items-center gap-2 shadow-sm transition active:scale-95 cursor-pointer"
           >
             <Share2 className="w-4 h-4" />
             <span>Share on WhatsApp</span>

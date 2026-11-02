@@ -18,7 +18,7 @@ import {
   loadPersistentBills,
   upsertPersistentBill,
 } from './utils/persistentBillsStorage';
-import { parseApiJsonResponse } from './utils/apiClient';
+import { apiFetch, parseApiJsonResponse } from './utils/apiClient';
 import { AdminLogin } from './components/AdminLogin';
 import { BillingDashboard } from './components/BillingDashboard';
 import { BillSuccessModal } from './components/BillSuccessModal';
@@ -93,7 +93,7 @@ export default function App() {
     let cancelled = false;
     setIsCheckingSession(true);
 
-    fetch('/api/auth/me', {
+    apiFetch('/api/auth/me', {
       headers: {
         Authorization: `Bearer ${adminToken}`,
         Accept: 'application/json',
@@ -156,7 +156,7 @@ export default function App() {
   // Handle Admin Logout — ONLY clears authentication session token; NEVER deletes sales/bill records
   const handleAdminLogout = useCallback(() => {
     if (adminToken) {
-      fetch('/api/auth/logout', {
+      apiFetch('/api/auth/logout', {
         method: 'POST',
         headers: { Authorization: `Bearer ${adminToken}` },
       }).catch(() => {});
@@ -252,7 +252,7 @@ export default function App() {
     setIsRetryingSync(true);
     try {
       const customSheetId = localStorage.getItem('annpurna_custom_sheet_id') || undefined;
-      const res = await fetch(`/api/bills/${bill.id}/retry-sheets`, {
+      const res = await apiFetch(`/api/bills/${bill.id}/retry-sheets`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -339,7 +339,7 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
       // 1. Check Official WhatsApp Business Cloud API first if configured on server
       if (adminToken) {
         try {
-          const apiRes = await fetch(`/api/bills/${bill.id}/send-whatsapp`, {
+          const apiRes = await apiFetch(`/api/bills/${bill.id}/send-whatsapp`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -475,11 +475,11 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
 
       {/* Floating In-App Notification Toast */}
       {toastNotification && (
-        <div className="fixed bottom-5 right-5 z-[60] max-w-md bg-slate-900 text-white text-xs sm:text-sm font-semibold px-4 py-3 rounded-2xl shadow-2xl border border-slate-700/60 animate-in fade-in slide-in-from-bottom-2 duration-200 flex items-center justify-between gap-3">
-          <span>{toastNotification}</span>
+        <div className="fixed bottom-16 md:bottom-5 left-3 right-3 sm:left-auto sm:right-5 z-[60] max-w-md bg-slate-900 text-white text-xs sm:text-sm font-semibold px-3.5 py-2.5 rounded-lg shadow-2xl border border-slate-700/60 animate-in fade-in slide-in-from-bottom-2 duration-200 flex items-center justify-between gap-3">
+          <span className="break-words">{toastNotification}</span>
           <button
             onClick={() => setToastNotification(null)}
-            className="text-slate-400 hover:text-white p-1 rounded-lg cursor-pointer"
+            className="text-slate-400 hover:text-white p-1 rounded-md cursor-pointer shrink-0"
           >
             ✕
           </button>
