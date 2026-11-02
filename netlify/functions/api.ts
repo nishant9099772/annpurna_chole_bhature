@@ -27,6 +27,27 @@ function getLocalServerPort(): Promise<number> {
 }
 
 export async function handler(event: any) {
+  const reqOrigin = event?.headers?.origin || event?.headers?.Origin || '*';
+  const corsHeaders: Record<string, string> = {
+    'Access-Control-Allow-Origin': reqOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin',
+    'Access-Control-Expose-Headers': 'Content-Type',
+  };
+
+  const method = (event?.httpMethod || 'GET').toUpperCase();
+  if (method === 'OPTIONS') {
+    return {
+      statusCode: 200,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({ ok: true }),
+    };
+  }
+
   try {
     const port = await getLocalServerPort();
 
@@ -45,9 +66,8 @@ export async function handler(event: any) {
       : '';
 
     const targetUrl = `http://127.0.0.1:${port}${rawPath}${qs}`;
-    const method = (event.httpMethod || 'GET').toUpperCase();
 
-    const blockedHeaders = new Set([
+    const blockedRequestHeaders = new Set([
       'host',
       'content-length',
       'content-encoding',
@@ -59,7 +79,7 @@ export async function handler(event: any) {
     const headers: Record<string, string> = {};
     if (event.headers) {
       for (const [k, v] of Object.entries(event.headers)) {
-        if (typeof v === 'string' && !blockedHeaders.has(k.toLowerCase())) {
+        if (typeof v === 'string' && !blockedRequestHeaders.has(k.toLowerCase())) {
           headers[k] = v;
         }
       }
@@ -87,9 +107,22 @@ export async function handler(event: any) {
       body: body as any,
     });
 
-    const resHeaders: Record<string, string> = {};
+    // Exclude hop-by-hop headers that break HTTP/2 mobile clients (Android OkHttp / WebView)
+    const blockedResponseHeaders = new Set([
+      'transfer-encoding',
+      'connection',
+      'keep-alive',
+      'content-length',
+      'content-encoding',
+    ]);
+
+    const resHeaders: Record<string, string> = {
+      ...corsHeaders,
+    };
     response.headers.forEach((val, key) => {
-      resHeaders[key] = val;
+      if (!blockedResponseHeaders.has(key.toLowerCase())) {
+        resHeaders[key] = val;
+      }
     });
 
     const contentType = response.headers.get('content-type') || '';
@@ -103,6 +136,7 @@ export async function handler(event: any) {
       };
     }
 
+    resHeaders['Content-Type'] = 'application/json; charset=utf-8';
     const text = await response.text();
     return {
       statusCode: response.status,
@@ -112,7 +146,10 @@ export async function handler(event: any) {
   } catch (err: any) {
     return {
       statusCode: 500,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
       body: JSON.stringify({ error: err.message || 'Serverless function execution error' }),
     };
   }

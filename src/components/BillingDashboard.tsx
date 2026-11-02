@@ -48,6 +48,7 @@ import {
   loadPersistentBills,
   upsertPersistentBill,
 } from '../utils/persistentBillsStorage';
+import { parseApiJsonResponse } from '../utils/apiClient';
 
 interface BillingDashboardProps {
   adminUsername: string;
@@ -167,8 +168,10 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       }
 
       if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        setServerSheetsStatus(statusData);
+        const { data: statusData } = await parseApiJsonResponse(statusRes);
+        if (statusData) {
+          setServerSheetsStatus(statusData);
+        }
       }
     } catch (err: any) {
       if (err?.status === 401) {
@@ -408,8 +411,8 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           clientPendingBills,
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
+      const { ok, data } = await parseApiJsonResponse(res);
+      if (ok && data) {
         if (data.failedCount === 0) {
           localStorage.removeItem('annpurna_pending_sync_bills');
         }
@@ -417,7 +420,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         if (onShowToast) onShowToast(data.message || 'Google Sheets synchronized!');
         refreshMetrics();
       } else {
-        setBatchSyncFeedback(`Sync error: ${data.error}`);
+        setBatchSyncFeedback(`Sync error: ${data?.error || 'Could not sync with Google Sheets'}`);
       }
     } catch (err: any) {
       setBatchSyncFeedback(`Batch sync error: ${err.message}`);
@@ -554,21 +557,16 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         throw new Error('Your session has expired. Please log in again.');
       }
 
-      const contentType = response.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
+      const { ok, status, data } = await parseApiJsonResponse<any>(response);
+
+      if (!ok) {
+        throw new Error(data?.error || `Save failed (HTTP ${status}). The bill draft has been kept.`);
+      }
+
+      if (!data || (!data.bill && !data.id)) {
         throw new Error(
-          `Server returned an invalid response (HTTP ${response.status}). Expected JSON. The bill draft has been kept.`
+          data?.error || 'Save response did not include authoritative bill details. The bill draft has been kept.'
         );
-      }
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || `Save failed with status ${response.status}`);
-      }
-
-      if (!data.bill && !data.id) {
-        throw new Error('Save response did not include authoritative bill details.');
       }
 
       const authoritativeBill: Bill = data.bill || {

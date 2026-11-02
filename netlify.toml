@@ -15,8 +15,17 @@
   status = 200
   force = true
 
+# CORS headers for Capacitor Android APK & cross-origin API calls
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin"
+
 # SPA fallback for frontend routes
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+

@@ -24,6 +24,7 @@ import {
 import { CopyMobileButton } from './CopyMobileButton';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
 import { printPosReceipt } from '../utils/posReceiptPrinter';
+import { parseApiJsonResponse } from '../utils/apiClient';
 
 interface BillSuccessModalProps {
   bill: Bill;
@@ -109,15 +110,13 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
             },
             body: JSON.stringify({ bill }),
           });
-          if (apiRes.ok) {
-            const apiData = await apiRes.json();
-            if (apiData.deliveredAutomatically && apiData.mode === 'cloud_api') {
-              setSharingStatus(apiData.message || 'Sent automatically via WhatsApp Cloud API!');
-              setTimeout(() => {
-                onNewBill();
-              }, 900);
-              return;
-            }
+          const { ok, data: apiData } = await parseApiJsonResponse<any>(apiRes);
+          if (ok && apiData?.deliveredAutomatically && apiData?.mode === 'cloud_api') {
+            setSharingStatus(apiData.message || 'Sent automatically via WhatsApp Cloud API!');
+            setTimeout(() => {
+              onNewBill();
+            }, 900);
+            return;
           }
         } catch {
           // Proceed to Click-to-Chat fallback

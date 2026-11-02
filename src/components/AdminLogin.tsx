@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, User, UtensilsCrossed, ArrowRight, ShieldCheck, AlertCircle, Eye, EyeOff } from 'lucide-react';
+import { parseApiJsonResponse } from '../utils/apiClient';
 
 interface AdminLoginProps {
   onLoginSuccess: (token: string, username: string) => void;
@@ -34,26 +35,26 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         body: JSON.stringify({ username: trimmedUser, password }),
       });
 
-      const rawContentType = (response.headers.get('content-type') || '').toLowerCase();
-      const text = await response.text();
+      const { ok, status, data } = await parseApiJsonResponse<{
+        success?: boolean;
+        token?: string;
+        username?: string;
+        error?: string;
+      }>(response);
 
-      let data: any = null;
-      if (rawContentType.includes('application/json')) {
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = null;
-        }
-      }
-
-      if (!response.ok) {
+      if (!ok) {
         throw new Error(
-          data?.error || `Authentication failed (HTTP ${response.status}). Please verify your User ID and Password.`
+          data?.error ||
+            (status === 401
+              ? 'Invalid User ID or Password. Access denied.'
+              : `Authentication failed (HTTP ${status}). Please verify your User ID and Password.`)
         );
       }
 
       if (!data || !data.token) {
-        throw new Error(`Invalid authentication response received from server (HTTP ${response.status}).`);
+        throw new Error(
+          data?.error || 'Authentication failed. Please verify your User ID and Password.'
+        );
       }
 
       onLoginSuccess(data.token, data.username || trimmedUser);

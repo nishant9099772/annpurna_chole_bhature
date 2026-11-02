@@ -27,6 +27,7 @@ import {
   loadPersistentBills,
   savePersistentBills,
 } from '../utils/persistentBillsStorage';
+import { parseApiJsonResponse } from '../utils/apiClient';
 
 interface MonthlySalesCalendarProps {
   adminToken: string;
@@ -79,12 +80,13 @@ export const MonthlySalesCalendar: React.FC<MonthlySalesCalendarProps> = ({
           },
         });
 
-        if (!res.ok) {
-          throw new Error(`Failed to load monthly data (HTTP ${res.status})`);
+        const { ok, status, data } = await parseApiJsonResponse<any>(res);
+
+        if (!ok) {
+          throw new Error(data?.error || `Failed to load monthly data (HTTP ${status})`);
         }
 
-        const data = await res.json();
-        if (data.report) {
+        if (data?.report) {
           // Merge any bills returned in the report into the persistent ledger
           const reportBills: Bill[] = [];
           if (Array.isArray(data.report.dailyData)) {

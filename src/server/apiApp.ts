@@ -268,15 +268,23 @@ const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, num
   BHATURE: 2500,       // Rs 25.00
 };
 
-// CORS & Preflight Middleware for API routes (ensures Netlify / cross-origin compatibility)
+// CORS & Preflight Middleware for API routes (ensures Netlify & Capacitor Android WebView compatibility)
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.url.startsWith('/api')) {
-    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+    const reqOrigin = req.headers.origin;
+    res.setHeader('Access-Control-Allow-Origin', reqOrigin || '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Google-Token');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin'
+    );
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Type');
+    if (reqOrigin) {
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
     if (req.method === 'OPTIONS') {
-      res.status(204).end();
+      res.setHeader('Content-Length', '0');
+      res.status(200).end();
       return;
     }
   }

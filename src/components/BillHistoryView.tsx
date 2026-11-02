@@ -29,6 +29,7 @@ import {
   savePersistentBills,
   upsertPersistentBill,
 } from '../utils/persistentBillsStorage';
+import { parseApiJsonResponse } from '../utils/apiClient';
 
 interface BillHistoryViewProps {
   adminToken: string;
@@ -90,16 +91,15 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         },
       });
 
-      if (!res.ok) {
-        throw new Error(`Failed to load bills (HTTP ${res.status})`);
+      const { ok, status, data } = await parseApiJsonResponse<any>(res);
+
+      if (!ok) {
+        throw new Error(data?.error || `Failed to load bills (HTTP ${status})`);
       }
 
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        throw new Error('Server returned unexpected non-JSON response');
+      if (!data) {
+        throw new Error('Could not parse bill history response from server.');
       }
-
-      const data = await res.json();
       const loadedBills: Bill[] = Array.isArray(data.bills) ? data.bills : [];
       if (loadedBills.length > 0) {
         savePersistentBills(loadedBills);
@@ -143,9 +143,9 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Sync retry failed');
+      const { ok, data } = await parseApiJsonResponse<any>(res);
+      if (!ok || !data?.success) {
+        throw new Error(data?.error || 'Sync retry failed');
       }
 
       const syncedBill: Bill = data.bill || {

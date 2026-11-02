@@ -18,6 +18,7 @@ import {
   loadPersistentBills,
   upsertPersistentBill,
 } from './utils/persistentBillsStorage';
+import { parseApiJsonResponse } from './utils/apiClient';
 import { AdminLogin } from './components/AdminLogin';
 import { BillingDashboard } from './components/BillingDashboard';
 import { BillSuccessModal } from './components/BillSuccessModal';
@@ -99,10 +100,11 @@ export default function App() {
       },
     })
       .then(async (res) => {
-        if (!res.ok) {
+        const { ok, data } = await parseApiJsonResponse<any>(res);
+        if (!ok || !data) {
           throw new Error('Session invalid or expired');
         }
-        return res.json();
+        return data;
       })
       .then((data) => {
         if (cancelled) return;
@@ -268,9 +270,9 @@ export default function App() {
         return;
       }
 
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Retry sync failed');
+      const { ok, data } = await parseApiJsonResponse<any>(res);
+      if (!ok || !data?.success) {
+        throw new Error(data?.error || 'Retry sync failed');
       }
 
       const syncedBill: Bill = data.bill || {
@@ -345,12 +347,10 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
             },
             body: JSON.stringify({ bill }),
           });
-          if (apiRes.ok) {
-            const apiData = await apiRes.json();
-            if (apiData.deliveredAutomatically && apiData.mode === 'cloud_api') {
-              setToastNotification(apiData.message || `WhatsApp sent to ${formattedCustomerName}!`);
-              return;
-            }
+          const { ok, data: apiData } = await parseApiJsonResponse<any>(apiRes);
+          if (ok && apiData?.deliveredAutomatically && apiData?.mode === 'cloud_api') {
+            setToastNotification(apiData.message || `WhatsApp sent to ${formattedCustomerName}!`);
+            return;
           }
         } catch {
           // Proceed to Click-to-Chat

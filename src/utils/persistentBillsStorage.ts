@@ -5,6 +5,7 @@ import {
   getKolkataDateString,
   resolveBillTimestampMs,
 } from './billTimestamp';
+import { parseApiJsonResponse } from './apiClient';
 
 export const PERSISTENT_BILLS_STORAGE_KEY = 'annpurna_persistent_bills_v1';
 export const LEGACY_PENDING_BILLS_KEY = 'annpurna_pending_sync_bills';
@@ -116,8 +117,8 @@ export async function hydrateAndSyncBillsWithServer(
       throw authError;
     }
 
-    if (res.ok) {
-      const data = await res.json();
+    const { ok, data } = await parseApiJsonResponse<any>(res);
+    if (ok && data) {
       const serverBills: Bill[] = Array.isArray(data?.bills) ? data.bills : [];
       const mergedBills = savePersistentBills(serverBills);
       // Compute rolling 24-hour metrics from the authoritative merged set
