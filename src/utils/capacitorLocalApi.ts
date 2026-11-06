@@ -399,7 +399,7 @@ function fromBase64Url(b64url: string): string {
 
 async function computeHmacB64Url(payloadB64: string): Promise<string> {
   const encoder = new TextEncoder();
-  const secretSeed = `acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${DEFAULT_ROLE_SCRYPT_HASHES.admin[0]}`;
+  const secretSeed = `acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${DEFAULT_ROLE_SCRYPT_HASHES.admin[1]}`;
   const secretHashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(secretSeed));
   const secretHex = Array.from(new Uint8Array(secretHashBuf))
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -448,7 +448,7 @@ async function createLocalSignedToken(
   };
 }
 
-function verifyLocalTokenPayload(token?: string | null): {
+export function verifyLocalTokenPayload(token?: string | null): {
   sub: string;
   role: UserRole;
   exp: number;
@@ -469,12 +469,19 @@ function verifyLocalTokenPayload(token?: string | null): {
       return null;
     }
     const rawRole = decoded.role;
-    const role: UserRole =
-      rawRole === 'billing' || rawRole === 'staff'
-        ? 'billing'
-        : rawRole === 'order'
-        ? 'order'
-        : 'admin';
+    let role: UserRole = 'admin';
+    if (rawRole === 'billing' || rawRole === 'staff') {
+      role = 'billing';
+    } else if (rawRole === 'order') {
+      role = 'order';
+    } else if (rawRole === 'admin') {
+      role = 'admin';
+    } else {
+      const userCheck = isAuthorizedUserId(decoded.sub);
+      if (userCheck.authorized) {
+        role = userCheck.role;
+      }
+    }
     return {
       sub: decoded.sub,
       role,
@@ -618,44 +625,52 @@ export async function handleCapacitorLocalApiRequest(
     }
 
     const userCheck = isAuthorizedUserId(rawUsername);
-    if (!userCheck.authorized) {
+    const validExpectedRole =
+      expectedProfileRole && ['admin', 'billing', 'order'].includes(expectedProfileRole)
+        ? expectedProfileRole
+        : undefined;
+
+    if (!userCheck.authorized && !validExpectedRole) {
       return jsonResponse(401, {
         error: 'Invalid User ID or Password. Access denied.',
       });
     }
 
-    if (
-      expectedProfileRole &&
-      ['admin', 'billing', 'order'].includes(expectedProfileRole) &&
-      userCheck.role !== expectedProfileRole
-    ) {
-      const targetLabel =
-        expectedProfileRole === 'admin'
-          ? 'Annapurna Admin'
-          : expectedProfileRole === 'billing'
-          ? 'Annapurna Billing'
-          : 'Annapurna Order';
-      return jsonResponse(401, {
-        error: `User ID "${rawUsername.trim()}" belongs to ${userCheck.profileLabel}, not ${targetLabel}. Please switch to the ${userCheck.profileLabel} tab.`,
-      });
+    const candidateRoles: UserRole[] = [];
+    if (userCheck.authorized) {
+      candidateRoles.push(userCheck.role);
+    }
+    if (validExpectedRole && !candidateRoles.includes(validExpectedRole)) {
+      candidateRoles.push(validExpectedRole);
     }
 
-    const passwordValid = await verifyPasswordForRoleScrypt(userCheck.role, rawPassword);
+    for (const candidateRole of candidateRoles) {
+      const passwordValid = await verifyPasswordForRoleScrypt(candidateRole, rawPassword);
+      if (passwordValid) {
+        const canonicalUser =
+          candidateRole === 'admin'
+            ? 'annapurna_admin'
+            : candidateRole === 'billing'
+            ? 'annapurna_billing'
+            : 'annapurna_order';
+        const profileLabel =
+          candidateRole === 'admin'
+            ? 'Annapurna Admin'
+            : candidateRole === 'billing'
+            ? 'Annapurna Billing'
+            : 'Annapurna Order';
 
-    if (passwordValid) {
-      const { token, expiresAt } = await createLocalSignedToken(
-        userCheck.canonicalUser,
-        userCheck.role
-      );
-      return jsonResponse(200, {
-        success: true,
-        message: `Authenticated as ${userCheck.profileLabel}`,
-        token,
-        username: userCheck.canonicalUser,
-        role: userCheck.role,
-        profileLabel: userCheck.profileLabel,
-        expiresAt,
-      });
+        const { token, expiresAt } = await createLocalSignedToken(canonicalUser, candidateRole);
+        return jsonResponse(200, {
+          success: true,
+          message: `Authenticated as ${profileLabel}`,
+          token,
+          username: canonicalUser,
+          role: candidateRole,
+          profileLabel,
+          expiresAt,
+        });
+      }
     }
 
     return jsonResponse(401, {
@@ -684,10 +699,17 @@ export async function handleCapacitorLocalApiRequest(
         error: 'Session invalid or expired',
       });
     }
+    const profileLabel =
+      session.role === 'admin'
+        ? 'Annapurna Admin'
+        : session.role === 'billing'
+        ? 'Annapurna Billing'
+        : 'Annapurna Order';
     return jsonResponse(200, {
       isAuthenticated: true,
       username: session.sub,
       role: session.role,
+      profileLabel,
       expiresAt: session.exp,
     });
   }

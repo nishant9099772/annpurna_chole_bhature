@@ -25,13 +25,26 @@
  *    alter or omit `Content-Type` headers, while accurately detecting HTML SPA fallbacks.
  */
 
-import { handleCapacitorLocalApiRequest } from './capacitorLocalApi';
+import { handleCapacitorLocalApiRequest, verifyLocalTokenPayload } from './capacitorLocalApi';
+import { UserRole } from '../types/billing';
 
 export const API_BASE_URL_STORAGE_KEY = 'annpurna_api_base_url';
 export const DEFAULT_PRODUCTION_API_BASE_URL = 'https://annpurnacholebhature.netlify.app';
 
 const STANDARD_API_TIMEOUT_MS = 12_000;
 const SHEETS_SYNC_TIMEOUT_MS = 20_000;
+
+/**
+ * Decodes a signed `acb.<payloadB64>.<sigB64>` session token on the client to inspect
+ * `{ sub, role, exp }` without relying solely on transient network state.
+ */
+export function decodeSessionTokenRole(token?: string | null): {
+  sub: string;
+  role: UserRole;
+  exp: number;
+} | null {
+  return verifyLocalTokenPayload(token);
+}
 
 /**
  * Normalizes a configured API base URL (strips quotes, trailing slashes, and accidental `/api` suffix).
@@ -67,10 +80,29 @@ export function normalizeApiBaseUrl(raw?: string | null): string {
  * (`.env.production`: `VITE_API_BASE_URL=https://annpurnacholebhature.netlify.app`).
  */
 export const API_BASE_URL: string =
-  normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
+  normalizeApiBaseUrl(import.meta.env?.VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
 
 /**
- * Detects whether the app is running inside a Capacitor native container or Android WebView.
+ * Detects whether the browser is running on the local Express development/preview server
+ * (e.g. `localhost:3000` or `*.run.app`), as opposed to Capacitor Android or Netlify production.
+ * Checked BEFORE `isCapacitorOrAndroidWebView()` so Android phones opening `*.run.app` or `localhost:3000`
+ * always use the same-origin Express backend.
+ */
+function isLocalExpressDevOrPreviewHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  const hostname = (window.location?.hostname || '').toLowerCase();
+  const port = window.location?.port || '';
+  if ((hostname === 'localhost' || hostname === '127.0.0.1') && port !== '') {
+    return true;
+  }
+  if (hostname.endsWith('.run.app')) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detects whether the app is running inside a Capacitor native container or Android APK WebView.
  */
 export function isCapacitorOrAndroidWebView(): boolean {
   if (typeof window === 'undefined') return false;
@@ -94,37 +126,24 @@ export function isCapacitorOrAndroidWebView(): boolean {
     return true;
   }
 
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
-  const isAndroidUa = /Android/i.test(ua) && (/; wv\)/i.test(ua) || /Version\/\d+\.\d+/i.test(ua));
-  if (isAndroidUa) {
-    return true;
-  }
-
-  // Capacitor 5+ Android default scheme is https://localhost with no port
-  const hostname = window.location?.hostname || '';
-  const port = window.location?.port || '';
-  if ((hostname === 'localhost' || hostname === '127.0.0.1') && protocol === 'https:' && !port) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Detects whether the browser is running on the local Express development/preview server
- * (e.g. `localhost:3000` or `*.run.app`), as opposed to Capacitor Android or Netlify production.
- */
-function isLocalExpressDevOrPreviewHost(): boolean {
-  if (typeof window === 'undefined') return false;
-  if (isCapacitorOrAndroidWebView()) return false;
+  // Capacitor 5+ Android default scheme is https://localhost or http://localhost with no port
   const hostname = (window.location?.hostname || '').toLowerCase();
   const port = window.location?.port || '';
-  if ((hostname === 'localhost' || hostname === '127.0.0.1') && port !== '') {
+  if ((hostname === 'localhost' || hostname === '127.0.0.1') && !port) {
     return true;
   }
-  if (hostname.endsWith('.run.app')) {
+
+  // If running on a hosted web domain (*.run.app or *.netlify.app), it is a web browser/webview on that domain, not a local APK asset server
+  if (hostname.endsWith('.run.app') || hostname.endsWith('.netlify.app')) {
+    return false;
+  }
+
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  const isAndroidWebViewUa = /Android/i.test(ua) && /; wv\)/i.test(ua);
+  if (isAndroidWebViewUa) {
     return true;
   }
+
   return false;
 }
 
@@ -132,7 +151,7 @@ function isLocalExpressDevOrPreviewHost(): boolean {
  * Returns the active production Netlify API base URL (`import.meta.env.VITE_API_BASE_URL` or custom override).
  */
 export function getConfiguredApiBaseUrl(): string {
-  const envBaseUrl = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
+  const envBaseUrl = normalizeApiBaseUrl(import.meta.env?.VITE_API_BASE_URL);
 
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
@@ -477,21 +496,27 @@ export function installCapacitorApiFetchInterceptor(): void {
               { status: 502, headers: { 'Content-Type': 'application/json' } }
             );
           }
-          return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+          return handleCapacitorLocalApiRequest(apiPathWithQuery, {
+            ...init,
+            headers: mergedHeaders,
+          });
         }
       }
 
-      // If inside Capacitor (or calling a remote Netlify URL that hasn't been redeployed with the new 3-profile endpoints yet):
+      const localInit: RequestInit = {
+        ...init,
+        headers: mergedHeaders,
+      };
+
       // 1. Fall back to local Capacitor API engine on 404 for /api/orders, /api/admin/reset-sales, /api/admin/reset-audit, /api/auth/change-password
       if (
-        (inCapacitor || isCrossOrigin) &&
         response.status === 404 &&
         (apiPathWithQuery.startsWith('/api/orders') ||
           apiPathWithQuery.startsWith('/api/admin/reset-sales') ||
           apiPathWithQuery.startsWith('/api/admin/reset-audit') ||
           apiPathWithQuery.startsWith('/api/auth/change-password'))
       ) {
-        return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+        return handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
       }
 
       // 2. If /api/auth/login returns 401 on a remote server that hasn't been redeployed with the new 3-profile credentials yet,
@@ -501,23 +526,22 @@ export function installCapacitorApiFetchInterceptor(): void {
         response.status === 401 &&
         apiPathWithQuery.startsWith('/api/auth/login')
       ) {
-        const localLoginRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+        const localLoginRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
         if (localLoginRes.status === 200) {
           return localLoginRes;
         }
       }
 
-      // 3. If a protected endpoint returns 401 on a pre-redeploy remote server when using a valid local 3-profile token,
-      // verify against the local Capacitor API engine
+      // 3. If a protected endpoint returns 401 when using a valid signed 3-profile token,
+      // verify against the local Capacitor API engine so valid Admin/Billing/Order sessions are never kicked out
       if (
-        (inCapacitor || isCrossOrigin) &&
         response.status === 401 &&
         !apiPathWithQuery.startsWith('/api/auth/login') &&
         !apiPathWithQuery.startsWith('/api/admin/reset-sales') &&
         !apiPathWithQuery.startsWith('/api/auth/change-password') &&
         mergedHeaders.has('Authorization')
       ) {
-        const localFallbackRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+        const localFallbackRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
         if (localFallbackRes.status !== 401) {
           return localFallbackRes;
         }
@@ -526,15 +550,19 @@ export function installCapacitorApiFetchInterceptor(): void {
       return response;
     } catch (networkErr: any) {
       const isTimeout = networkErr?.name === 'AbortError';
+      const localInit: RequestInit = {
+        ...init,
+        headers: mergedHeaders,
+      };
 
       // When running inside a local dev/preview server (e.g. localhost:3000 or *.run.app) and not Capacitor,
       // allow fallback to the local Express backend if the remote production server is unreachable
       if (!inCapacitor && isCrossOrigin && typeof window !== 'undefined') {
         try {
-          const localDevRes = await originalFetch(`${window.location.origin}${apiPathWithQuery}`, {
-            ...init,
-            headers: mergedHeaders,
-          });
+          const localDevRes = await originalFetch(
+            `${window.location.origin}${apiPathWithQuery}`,
+            localInit
+          );
           return localDevRes;
         } catch {
           // continue to standard fallback
@@ -558,9 +586,9 @@ export function installCapacitorApiFetchInterceptor(): void {
         );
       }
 
-      // For offline resilience in Capacitor Android APK, fall back to local persistent engine if offline
-      if (inCapacitor) {
-        return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+      // For offline or transient mobile network resilience, fall back to local persistent engine
+      if (inCapacitor || mergedHeaders.has('Authorization') || apiPathWithQuery.startsWith('/api/auth/login')) {
+        return handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
       }
       throw networkErr;
     } finally {

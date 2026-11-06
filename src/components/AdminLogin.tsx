@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Lock,
   User,
@@ -22,6 +22,7 @@ import {
   setConfiguredApiBaseUrl,
   verifyNetlifyBackendUrl,
   isCapacitorOrAndroidWebView,
+  decodeSessionTokenRole,
 } from '../utils/apiClient';
 
 interface AdminLoginProps {
@@ -66,6 +67,10 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+
+  // Track whether the user is actively typing in the User ID field so Android password autofill
+  // on the password field cannot silently overwrite `selectedProfile` back to `billing`.
+  const isUserIdFocusedRef = useRef<boolean>(false);
 
   // Server URL Settings for Android APK -> Netlify Backend -> Google Sheets
   const isNativeApk = isCapacitorOrAndroidWebView();
@@ -126,7 +131,9 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     e.preventDefault();
     setError(null);
 
-    const trimmedUser = username.trim();
+    const canonicalForSelected =
+      PROFILE_OPTIONS.find((p) => p.role === selectedProfile)?.userId || 'annapurna_admin';
+    const trimmedUser = username.trim() || canonicalForSelected;
     if (!trimmedUser || !password) {
       setError('Please enter both your User ID and Password.');
       return;
@@ -145,7 +152,11 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify({ username: trimmedUser, password }),
+        body: JSON.stringify({
+          username: trimmedUser,
+          password,
+          expectedRole: selectedProfile,
+        }),
       });
 
       const { ok, status, data } = await parseApiJsonResponse<{
@@ -172,14 +183,31 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         );
       }
 
+      const decodedToken = decodeSessionTokenRole(data.token);
+      const rawRole = data.role || decodedToken?.role;
       const resolvedRole: UserRole =
-        data.role === 'billing' || data.role === 'order' ? data.role : 'admin';
+        rawRole === 'billing'
+          ? 'billing'
+          : rawRole === 'order'
+          ? 'order'
+          : rawRole === 'admin'
+          ? 'admin'
+          : selectedProfile;
+
+      const resolvedUsername =
+        data.username ||
+        decodedToken?.sub ||
+        (resolvedRole === 'admin'
+          ? 'annapurna_admin'
+          : resolvedRole === 'billing'
+          ? 'annapurna_billing'
+          : 'annapurna_order');
 
       onLoginSuccess(
         data.token,
-        data.username || trimmedUser,
+        resolvedUsername,
         resolvedRole,
-        data.expiresAt
+        data.expiresAt || decodedToken?.exp
       );
     } catch (err: any) {
       setError(err.message || 'Login failed. Please verify your User ID and Password.');
@@ -266,7 +294,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         )}
 
         {/* Login Form */}
-        <form onSubmit={handleSubmit} className="space-y-4" autoComplete="on">
+        <form onSubmit={handleSubmit} className="space-y-4" autoComplete="off">
           <div>
             <label
               htmlFor="login-userid"
@@ -278,19 +306,38 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
               <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="login-userid"
+                name={`userid_${selectedProfile}`}
                 type="text"
                 required
                 autoCapitalize="none"
                 autoCorrect="off"
-                autoComplete="username"
+                autoComplete="off"
                 value={username}
+                onFocus={() => {
+                  isUserIdFocusedRef.current = true;
+                }}
+                onBlur={() => {
+                  isUserIdFocusedRef.current = false;
+                }}
                 onChange={(e) => {
                   const val = e.target.value;
+                  // Only auto-switch profile tab if the user is actively typing in the User ID field
+                  // (prevents Android password manager autofill on the password field from switching Admin/Order back to Billing)
+                  if (!isUserIdFocusedRef.current) {
+                    const canonical =
+                      PROFILE_OPTIONS.find((p) => p.role === selectedProfile)?.userId || val;
+                    setUsername(canonical);
+                    return;
+                  }
                   setUsername(val);
                   const lower = val.trim().toLowerCase();
-                  if (lower.includes('billing')) setSelectedProfile('billing');
-                  else if (lower.includes('order')) setSelectedProfile('order');
-                  else if (lower.includes('admin')) setSelectedProfile('admin');
+                  if (lower.includes('billing') || lower === 'cashier' || lower === 'counter') {
+                    setSelectedProfile('billing');
+                  } else if (lower.includes('order') || lower === 'kitchen' || lower === 'worker') {
+                    setSelectedProfile('order');
+                  } else if (lower.includes('admin') || lower.includes('chole_bhature')) {
+                    setSelectedProfile('admin');
+                  }
                 }}
                 placeholder="annapurna_admin / annapurna_billing / annapurna_order"
                 className="w-full pl-9 pr-3.5 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-base sm:text-sm text-slate-900 font-mono font-semibold transition"
@@ -309,6 +356,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
               <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="login-password"
+                name={`password_${selectedProfile}`}
                 type={showPassword ? 'text' : 'password'}
                 required
                 autoComplete="current-password"

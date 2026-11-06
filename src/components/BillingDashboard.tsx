@@ -229,14 +229,16 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   // Fetch & Bidirectionally Hydrate Business Metrics & Server Google Sheets Status
   const refreshMetrics = useCallback(
     async (forceHydrate: boolean = false) => {
+      const currentToken = adminToken;
+      if (!currentToken) return;
       try {
         if (!isAdmin) {
-          await hydrateAndSyncBillsWithServer(adminToken, null, undefined, forceHydrate);
+          await hydrateAndSyncBillsWithServer(currentToken, null, undefined, forceHydrate);
           return;
         }
 
         const headers: Record<string, string> = {
-          Authorization: `Bearer ${adminToken}`,
+          Authorization: `Bearer ${currentToken}`,
         };
         if (googleToken) {
           headers['x-google-token'] = googleToken;
@@ -247,7 +249,12 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           : '';
 
         const [hydratedResult, statusRes] = await Promise.all([
-          hydrateAndSyncBillsWithServer(adminToken, googleToken, customSpreadsheetId, forceHydrate),
+          hydrateAndSyncBillsWithServer(
+            currentToken,
+            googleToken,
+            customSpreadsheetId,
+            forceHydrate
+          ),
           apiFetch(`/api/sheets/status${sheetQuery}`, { headers }),
         ]);
 
@@ -267,7 +274,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           }
         }
       } catch (err: any) {
-        if (err?.status === 401) {
+        if (err?.status === 401 && (!err.token || err.token === currentToken)) {
           onLogout();
           return;
         }
@@ -833,7 +840,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   Annapurna Chole Bhature
                 </h1>
                 <span
-                  className={`hidden lg:inline-block text-[11px] font-bold px-2 py-0.5 rounded-md shrink-0 border ${
+                  className={`inline-block text-[10px] sm:text-[11px] font-bold px-2 py-0.5 rounded-md shrink-0 border ${
                     isAdmin
                       ? 'text-amber-900 bg-amber-50 border-amber-300'
                       : 'text-blue-700 bg-blue-50 border-blue-200'

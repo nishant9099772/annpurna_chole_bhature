@@ -896,7 +896,7 @@ export const OrderDashboard: React.FC<OrderDashboardProps> = ({
                 <h1 className="font-black text-base sm:text-xl tracking-tight truncate">
                   Annapurna Kitchen Order Display
                 </h1>
-                <span className="hidden sm:inline-block px-2 py-0.5 text-[11px] font-black uppercase bg-amber-500 text-slate-950 rounded-md">
+                <span className="inline-block px-2 py-0.5 text-[10px] sm:text-[11px] font-black uppercase bg-amber-500 text-slate-950 rounded-md shrink-0">
                   Annapurna Order
                 </span>
               </div>

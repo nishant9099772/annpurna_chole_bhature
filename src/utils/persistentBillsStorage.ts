@@ -134,10 +134,22 @@ export function upsertPersistentBill(bill: Bill): Bill[] {
   return savePersistentBills([bill]);
 }
 
-// In-flight deduplication & throttle for hydration calls so switching tabs doesn't trigger redundant network roundtrips
+// In-flight deduplication & throttle for hydration calls scoped per session token
 let activeHydrationPromise: Promise<{ bills: Bill[]; metrics: BusinessMetrics }> | null = null;
+let activeHydrationToken: string | null = null;
 let lastClientHydrationAt = 0;
+let lastClientHydrationToken: string | null = null;
 const CLIENT_HYDRATION_COOLDOWN_MS = 15_000;
+
+/**
+ * Resets the hydration cooldown and in-flight cache when switching profiles or logging out.
+ */
+export function resetClientHydrationCache(): void {
+  activeHydrationPromise = null;
+  activeHydrationToken = null;
+  lastClientHydrationAt = 0;
+  lastClientHydrationToken = null;
+}
 
 /**
  * Bidirectionally synchronizes bills between the persistent client ledger,
@@ -157,6 +169,7 @@ export async function hydrateAndSyncBillsWithServer(
 
   if (
     !force &&
+    adminToken === lastClientHydrationToken &&
     localBills.length > 0 &&
     Date.now() - lastClientHydrationAt < CLIENT_HYDRATION_COOLDOWN_MS
   ) {
@@ -166,11 +179,12 @@ export async function hydrateAndSyncBillsWithServer(
     };
   }
 
-  if (activeHydrationPromise) {
+  if (activeHydrationPromise && activeHydrationToken === adminToken) {
     return activeHydrationPromise;
   }
 
-  activeHydrationPromise = (async () => {
+  activeHydrationToken = adminToken;
+  const currentPromise = (async () => {
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -194,6 +208,7 @@ export async function hydrateAndSyncBillsWithServer(
       if (res.status === 401) {
         const authErr: any = new Error('Unauthorized session');
         authErr.status = 401;
+        authErr.token = adminToken;
         throw authErr;
       }
 
@@ -205,6 +220,7 @@ export async function hydrateAndSyncBillsWithServer(
 
       if (ok && data && Array.isArray(data.bills)) {
         lastClientHydrationAt = Date.now();
+        lastClientHydrationToken = adminToken;
 
         const serverResetTs = Number(data.lastResetTimestamp) || 0;
         const localResetTs = getLocalLastResetTimestamp();
@@ -232,12 +248,14 @@ export async function hydrateAndSyncBillsWithServer(
         };
       }
     } catch (err: any) {
-      if (err?.status === 401) {
+      if (err?.status === 401 && activeHydrationToken === adminToken) {
         throw err;
       }
       // Fallback to local persistent ledger if offline or server unreachable
     } finally {
-      activeHydrationPromise = null;
+      if (activeHydrationToken === adminToken) {
+        activeHydrationPromise = null;
+      }
     }
 
     const fallbackBills = loadPersistentBills();
@@ -247,7 +265,8 @@ export async function hydrateAndSyncBillsWithServer(
     };
   })();
 
-  return activeHydrationPromise;
+  activeHydrationPromise = currentPromise;
+  return currentPromise;
 }
 
 /**

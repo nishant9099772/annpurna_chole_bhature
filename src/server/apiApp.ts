@@ -143,6 +143,20 @@ function getSessionSecret(): string {
     .digest('hex');
 }
 
+function getAllValidSessionSecrets(): string[] {
+  const secrets = new Set<string>();
+  secrets.add(getSessionSecret());
+  for (const hashHex of DEFAULT_ADMIN_SCRYPT_HASHES_HEX) {
+    secrets.add(
+      crypto
+        .createHash('sha256')
+        .update(`acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${hashHex}`)
+        .digest('hex')
+    );
+  }
+  return Array.from(secrets);
+}
+
 // 24-Hour Session Validity (86,400,000 ms)
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -335,9 +349,14 @@ export interface SignedSessionPayload {
   jti: string;
 }
 
-function normalizeTokenRole(rawRole?: string): UserRole {
+function normalizeTokenRole(rawRole?: string, rawSub?: string): UserRole {
   if (rawRole === 'billing' || rawRole === 'staff') return 'billing';
   if (rawRole === 'order') return 'order';
+  if (rawRole === 'admin') return 'admin';
+  if (rawSub && typeof rawSub === 'string') {
+    const profile = resolveAuthorizedProfile(rawSub);
+    if (profile.authorized) return profile.role;
+  }
   return 'admin';
 }
 
@@ -377,14 +396,22 @@ function verifySignedSessionToken(token?: string | null): SignedSessionPayload |
   if (!payloadB64 || !signatureB64) return null;
 
   try {
-    const expectedSig = crypto
-      .createHmac('sha256', getSessionSecret())
-      .update(payloadB64)
-      .digest('base64url');
-
     const sigBuf = Buffer.from(signatureB64, 'utf-8');
-    const expectedBuf = Buffer.from(expectedSig, 'utf-8');
-    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    let signatureMatched = false;
+
+    for (const secret of getAllValidSessionSecrets()) {
+      const expectedSig = crypto
+        .createHmac('sha256', secret)
+        .update(payloadB64)
+        .digest('base64url');
+      const expectedBuf = Buffer.from(expectedSig, 'utf-8');
+      if (sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+        signatureMatched = true;
+        break;
+      }
+    }
+
+    if (!signatureMatched) {
       return null;
     }
 
@@ -396,7 +423,7 @@ function verifySignedSessionToken(token?: string | null): SignedSessionPayload |
     }
     return {
       ...decoded,
-      role: normalizeTokenRole(decoded.role),
+      role: normalizeTokenRole(decoded.role, decoded.sub),
     };
   } catch {
     return null;
@@ -559,41 +586,53 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
   }
 
   const profileCheck = resolveAuthorizedProfile(rawUsername);
-  if (!profileCheck.authorized) {
+  const validExpectedRole =
+    expectedProfileRole && ['admin', 'billing', 'order'].includes(expectedProfileRole)
+      ? expectedProfileRole
+      : undefined;
+
+  if (!profileCheck.authorized && !validExpectedRole) {
     res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });
     return;
   }
 
-  // If the user selected a specific profile tab on the login screen, ensure the User ID matches that profile
-  if (
-    expectedProfileRole &&
-    ['admin', 'billing', 'order'].includes(expectedProfileRole) &&
-    profileCheck.role !== expectedProfileRole
-  ) {
-    res.status(401).json({
-      error: `User ID "${rawUsername.trim()}" belongs to ${profileCheck.profileLabel}, not ${getProfileDisplayLabel(expectedProfileRole)}. Please switch to the ${profileCheck.profileLabel} tab.`,
-    });
-    return;
+  // Candidate roles to test in order:
+  // 1. The profile resolved from the entered User ID (`profileCheck.role`)
+  // 2. If Android mobile password autofill overwrote the User ID field while the user
+  //    explicitly selected a profile tab (`validExpectedRole`), also test `validExpectedRole`.
+  const candidateRoles: UserRole[] = [];
+  if (profileCheck.authorized) {
+    candidateRoles.push(profileCheck.role);
+  }
+  if (validExpectedRole && !candidateRoles.includes(validExpectedRole)) {
+    candidateRoles.push(validExpectedRole);
   }
 
-  const passwordValid = verifyRolePasswordConstantTime(rawPassword, profileCheck.role);
+  for (const candidateRole of candidateRoles) {
+    if (verifyRolePasswordConstantTime(rawPassword, candidateRole)) {
+      const canonicalUser =
+        candidateRole === 'admin'
+          ? 'annapurna_admin'
+          : candidateRole === 'billing'
+          ? 'annapurna_billing'
+          : 'annapurna_order';
+      const profileLabel = getProfileDisplayLabel(candidateRole);
+      const { token: sessionToken, expiresAt } = createSignedSessionToken(
+        canonicalUser,
+        candidateRole
+      );
 
-  if (passwordValid) {
-    const { token: sessionToken, expiresAt } = createSignedSessionToken(
-      profileCheck.canonicalUser,
-      profileCheck.role
-    );
-
-    res.status(200).json({
-      success: true,
-      message: `Authenticated as ${profileCheck.profileLabel}`,
-      token: sessionToken,
-      username: profileCheck.canonicalUser,
-      role: profileCheck.role,
-      profileLabel: profileCheck.profileLabel,
-      expiresAt,
-    });
-    return;
+      res.status(200).json({
+        success: true,
+        message: `Authenticated as ${profileLabel}`,
+        token: sessionToken,
+        username: canonicalUser,
+        role: candidateRole,
+        profileLabel,
+        expiresAt,
+      });
+      return;
+    }
   }
 
   res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });

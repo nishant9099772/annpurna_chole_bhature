@@ -4,7 +4,7 @@
  * automatic 24-hour session expiration, synchronized live kitchen orders,
  * Google Sheets workspace token, PDF receipt viewer, and 3D Thali showcase.
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { User as FirebaseUser } from 'firebase/auth';
 import { Bill, UserRole } from './types/billing';
 import { initAuth } from './services/firebaseAuth';
@@ -17,9 +17,14 @@ import { formatCustomerNameWithJi } from './utils/customerFormat';
 import {
   hydrateAndSyncBillsWithServer,
   loadPersistentBills,
+  resetClientHydrationCache,
   upsertPersistentBill,
 } from './utils/persistentBillsStorage';
-import { apiFetch, parseApiJsonResponse } from './utils/apiClient';
+import {
+  apiFetch,
+  decodeSessionTokenRole,
+  parseApiJsonResponse,
+} from './utils/apiClient';
 import { AdminLogin } from './components/AdminLogin';
 import { BillingDashboard } from './components/BillingDashboard';
 import { OrderDashboard } from './components/OrderDashboard';
@@ -30,34 +35,184 @@ import { ThaliCanvas3D } from './components/ThaliCanvas3D';
 
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Hours
 
-export default function App() {
-  // Authentication State — strictly verified against backend /api/auth/me
-  const [adminToken, setAdminToken] = useState<string | null>(() => {
-    const stored = localStorage.getItem('annpurna_admin_token');
-    if (!stored || !stored.startsWith('acb.')) {
-      localStorage.removeItem('annpurna_admin_token');
-      return null;
-    }
-    return stored;
-  });
-  const [adminUsername, setAdminUsername] = useState<string>(() => {
-    return localStorage.getItem('annpurna_admin_user') || 'annapurna_admin';
-  });
-  const [userRole, setUserRole] = useState<UserRole>(() => {
-    const storedRole = localStorage.getItem('annpurna_user_role');
-    if (storedRole === 'billing' || storedRole === 'order') return storedRole;
-    return 'admin';
-  });
-  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(() => {
-    const rawExp = localStorage.getItem('annpurna_session_expires_at');
-    const parsed = rawExp ? Number(rawExp) : NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  });
+interface InitialSessionState {
+  token: string | null;
+  username: string;
+  role: UserRole;
+  expiresAt: number | null;
+}
 
-  const [isSessionVerified, setIsSessionVerified] = useState<boolean>(false);
+function loadInitialSessionState(): InitialSessionState {
+  try {
+    // 1. Check per-tab sessionStorage first so multiple tabs (Admin, Billing, Order)
+    //    can run simultaneously in the same browser without overwriting each other.
+    const tabToken =
+      typeof sessionStorage !== 'undefined'
+        ? sessionStorage.getItem('annpurna_tab_token')
+        : null;
+    const globalToken = localStorage.getItem('annpurna_admin_token');
+
+    const candidateToken =
+      tabToken && tabToken.startsWith('acb.')
+        ? tabToken
+        : globalToken && globalToken.startsWith('acb.')
+        ? globalToken
+        : null;
+
+    if (!candidateToken) {
+      if (globalToken && !globalToken.startsWith('acb.')) {
+        localStorage.removeItem('annpurna_admin_token');
+      }
+      return {
+        token: null,
+        username: 'annapurna_admin',
+        role: 'admin',
+        expiresAt: null,
+      };
+    }
+
+    const decoded = decodeSessionTokenRole(candidateToken);
+    const isUsingTabStorage = Boolean(tabToken && tabToken === candidateToken);
+
+    const rawStoredRole = isUsingTabStorage
+      ? sessionStorage.getItem('annpurna_tab_role')
+      : localStorage.getItem('annpurna_user_role');
+
+    const resolvedRole: UserRole =
+      decoded?.role === 'billing' || decoded?.role === 'order' || decoded?.role === 'admin'
+        ? decoded.role
+        : rawStoredRole === 'billing' || rawStoredRole === 'order'
+        ? rawStoredRole
+        : 'admin';
+
+    const rawStoredUser = isUsingTabStorage
+      ? sessionStorage.getItem('annpurna_tab_user')
+      : localStorage.getItem('annpurna_admin_user');
+
+    const resolvedUsername =
+      decoded?.sub ||
+      rawStoredUser ||
+      (resolvedRole === 'admin'
+        ? 'annapurna_admin'
+        : resolvedRole === 'billing'
+        ? 'annapurna_billing'
+        : 'annapurna_order');
+
+    const rawExp = isUsingTabStorage
+      ? sessionStorage.getItem('annpurna_tab_expires_at')
+      : localStorage.getItem('annpurna_session_expires_at');
+    const parsedExp = rawExp ? Number(rawExp) : NaN;
+    const resolvedExpiresAt =
+      decoded?.exp && decoded.exp > 0
+        ? decoded.exp
+        : Number.isFinite(parsedExp) && parsedExp > 0
+        ? parsedExp
+        : null;
+
+    // Sync into tab sessionStorage so this tab stays locked to its own role
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem('annpurna_tab_token', candidateToken);
+      sessionStorage.setItem('annpurna_tab_user', resolvedUsername);
+      sessionStorage.setItem('annpurna_tab_role', resolvedRole);
+      if (resolvedExpiresAt) {
+        sessionStorage.setItem('annpurna_tab_expires_at', String(resolvedExpiresAt));
+      }
+    }
+
+    return {
+      token: candidateToken,
+      username: resolvedUsername,
+      role: resolvedRole,
+      expiresAt: resolvedExpiresAt,
+    };
+  } catch {
+    return {
+      token: null,
+      username: 'annapurna_admin',
+      role: 'admin',
+      expiresAt: null,
+    };
+  }
+}
+
+function persistSessionToStorage(
+  token: string,
+  username: string,
+  role: UserRole,
+  expiresAt: number
+): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem('annpurna_tab_token', token);
+      sessionStorage.setItem('annpurna_tab_user', username);
+      sessionStorage.setItem('annpurna_tab_role', role);
+      sessionStorage.setItem('annpurna_tab_expires_at', String(expiresAt));
+    }
+    localStorage.setItem('annpurna_admin_token', token);
+    localStorage.setItem('annpurna_admin_user', username);
+    localStorage.setItem('annpurna_user_role', role);
+    localStorage.setItem('annpurna_session_expires_at', String(expiresAt));
+    localStorage.setItem(
+      `annpurna_profile_session_${role}`,
+      JSON.stringify({ token, username, role, expiresAt })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearSessionFromStorage(tokenBeingCleared?: string | null, roleBeingCleared?: UserRole): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.removeItem('annpurna_tab_token');
+      sessionStorage.removeItem('annpurna_tab_user');
+      sessionStorage.removeItem('annpurna_tab_role');
+      sessionStorage.removeItem('annpurna_tab_expires_at');
+    }
+    if (roleBeingCleared) {
+      localStorage.removeItem(`annpurna_profile_session_${roleBeingCleared}`);
+    }
+    // Only clear shared localStorage keys if they belong to the token being logged out
+    // so logging out in one browser tab never wipes a different active profile in another tab.
+    const currentGlobalToken = localStorage.getItem('annpurna_admin_token');
+    if (!tokenBeingCleared || !currentGlobalToken || currentGlobalToken === tokenBeingCleared) {
+      localStorage.removeItem('annpurna_admin_token');
+      localStorage.removeItem('annpurna_admin_user');
+      localStorage.removeItem('annpurna_user_role');
+      localStorage.removeItem('annpurna_session_expires_at');
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export default function App() {
+  const initialSession = useRef<InitialSessionState | null>(null);
+  if (initialSession.current === null) {
+    initialSession.current = loadInitialSessionState();
+  }
+
+  // Authentication State — strictly verified against backend /api/auth/me and signed token payload
+  const [adminToken, setAdminToken] = useState<string | null>(initialSession.current.token);
+  const [adminUsername, setAdminUsername] = useState<string>(initialSession.current.username);
+  const [userRole, setUserRole] = useState<UserRole>(initialSession.current.role);
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(
+    initialSession.current.expiresAt
+  );
+
+  // Track freshly authenticated token from POST /api/auth/login so useEffect([adminToken])
+  // does not immediately unmount the dashboard with a redundant "Verifying secure session..." spinner.
+  const justVerifiedTokenRef = useRef<string | null>(null);
+
+  const [isSessionVerified, setIsSessionVerified] = useState<boolean>(() => {
+    const decoded = decodeSessionTokenRole(initialSession.current?.token);
+    return Boolean(decoded && decoded.exp > Date.now());
+  });
   const [isCheckingSession, setIsCheckingSession] = useState<boolean>(() => {
-    const stored = localStorage.getItem('annpurna_admin_token');
-    return Boolean(stored && stored.startsWith('acb.'));
+    const tok = initialSession.current?.token;
+    if (!tok) return false;
+    const decoded = decodeSessionTokenRole(tok);
+    return !decoded;
   });
 
   // Google Workspace Auth State (for Google Sheets sync — Admin only)
@@ -98,21 +253,24 @@ export default function App() {
 
   // Handle Logout — ONLY clears authentication session token; NEVER deletes sales/bill/order records
   const handleAdminLogout = useCallback(() => {
-    if (adminToken) {
+    const tokenToRevoke = adminToken;
+    const roleToClear = userRole;
+    resetClientHydrationCache();
+    justVerifiedTokenRef.current = null;
+
+    if (tokenToRevoke) {
       apiFetch('/api/auth/logout', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${adminToken}` },
+        headers: { Authorization: `Bearer ${tokenToRevoke}` },
       }).catch(() => {});
     }
-    localStorage.removeItem('annpurna_admin_token');
-    localStorage.removeItem('annpurna_admin_user');
-    localStorage.removeItem('annpurna_user_role');
-    localStorage.removeItem('annpurna_session_expires_at');
+    clearSessionFromStorage(tokenToRevoke, roleToClear);
     setAdminToken(null);
     setSessionExpiresAt(null);
     setIsSessionVerified(false);
+    setIsCheckingSession(false);
     setActiveCompletedBill(null);
-  }, [adminToken]);
+  }, [adminToken, userRole]);
 
   // Automatic 24-Hour Session Expiration Watcher
   useEffect(() => {
@@ -138,8 +296,18 @@ export default function App() {
       return;
     }
 
+    // If this token was just verified by POST /api/auth/login, do not unmount the newly activated dashboard!
+    if (justVerifiedTokenRef.current === adminToken) {
+      setIsSessionVerified(true);
+      setIsCheckingSession(false);
+      return;
+    }
+
     let cancelled = false;
-    setIsCheckingSession(true);
+    const decodedLocal = decodeSessionTokenRole(adminToken);
+    if (!decodedLocal) {
+      setIsCheckingSession(true);
+    }
 
     apiFetch('/api/auth/me', {
       headers: {
@@ -148,9 +316,11 @@ export default function App() {
       },
     })
       .then(async (res) => {
-        const { ok, data } = await parseApiJsonResponse<any>(res);
+        const { ok, status, data } = await parseApiJsonResponse<any>(res);
         if (!ok || !data) {
-          throw new Error('Session invalid or expired');
+          const err: any = new Error('Session invalid or expired');
+          err.status = status;
+          throw err;
         }
         return data;
       })
@@ -158,28 +328,39 @@ export default function App() {
         if (cancelled) return;
         if (data?.isAuthenticated) {
           setIsSessionVerified(true);
-          if (data.username) {
-            setAdminUsername(data.username);
-            localStorage.setItem('annpurna_admin_user', data.username);
-          }
+          const resolvedUsername =
+            data.username || decodedLocal?.sub || adminUsername || 'annapurna_admin';
+          setAdminUsername(resolvedUsername);
+
+          const rawRole = data.role || decodedLocal?.role;
           const resolvedRole: UserRole =
-            data.role === 'billing' || data.role === 'order' ? data.role : 'admin';
+            rawRole === 'billing' ? 'billing' : rawRole === 'order' ? 'order' : 'admin';
           setUserRole(resolvedRole);
-          localStorage.setItem('annpurna_user_role', resolvedRole);
-          if (typeof data.expiresAt === 'number' && data.expiresAt > 0) {
-            setSessionExpiresAt(data.expiresAt);
-            localStorage.setItem('annpurna_session_expires_at', String(data.expiresAt));
-          }
+
+          const resolvedExp =
+            typeof data.expiresAt === 'number' && data.expiresAt > 0
+              ? data.expiresAt
+              : decodedLocal?.exp || Date.now() + SESSION_DURATION_MS;
+          setSessionExpiresAt(resolvedExp);
+
+          persistSessionToStorage(adminToken, resolvedUsername, resolvedRole, resolvedExp);
         } else {
-          throw new Error('Not authenticated');
+          const err: any = new Error('Not authenticated');
+          err.status = 401;
+          throw err;
         }
       })
-      .catch(() => {
+      .catch((err: any) => {
         if (cancelled) return;
-        localStorage.removeItem('annpurna_admin_token');
-        localStorage.removeItem('annpurna_admin_user');
-        localStorage.removeItem('annpurna_user_role');
-        localStorage.removeItem('annpurna_session_expires_at');
+        // If transient network failure occurred on mobile but token is cryptographically valid & unexpired, keep session active
+        if (err?.status !== 401 && decodedLocal && decodedLocal.exp > Date.now()) {
+          setIsSessionVerified(true);
+          setUserRole(decodedLocal.role);
+          setAdminUsername(decodedLocal.sub);
+          setSessionExpiresAt(decodedLocal.exp);
+          return;
+        }
+        clearSessionFromStorage(adminToken);
         setAdminToken(null);
         setSessionExpiresAt(null);
         setIsSessionVerified(false);
@@ -193,7 +374,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [adminToken]);
+  }, [adminToken, adminUsername]);
 
   // Initialize Firebase Auth Listener
   useEffect(() => {
@@ -217,12 +398,13 @@ export default function App() {
     if (!adminToken || !isSessionVerified) return;
     if (userRole === 'order') return;
 
-    hydrateAndSyncBillsWithServer(adminToken, userRole === 'admin' ? googleToken : null)
+    const currentToken = adminToken;
+    hydrateAndSyncBillsWithServer(currentToken, userRole === 'admin' ? googleToken : null)
       .then(({ bills }) => {
         setShiftBills(bills);
       })
       .catch((err: any) => {
-        if (err?.status === 401) {
+        if (err?.status === 401 && (!err.token || err.token === currentToken)) {
           handleAdminLogout();
           return;
         }
@@ -237,22 +419,42 @@ export default function App() {
     role: UserRole,
     expiresAt?: number
   ) => {
+    resetClientHydrationCache();
+    const decoded = decodeSessionTokenRole(token);
+    const authoritativeRole: UserRole =
+      role === 'billing' || role === 'order' || role === 'admin'
+        ? role
+        : decoded?.role || 'admin';
+    const authoritativeUsername =
+      username ||
+      decoded?.sub ||
+      (authoritativeRole === 'admin'
+        ? 'annapurna_admin'
+        : authoritativeRole === 'billing'
+        ? 'annapurna_billing'
+        : 'annapurna_order');
+
     const effectiveExpiresAt =
       typeof expiresAt === 'number' && expiresAt > Date.now()
         ? expiresAt
+        : decoded?.exp && decoded.exp > Date.now()
+        ? decoded.exp
         : Date.now() + SESSION_DURATION_MS;
 
-    localStorage.setItem('annpurna_admin_token', token);
-    localStorage.setItem('annpurna_admin_user', username);
-    localStorage.setItem('annpurna_user_role', role);
-    localStorage.setItem('annpurna_session_expires_at', String(effectiveExpiresAt));
+    justVerifiedTokenRef.current = token;
+    persistSessionToStorage(
+      token,
+      authoritativeUsername,
+      authoritativeRole,
+      effectiveExpiresAt
+    );
 
-    setAdminUsername(username);
-    setUserRole(role);
+    setAdminUsername(authoritativeUsername);
+    setUserRole(authoritativeRole);
     setSessionExpiresAt(effectiveExpiresAt);
-    setAdminToken(token);
     setIsSessionVerified(true);
     setIsCheckingSession(false);
+    setAdminToken(token);
   };
 
   // Helper to manage persistent localStorage pending-sync queue
