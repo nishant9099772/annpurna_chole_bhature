@@ -1094,7 +1094,8 @@ export async function fetchBillsFromGoogleSheets(options?: {
         (billDate && billTime ? `${billDate}, ${billTime} IST` : billDate || 'IST');
 
       // Parse exact millisecond timestamp from Timestamp (ms), Date & Time (IST), Bill Date + Bill Time, or Order ID
-      let timestamp = Date.now() - r * 1000;
+      // Do NOT fall back to Date.now() for unparseable rows, as that would make historical rows look brand-new
+      let timestamp = 0;
       const rawTsMs = Number(rowObj['Timestamp (ms)'] || '');
       if (Number.isFinite(rawTsMs) && rawTsMs > 946684800000) {
         timestamp = rawTsMs;
@@ -1105,9 +1106,13 @@ export async function fetchBillsFromGoogleSheets(options?: {
           billTime,
           orderId || billNumber
         );
-        if (parsedKolkataMs !== null && Number.isFinite(parsedKolkataMs)) {
+        if (parsedKolkataMs !== null && Number.isFinite(parsedKolkataMs) && parsedKolkataMs > 946684800000) {
           timestamp = parsedKolkataMs;
         }
+      }
+      if (!timestamp) {
+        // Skip malformed or unparseable rows so they never pollute 24h metrics or kitchen queues
+        continue;
       }
 
       const itemsSummary = rowObj['Items'] || rowObj['Product Details'] || '';
@@ -1155,6 +1160,9 @@ export async function fetchBillsFromGoogleSheets(options?: {
         sheetsSyncStatus: 'synced',
         spreadsheetId,
         spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+        orderStatus: 'COMPLETED',
+        orderCreatedAt: timestamp,
+        orderCompletedAt: timestamp,
       });
     }
 

@@ -1,0 +1,26 @@
+[
+  {
+    "resetId": "RST-56560333",
+    "timestamp": 1793987211832,
+    "dateTimeKolkata": "06 Nov 2026, 11:16:51 pm IST",
+    "adminUsername": "annapurna_admin",
+    "deletedBillsCount": 7,
+    "deletedRevenueRupees": 14082
+  },
+  {
+    "resetId": "RST-29BA8B07",
+    "timestamp": 1793987212889,
+    "dateTimeKolkata": "06 Nov 2026, 11:16:52 pm IST",
+    "adminUsername": "annapurna_admin",
+    "deletedBillsCount": 1,
+    "deletedRevenueRupees": 160
+  },
+  {
+    "resetId": "RST-B7B27AE6",
+    "timestamp": 1793987213176,
+    "dateTimeKolkata": "06 Nov 2026, 11:16:53 pm IST",
+    "adminUsername": "annapurna_admin",
+    "deletedBillsCount": 1,
+    "deletedRevenueRupees": 80
+  }
+]

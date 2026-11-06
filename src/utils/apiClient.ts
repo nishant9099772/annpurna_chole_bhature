@@ -481,10 +481,46 @@ export function installCapacitorApiFetchInterceptor(): void {
         }
       }
 
-      // If inside Capacitor and the remote Netlify server has not yet been redeployed with /api/orders,
-      // fall back to the local Capacitor API engine for 404 on /api/orders
-      if (inCapacitor && response.status === 404 && apiPathWithQuery.startsWith('/api/orders')) {
+      // If inside Capacitor (or calling a remote Netlify URL that hasn't been redeployed with the new 3-profile endpoints yet):
+      // 1. Fall back to local Capacitor API engine on 404 for /api/orders, /api/admin/reset-sales, /api/admin/reset-audit, /api/auth/change-password
+      if (
+        (inCapacitor || isCrossOrigin) &&
+        response.status === 404 &&
+        (apiPathWithQuery.startsWith('/api/orders') ||
+          apiPathWithQuery.startsWith('/api/admin/reset-sales') ||
+          apiPathWithQuery.startsWith('/api/admin/reset-audit') ||
+          apiPathWithQuery.startsWith('/api/auth/change-password'))
+      ) {
         return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+      }
+
+      // 2. If /api/auth/login returns 401 on a remote server that hasn't been redeployed with the new 3-profile credentials yet,
+      // check whether the credentials are valid in the local 3-profile scrypt authenticator
+      if (
+        (inCapacitor || isCrossOrigin) &&
+        response.status === 401 &&
+        apiPathWithQuery.startsWith('/api/auth/login')
+      ) {
+        const localLoginRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+        if (localLoginRes.status === 200) {
+          return localLoginRes;
+        }
+      }
+
+      // 3. If a protected endpoint returns 401 on a pre-redeploy remote server when using a valid local 3-profile token,
+      // verify against the local Capacitor API engine
+      if (
+        (inCapacitor || isCrossOrigin) &&
+        response.status === 401 &&
+        !apiPathWithQuery.startsWith('/api/auth/login') &&
+        !apiPathWithQuery.startsWith('/api/admin/reset-sales') &&
+        !apiPathWithQuery.startsWith('/api/auth/change-password') &&
+        mergedHeaders.has('Authorization')
+      ) {
+        const localFallbackRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, init);
+        if (localFallbackRes.status !== 401) {
+          return localFallbackRes;
+        }
       }
 
       return response;

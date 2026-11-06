@@ -749,7 +749,11 @@ app.get(['/api/metrics', '/api/metrics/'], requireAdminOnly, async (req: Request
   await maybeHydrateFromSheets(clientToken, customSheetId);
   const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
   const metrics = billStorage.getMetrics(userId);
-  res.json({ metrics, bills: billStorage.getAllBills() });
+  res.json({
+    metrics,
+    bills: billStorage.getAllBills(),
+    lastResetTimestamp: billStorage.getLastResetTimestamp(),
+  });
 });
 
 /**
@@ -773,11 +777,13 @@ app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminOrBilling, a
     }
 
     const allBills = billStorage.getAllBills();
+    const lastResetTimestamp = billStorage.getLastResetTimestamp();
 
     if (session.role === 'billing') {
       res.json({
         success: true,
         bills: allBills.map(sanitizeBillForBillingProfile),
+        lastResetTimestamp,
       });
       return;
     }
@@ -787,6 +793,7 @@ app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminOrBilling, a
       success: true,
       metrics,
       bills: allBills,
+      lastResetTimestamp,
     });
   } catch (err: any) {
     console.error('[Bills Hydrate Error]:', err);
@@ -902,6 +909,7 @@ app.post(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Reque
       paymentMethod = 'Cash',
       paymentStatus = 'Paid',
       specialInstructions,
+      idempotencyKey,
       userId,
       googleAccessToken,
       customSpreadsheetId,
@@ -1050,16 +1058,73 @@ app.post(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Reque
       hour12: true,
     }).format(now);
 
-    // 8. Generate Unique Order ID & Bill Number
+    // 8. Idempotency & Duplicate Submission Protection
+    const itemCount = validatedItems.reduce((sum, item) => sum + item.quantity, 0);
+    const itemDetailsSummary = validatedItems.map((i) => `${i.name} (${i.quantity})`).join(', ');
+    const itemPricesSummary = validatedItems.map((i) => `${i.name}: Rs ${i.unitPriceRupees}`).join(', ');
+    const nowMs = Date.now();
+    const cleanedIdempotencyKey =
+      typeof idempotencyKey === 'string' && idempotencyKey.trim()
+        ? idempotencyKey.trim().slice(0, 128)
+        : undefined;
+
+    const existingDuplicate = billStorage.findExistingDuplicateBill({
+      idempotencyKey: cleanedIdempotencyKey,
+      customerName: trimmedName,
+      mobileNumber: cleanMobile,
+      orderType: validatedOrderType,
+      grandTotalPaise,
+      itemDetailsSummary,
+      nowMs,
+    });
+
+    if (existingDuplicate) {
+      const dupResponseBill =
+        session.role === 'billing'
+          ? sanitizeBillForBillingProfile(existingDuplicate)
+          : existingDuplicate;
+      res.status(200).json({
+        success: true,
+        duplicatePrevented: true,
+        message: 'Bill already created (duplicate submission prevented)',
+        bill: dupResponseBill,
+        order: billToKitchenOrder(existingDuplicate, nowMs),
+        id: dupResponseBill.id,
+        orderId: dupResponseBill.orderId,
+        billNumber: dupResponseBill.billNumber,
+        orderType: dupResponseBill.orderType,
+        orderTypeLabel: dupResponseBill.orderTypeLabel,
+        customerName: dupResponseBill.customerName,
+        mobileNumber: dupResponseBill.mobileNumber,
+        countryCode: dupResponseBill.countryCode,
+        items: dupResponseBill.items,
+        subtotalRupees: dupResponseBill.subtotalRupees,
+        discountPercent: dupResponseBill.discountPercent,
+        discountAmountRupees: dupResponseBill.discountAmountRupees,
+        discountRupees: dupResponseBill.discountAmountRupees,
+        grandTotalRupees: dupResponseBill.grandTotalRupees,
+        paymentMethod: dupResponseBill.paymentMethod,
+        paymentStatus: dupResponseBill.paymentStatus,
+        billDate: dupResponseBill.billDate,
+        billTime: dupResponseBill.billTime,
+        dateTimeKolkata: dupResponseBill.dateTimeKolkata,
+        timestamp: dupResponseBill.timestamp,
+        orderStatus: dupResponseBill.orderStatus,
+        orderCreatedAt: dupResponseBill.orderCreatedAt,
+        savedToSheets: dupResponseBill.savedToSheets,
+        sheetsSyncStatus: dupResponseBill.sheetsSyncStatus,
+        sheetsSyncError: dupResponseBill.sheetsSyncError,
+        spreadsheetId: dupResponseBill.spreadsheetId,
+        spreadsheetUrl: dupResponseBill.spreadsheetUrl,
+      });
+      return;
+    }
+
+    // Generate Unique Order ID & Bill Number
     const uniqueBillId = `BILL-${crypto.randomUUID()}`;
     const orderId = billStorage.generateOrderId();
     const billNumber = billStorage.generateBillNumber();
 
-    const itemCount = validatedItems.reduce((sum, item) => sum + item.quantity, 0);
-    const itemDetailsSummary = validatedItems.map((i) => `${i.name} (${i.quantity})`).join(', ');
-    const itemPricesSummary = validatedItems.map((i) => `${i.name}: Rs ${i.unitPriceRupees}`).join(', ');
-
-    const nowMs = Date.now();
     const cleanedInstructions =
       typeof specialInstructions === 'string' && specialInstructions.trim()
         ? specialInstructions.trim().slice(0, 240)
@@ -1102,6 +1167,7 @@ app.post(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Reque
       orderStatus: 'WAITING',
       orderCreatedAt: nowMs,
       specialInstructions: cleanedInstructions,
+      idempotencyKey: cleanedIdempotencyKey,
     };
 
     // 9. Sync to Google Sheets (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
@@ -1381,6 +1447,7 @@ app.get(['/api/orders', '/api/orders/'], requireAnyAuthenticatedProfile, async (
         completed: completedOrders.length,
       },
       serverTime: nowMs,
+      lastResetTimestamp: billStorage.getLastResetTimestamp(),
     });
   } catch (err: any) {
     console.error('Get kitchen orders error:', err);
@@ -1509,6 +1576,7 @@ app.get(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Reques
     res.json({
       ...result,
       bills: result.bills.map(sanitizeBillForBillingProfile),
+      lastResetTimestamp: billStorage.getLastResetTimestamp(),
     });
     return;
   }
@@ -1518,8 +1586,102 @@ app.get(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Reques
   res.json({
     ...result,
     metrics,
+    lastResetTimestamp: billStorage.getLastResetTimestamp(),
   });
 });
+
+/**
+ * POST /api/admin/reset-sales (Admin Only)
+ * Permanently resets all historical sales records, bill history, financial transaction records,
+ * daily/24h/monthly sales totals, sales calendar entries, and completed/waiting kitchen orders.
+ * Requires mandatory dual verification:
+ *   1. Current Admin password (verified in constant time using scrypt)
+ *   2. Exact typed confirmation phrase: "RESET ALL SALES DATA"
+ *   3. Blocks reset with 409 Conflict if any kitchen order is actively PREPARING or LATE.
+ */
+app.post(
+  ['/api/admin/reset-sales', '/api/admin/reset-sales/'],
+  requireAdminOnly,
+  async (req: Request, res: Response) => {
+    try {
+      const session: SignedSessionPayload = (req as any).authSession;
+      const { adminPassword, confirmationPhrase } = req.body || {};
+
+      // 1. Validate Admin Password
+      if (typeof adminPassword !== 'string' || !adminPassword.trim()) {
+        res.status(400).json({
+          error: 'Admin password is required to authorize sales data reset.',
+        });
+        return;
+      }
+
+      if (!verifyRolePasswordConstantTime(adminPassword, 'admin')) {
+        res.status(401).json({
+          error: 'Invalid Admin password. Sales data reset denied.',
+        });
+        return;
+      }
+
+      // 2. Validate Exact Typed Confirmation Phrase
+      const cleanedPhrase =
+        typeof confirmationPhrase === 'string' ? confirmationPhrase.trim() : '';
+      if (cleanedPhrase !== 'RESET ALL SALES DATA') {
+        res.status(400).json({
+          error: 'Please type the exact confirmation phrase: RESET ALL SALES DATA',
+        });
+        return;
+      }
+
+      // 3. Guard Active Preparing Kitchen Orders
+      const nowMs = Date.now();
+      const activePreparingOrders = billStorage.getActivePreparingOrders(nowMs);
+      if (activePreparingOrders.length > 0) {
+        const activeNums = activePreparingOrders.map((o) => o.orderNumber).join(', ');
+        res.status(409).json({
+          error: `Cannot reset sales data while ${activePreparingOrders.length} kitchen order(s) (${activeNums}) are actively being prepared. Please mark active kitchen orders as Completed first.`,
+          activeOrdersCount: activePreparingOrders.length,
+          activeOrderNumbers: activePreparingOrders.map((o) => o.orderNumber),
+        });
+        return;
+      }
+
+      // 4. Execute Transactional Sales Data Reset + Audit Log
+      const { auditEntry, lastResetTimestamp } = await billStorage.resetAllSalesData(
+        session.sub,
+        nowMs
+      );
+
+      res.status(200).json({
+        success: true,
+        message: `All sales data, bill history, and completed orders (${auditEntry.deletedBillsCount} records) have been reset to ₹0.00.`,
+        auditEntry,
+        lastResetTimestamp,
+        metrics: billStorage.getMetrics(undefined, nowMs),
+      });
+    } catch (err: any) {
+      console.error('[Admin Reset Sales Error]:', err);
+      res.status(500).json({
+        error: err?.message || 'Failed to reset sales data.',
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/admin/reset-audit (Admin Only)
+ * Returns the audit log of past sales data resets and the current reset watermark.
+ */
+app.get(
+  ['/api/admin/reset-audit', '/api/admin/reset-audit/'],
+  requireAdminOnly,
+  (req: Request, res: Response) => {
+    res.json({
+      success: true,
+      lastResetTimestamp: billStorage.getLastResetTimestamp(),
+      auditLog: billStorage.getResetAuditLog(),
+    });
+  }
+);
 
 /**
  * GET /api/bills/:id/pdf (Admin and Billing)

@@ -439,20 +439,21 @@ export const OrderDashboard: React.FC<OrderDashboardProps> = ({
       </div>
 
       {/* 3 Required Kitchen Sections Switcher */}
-      <div className="bg-white p-1.5 rounded-xl border border-slate-200 shadow-xs grid grid-cols-3 gap-1.5">
+      <div className="bg-white p-1.5 rounded-xl border border-slate-200 shadow-xs grid grid-cols-3 gap-1.5 sticky top-14 sm:top-16 z-20">
         <button
           type="button"
           onClick={() => setActiveSection('fifo')}
-          className={`py-3 px-2.5 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1.5 sm:gap-2 transition cursor-pointer ${
+          className={`py-2.5 sm:py-3 px-2 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1 sm:gap-2 transition cursor-pointer ${
             activeSection === 'fifo'
               ? 'bg-amber-600 text-white shadow-xs'
               : 'bg-slate-50 text-slate-700 hover:bg-slate-100'
           }`}
         >
-          <ListOrdered className="w-4 h-4 shrink-0" />
-          <span className="truncate">First Come, First Served</span>
+          <ListOrdered className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+          <span className="sm:hidden truncate">FIFO Queue</span>
+          <span className="hidden sm:inline truncate">First Come, First Served</span>
           <span
-            className={`px-2 py-0.5 rounded-md font-mono text-xs ${
+            className={`px-1.5 sm:px-2 py-0.5 rounded-md font-mono text-[11px] sm:text-xs ${
               activeSection === 'fifo'
                 ? 'bg-amber-900/40 text-white'
                 : 'bg-amber-100 text-amber-900'
@@ -465,16 +466,16 @@ export const OrderDashboard: React.FC<OrderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setActiveSection('all')}
-          className={`py-3 px-2.5 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1.5 sm:gap-2 transition cursor-pointer ${
+          className={`py-2.5 sm:py-3 px-2 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1 sm:gap-2 transition cursor-pointer ${
             activeSection === 'all'
               ? 'bg-slate-900 text-white shadow-xs'
               : 'bg-slate-50 text-slate-700 hover:bg-slate-100'
           }`}
         >
-          <Layers className="w-4 h-4 shrink-0" />
+          <Layers className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
           <span className="truncate">All Orders</span>
           <span
-            className={`px-2 py-0.5 rounded-md font-mono text-xs ${
+            className={`px-1.5 sm:px-2 py-0.5 rounded-md font-mono text-[11px] sm:text-xs ${
               activeSection === 'all' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-800'
             }`}
           >
@@ -485,16 +486,17 @@ export const OrderDashboard: React.FC<OrderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setActiveSection('completed')}
-          className={`py-3 px-2.5 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1.5 sm:gap-2 transition cursor-pointer ${
+          className={`py-2.5 sm:py-3 px-2 sm:px-4 rounded-lg font-extrabold text-xs sm:text-sm flex items-center justify-center gap-1 sm:gap-2 transition cursor-pointer ${
             activeSection === 'completed'
               ? 'bg-emerald-700 text-white shadow-xs'
               : 'bg-slate-50 text-slate-700 hover:bg-slate-100'
           }`}
         >
-          <CheckCheck className="w-4 h-4 shrink-0" />
-          <span className="truncate">Completed Orders</span>
+          <CheckCheck className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+          <span className="sm:hidden truncate">Completed</span>
+          <span className="hidden sm:inline truncate">Completed Orders</span>
           <span
-            className={`px-2 py-0.5 rounded-md font-mono text-xs ${
+            className={`px-1.5 sm:px-2 py-0.5 rounded-md font-mono text-[11px] sm:text-xs ${
               activeSection === 'completed'
                 ? 'bg-emerald-950/40 text-white'
                 : 'bg-emerald-100 text-emerald-900'

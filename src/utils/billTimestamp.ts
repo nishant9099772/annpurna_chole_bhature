@@ -245,11 +245,15 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
 
     if (!idKey && !orderIdKey && !billNoKey) continue;
 
+    const isSheetRow = idKey.startsWith('SHEET-');
+    const defaultStatusForRecord = isSheetRow ? 'COMPLETED' : rawBill.orderStatus || 'COMPLETED';
+
     const resolvedTs = resolveBillTimestampMs(rawBill);
     const normalizedBill: Bill = {
       ...rawBill,
       customerName: formatCustomerNameWithJi(rawBill.customerName || 'Customer'),
       timestamp: resolvedTs,
+      orderStatus: rawBill.orderStatus || defaultStatusForRecord,
     };
 
     const existingCanonicalKey =
@@ -265,14 +269,15 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
       if (billNoKey) billNoToCanonicalKey.set(billNoKey, canonical);
     } else {
       const prev = byCanonicalKey.get(existingCanonicalKey)!;
+      const prevIsSheet = Boolean(prev.id && prev.id.startsWith('SHEET-'));
       // Prefer non-SHEET internal ID and accurate millisecond timestamp
       const preferPrevId =
-        prev.id && !prev.id.startsWith('SHEET-')
+        prev.id && !prevIsSheet
           ? prev.id
           : normalizedBill.id || prev.id;
 
       const preferTimestamp =
-        prev.id && !prev.id.startsWith('SHEET-') && prev.timestamp > 946684800000
+        prev.id && !prevIsSheet && prev.timestamp > 946684800000
           ? prev.timestamp
           : normalizedBill.timestamp;
 
@@ -289,12 +294,20 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
         LATE: 3,
         COMPLETED: 4,
       };
-      const prevRank = statusRank[prev.orderStatus || 'WAITING'] || 1;
-      const nextRank = statusRank[normalizedBill.orderStatus || 'WAITING'] || 1;
-      const mergedOrderStatus =
-        nextRank > prevRank
-          ? normalizedBill.orderStatus
-          : prev.orderStatus || normalizedBill.orderStatus || 'WAITING';
+      let mergedOrderStatus = prev.orderStatus || normalizedBill.orderStatus || 'COMPLETED';
+      if (!prevIsSheet && isSheetRow) {
+        // Native bill's live kitchen status always takes precedence over a stateless sheet row
+        mergedOrderStatus = prev.orderStatus || 'COMPLETED';
+      } else if (prevIsSheet && !isSheetRow) {
+        mergedOrderStatus = normalizedBill.orderStatus || 'COMPLETED';
+      } else {
+        const prevRank = statusRank[prev.orderStatus || 'COMPLETED'] || 4;
+        const nextRank = statusRank[normalizedBill.orderStatus || 'COMPLETED'] || 4;
+        mergedOrderStatus =
+          nextRank > prevRank
+            ? normalizedBill.orderStatus || 'COMPLETED'
+            : prev.orderStatus || normalizedBill.orderStatus || 'COMPLETED';
+      }
 
       const merged: Bill = {
         ...normalizedBill,
@@ -320,6 +333,7 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
         startedBy: prev.startedBy || normalizedBill.startedBy,
         completedBy: prev.completedBy || normalizedBill.completedBy,
         specialInstructions: prev.specialInstructions || normalizedBill.specialInstructions,
+        idempotencyKey: prev.idempotencyKey || normalizedBill.idempotencyKey,
       };
 
       byCanonicalKey.set(existingCanonicalKey, merged);

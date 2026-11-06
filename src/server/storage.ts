@@ -2,10 +2,12 @@
  * Annpurna Chole Bhature - Persistent Storage Layer
  * Thread-safe, disk-backed persistent storage in ./data/bills.json (with serverless /tmp fallback).
  * Survives server restarts, logouts, logins, page refreshes, and reboots.
- * Provides indexed Order ID lookups, multi-attribute filtering, pagination,
- * 24-hour rolling window dashboard analytics, and monthly sales calendar reporting.
+ * Provides indexed Order ID lookups, idempotency protection, multi-attribute filtering, pagination,
+ * 24-hour rolling window dashboard analytics, monthly sales calendar reporting,
+ * and transactional Admin-only Sales Data Reset with watermark & audit trail.
  */
 
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -15,7 +17,9 @@ import {
   KitchenOrder,
   MonthlyReportData,
   DailySalesData,
+  OrderType,
   PREP_TIME_LIMIT_MS,
+  ResetSalesAuditEntry,
 } from '../types/billing';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
 import {
@@ -29,13 +33,25 @@ import { billToKitchenOrder, computeOrderTimers } from '../utils/orderTimers';
 
 const PRIMARY_DATA_DIR = path.resolve(process.cwd(), 'data');
 const PRIMARY_BILLS_FILE = path.resolve(PRIMARY_DATA_DIR, 'bills.json');
+const PRIMARY_RESET_STATE_FILE = path.resolve(PRIMARY_DATA_DIR, 'reset_state.json');
+const PRIMARY_RESET_AUDIT_FILE = path.resolve(PRIMARY_DATA_DIR, 'reset_audit.json');
+
 const TMP_DATA_DIR = path.resolve(os.tmpdir(), 'annpurna-billing-data');
 const TMP_BILLS_FILE = path.resolve(TMP_DATA_DIR, 'bills.json');
+const TMP_RESET_STATE_FILE = path.resolve(TMP_DATA_DIR, 'reset_state.json');
+const TMP_RESET_AUDIT_FILE = path.resolve(TMP_DATA_DIR, 'reset_audit.json');
+
+interface PersistedResetState {
+  lastResetTimestamp: number;
+  lastResetBy?: string;
+}
 
 class BillStorage {
   private bills: Map<string, Bill> = new Map();
   private isLoaded = false;
   private sequence = 1;
+  private lastResetTimestamp = 0;
+  private resetAuditLog: ResetSalesAuditEntry[] = [];
   private activeDataDir = PRIMARY_DATA_DIR;
   private activeBillsFile = PRIMARY_BILLS_FILE;
 
@@ -46,11 +62,15 @@ class BillStorage {
   private normalizeBillRecord(b: Bill): Bill {
     const resolvedTs = resolveBillTimestampMs(b);
     const createdAt = b.orderCreatedAt || resolvedTs;
-    // Historical bills created before the 3-profile kitchen order system that have no orderStatus
-    // and are older than 2 hours default to 'COMPLETED' so old archive records don't clog the kitchen queue.
-    const defaultLegacyStatus =
-      Date.now() - createdAt > 2 * 60 * 60 * 1000 ? 'COMPLETED' : 'WAITING';
-    const currentStatus = b.orderStatus || defaultLegacyStatus;
+    const isSheetRow = Boolean(b.id && String(b.id).startsWith('SHEET-'));
+
+    // Reconstructed Google Sheets rows and legacy records without an explicit orderStatus
+    // ALWAYS default to 'COMPLETED' so they never randomly appear in the active kitchen queue.
+    // Furthermore, unstarted WAITING orders older than 4 hours (from a previous shift) auto-complete.
+    let currentStatus = isSheetRow ? 'COMPLETED' : b.orderStatus || 'COMPLETED';
+    if (currentStatus === 'WAITING' && Date.now() - createdAt > 4 * 60 * 60 * 1000) {
+      currentStatus = 'COMPLETED';
+    }
 
     let effectiveStatus = currentStatus;
     let effectiveLateAt = b.orderLateAt;
@@ -87,8 +107,67 @@ class BillStorage {
     };
   }
 
+  private loadResetMetadata() {
+    for (const stateFile of [PRIMARY_RESET_STATE_FILE, TMP_RESET_STATE_FILE]) {
+      try {
+        if (fs.existsSync(stateFile)) {
+          const raw = fs.readFileSync(stateFile, 'utf-8');
+          if (raw.trim()) {
+            const parsed = JSON.parse(raw) as PersistedResetState;
+            if (
+              parsed &&
+              typeof parsed.lastResetTimestamp === 'number' &&
+              parsed.lastResetTimestamp > this.lastResetTimestamp
+            ) {
+              this.lastResetTimestamp = parsed.lastResetTimestamp;
+            }
+          }
+        }
+      } catch {
+        // ignore read error
+      }
+    }
+
+    for (const auditFile of [PRIMARY_RESET_AUDIT_FILE, TMP_RESET_AUDIT_FILE]) {
+      try {
+        if (fs.existsSync(auditFile)) {
+          const raw = fs.readFileSync(auditFile, 'utf-8');
+          if (raw.trim()) {
+            const parsed = JSON.parse(raw) as ResetSalesAuditEntry[];
+            if (Array.isArray(parsed) && parsed.length > this.resetAuditLog.length) {
+              this.resetAuditLog = parsed;
+            }
+          }
+        }
+      } catch {
+        // ignore read error
+      }
+    }
+  }
+
+  private saveResetMetadata(state: PersistedResetState, auditLog: ResetSalesAuditEntry[]) {
+    const statePayload = JSON.stringify(state, null, 2);
+    const auditPayload = JSON.stringify(auditLog, null, 2);
+
+    try {
+      if (!fs.existsSync(PRIMARY_DATA_DIR)) {
+        fs.mkdirSync(PRIMARY_DATA_DIR, { recursive: true });
+      }
+      fs.writeFileSync(PRIMARY_RESET_STATE_FILE, statePayload, 'utf-8');
+      fs.writeFileSync(PRIMARY_RESET_AUDIT_FILE, auditPayload, 'utf-8');
+    } catch {
+      if (!fs.existsSync(TMP_DATA_DIR)) {
+        fs.mkdirSync(TMP_DATA_DIR, { recursive: true });
+      }
+      fs.writeFileSync(TMP_RESET_STATE_FILE, statePayload, 'utf-8');
+      fs.writeFileSync(TMP_RESET_AUDIT_FILE, auditPayload, 'utf-8');
+    }
+  }
+
   private init() {
     try {
+      this.loadResetMetadata();
+
       const candidateFiles: string[] = [];
       if (fs.existsSync(PRIMARY_BILLS_FILE)) {
         candidateFiles.push(PRIMARY_BILLS_FILE);
@@ -120,7 +199,15 @@ class BillStorage {
         const deduped = deduplicateBills(loadedList);
         deduped.forEach((b) => {
           const normalized = this.normalizeBillRecord(b);
-          if (normalized.customerName !== b.customerName || normalized.timestamp !== b.timestamp) {
+          if (this.lastResetTimestamp > 0 && normalized.timestamp <= this.lastResetTimestamp) {
+            needsNormalizedFlush = true;
+            return;
+          }
+          if (
+            normalized.customerName !== b.customerName ||
+            normalized.timestamp !== b.timestamp ||
+            normalized.orderStatus !== b.orderStatus
+          ) {
             needsNormalizedFlush = true;
           }
           this.bills.set(normalized.id, normalized);
@@ -143,8 +230,10 @@ class BillStorage {
     }
   }
 
-  private flushToDisk() {
-    const allBills = deduplicateBills(Array.from(this.bills.values()));
+  private flushToDisk(throwOnError: boolean = false) {
+    const allBills = deduplicateBills(Array.from(this.bills.values())).filter(
+      (b) => this.lastResetTimestamp === 0 || resolveBillTimestampMs(b) > this.lastResetTimestamp
+    );
     this.bills.clear();
     for (const b of allBills) {
       this.bills.set(b.id, b);
@@ -159,8 +248,16 @@ class BillStorage {
       const tmpFile = `${this.activeBillsFile}.${Date.now()}.tmp`;
       fs.writeFileSync(tmpFile, payload, 'utf-8');
       fs.renameSync(tmpFile, this.activeBillsFile);
+
+      // Also keep /tmp copy in sync if it exists so both paths match
+      if (this.activeBillsFile !== TMP_BILLS_FILE && fs.existsSync(TMP_BILLS_FILE)) {
+        try {
+          fs.writeFileSync(TMP_BILLS_FILE, payload, 'utf-8');
+        } catch {
+          // ignore
+        }
+      }
     } catch {
-      // Fallback to os.tmpdir() if running in a read-only serverless container (e.g. Netlify Functions)
       try {
         this.activeDataDir = TMP_DATA_DIR;
         this.activeBillsFile = TMP_BILLS_FILE;
@@ -170,8 +267,19 @@ class BillStorage {
         fs.writeFileSync(this.activeBillsFile, payload, 'utf-8');
       } catch (fallbackErr) {
         console.error('[Storage] Error persisting bills to disk:', fallbackErr);
+        if (throwOnError) {
+          throw fallbackErr;
+        }
       }
     }
+  }
+
+  public getLastResetTimestamp(): number {
+    return this.lastResetTimestamp;
+  }
+
+  public getResetAuditLog(): ResetSalesAuditEntry[] {
+    return [...this.resetAuditLog].sort((a, b) => b.timestamp - a.timestamp);
   }
 
   /**
@@ -193,11 +301,50 @@ class BillStorage {
   }
 
   /**
-   * Saves a new bill permanently (idempotent deduplication by Order ID / Bill Number / ID)
+   * Checks whether an identical bill was already created via idempotencyKey or within a 15-second
+   * duplicate submission window (protects against double taps, mobile network retries, and duplicate events).
+   */
+  public findExistingDuplicateBill(params: {
+    idempotencyKey?: string;
+    customerName: string;
+    mobileNumber: string;
+    orderType: OrderType;
+    grandTotalPaise: number;
+    itemDetailsSummary: string;
+    nowMs?: number;
+  }): Bill | null {
+    const nowMs = params.nowMs || Date.now();
+    const cleanKey = typeof params.idempotencyKey === 'string' ? params.idempotencyKey.trim() : '';
+
+    for (const b of this.bills.values()) {
+      if (cleanKey && b.idempotencyKey && b.idempotencyKey === cleanKey) {
+        return b;
+      }
+      if (
+        Math.abs(nowMs - b.timestamp) <= 15_000 &&
+        b.customerName === params.customerName &&
+        b.mobileNumber === params.mobileNumber &&
+        b.orderType === params.orderType &&
+        b.grandTotalPaise === params.grandTotalPaise &&
+        b.itemDetailsSummary === params.itemDetailsSummary
+      ) {
+        return b;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Saves a new bill permanently (idempotent deduplication by Order ID / Bill Number / ID / idempotencyKey)
    */
   public async saveBill(bill: Bill): Promise<Bill> {
     const normalized = this.normalizeBillRecord(bill);
     const existing =
+      (normalized.idempotencyKey
+        ? Array.from(this.bills.values()).find(
+            (b) => b.idempotencyKey === normalized.idempotencyKey
+          ) || null
+        : null) ||
       this.getBill(normalized.orderId) ||
       this.getBill(normalized.billNumber) ||
       this.getBill(normalized.id);
@@ -236,12 +383,10 @@ class BillStorage {
     if (!idOrOrderId) return null;
     const query = idOrOrderId.trim().toUpperCase();
 
-    // Check by internal record ID
     if (this.bills.has(idOrOrderId)) {
       return this.bills.get(idOrOrderId) || null;
     }
 
-    // Check by Order ID or Bill Number
     for (const b of this.bills.values()) {
       if (
         b.id === idOrOrderId ||
@@ -256,16 +401,18 @@ class BillStorage {
   }
 
   /**
-   * Returns all stored bills sorted newest-first without deleting or filtering any record.
+   * Returns all stored bills sorted newest-first without deleting or filtering any post-reset record.
    */
   public getAllBills(): Bill[] {
-    return deduplicateBills(Array.from(this.bills.values()));
+    return deduplicateBills(Array.from(this.bills.values())).filter(
+      (b) => this.lastResetTimestamp === 0 || resolveBillTimestampMs(b) > this.lastResetTimestamp
+    );
   }
 
   /**
-   * Merges bills fetched from Google Sheets or client persistent ledger idempotently
-   * by Order ID / Bill Number / ID so historical data is permanently preserved across
-   * logouts, logins, page refreshes, and serverless cold starts.
+   * Merges bills fetched from Google Sheets idempotently by Order ID / Bill Number / ID.
+   * Respects `lastResetTimestamp` so rows created before an Admin Sales Reset are never re-hydrated,
+   * and ensures reconstructed sheet archive rows never enter the active WAITING kitchen queue.
    */
   public mergeBillsFromSheets(remoteBills: Bill[]): number {
     if (!Array.isArray(remoteBills) || remoteBills.length === 0) return 0;
@@ -273,13 +420,26 @@ class BillStorage {
 
     for (const remote of remoteBills) {
       if (!remote || (!remote.orderId && !remote.billNumber && !remote.id)) continue;
+
+      const resolvedRemoteTs = resolveBillTimestampMs(remote);
+      if (this.lastResetTimestamp > 0 && resolvedRemoteTs <= this.lastResetTimestamp) {
+        // Skip historical records that predate the latest Admin Sales Reset watermark
+        continue;
+      }
+
       const existing =
         this.getBill(remote.orderId) ||
         this.getBill(remote.billNumber) ||
         this.getBill(remote.id);
 
       if (!existing) {
-        const normalized = this.normalizeBillRecord(remote);
+        const normalized = this.normalizeBillRecord({
+          ...remote,
+          // Reconstructed sheet archive rows are always COMPLETED
+          orderStatus: remote.id?.startsWith('SHEET-')
+            ? 'COMPLETED'
+            : remote.orderStatus || 'COMPLETED',
+        });
         this.bills.set(normalized.id, normalized);
         addedOrUpdatedCount++;
       } else {
@@ -287,7 +447,6 @@ class BillStorage {
         const existingSynced = Boolean(
           existing.savedToSheets || existing.sheetsSyncStatus === 'synced'
         );
-        const resolvedRemoteTs = resolveBillTimestampMs(remote);
         const resolvedExistingTs = resolveBillTimestampMs(existing);
 
         if (remoteSynced && !existingSynced) {
@@ -307,7 +466,6 @@ class BillStorage {
           remote.id &&
           !remote.id.startsWith('SHEET-')
         ) {
-          // Upgrade a sheet-reconstructed record with the full client/server record that has exact millisecond timestamp
           this.bills.delete(existing.id);
           const merged = this.normalizeBillRecord({
             ...existing,
@@ -319,6 +477,7 @@ class BillStorage {
               existingSynced || remoteSynced
                 ? 'synced'
                 : remote.sheetsSyncStatus || existing.sheetsSyncStatus,
+            orderStatus: remote.orderStatus || existing.orderStatus || 'COMPLETED',
           });
           this.bills.set(merged.id, merged);
           addedOrUpdatedCount++;
@@ -335,10 +494,195 @@ class BillStorage {
   }
 
   /**
-   * Alias for merging client-persisted bills on login/refresh or serverless warm-up.
+   * Merges client-persisted bills on login/refresh or offline Capacitor sync.
+   * Strict protections against random/stale orders:
+   * 1. Ignores any client bill older than `lastResetTimestamp`.
+   * 2. Never downgrades an existing server bill's `orderStatus` (e.g., never overwrites COMPLETED with WAITING).
+   * 3. Only allows a net-new client bill to enter the kitchen queue as WAITING if it was created within the last 10 minutes;
+   *    older offline client bills are merged with `orderStatus: 'COMPLETED'`.
    */
   public mergeClientBills(clientBills: Bill[]): number {
-    return this.mergeBillsFromSheets(clientBills);
+    if (!Array.isArray(clientBills) || clientBills.length === 0) return 0;
+    let addedOrUpdatedCount = 0;
+    const nowMs = Date.now();
+
+    const statusRank: Record<string, number> = {
+      WAITING: 1,
+      PREPARING: 2,
+      LATE: 3,
+      COMPLETED: 4,
+    };
+
+    for (const clientBill of clientBills) {
+      if (!clientBill || (!clientBill.orderId && !clientBill.billNumber && !clientBill.id)) {
+        continue;
+      }
+
+      const resolvedClientTs = resolveBillTimestampMs(clientBill);
+      if (this.lastResetTimestamp > 0 && resolvedClientTs <= this.lastResetTimestamp) {
+        continue;
+      }
+
+      const existing =
+        (clientBill.idempotencyKey
+          ? Array.from(this.bills.values()).find(
+              (b) => b.idempotencyKey === clientBill.idempotencyKey
+            ) || null
+          : null) ||
+        this.getBill(clientBill.orderId) ||
+        this.getBill(clientBill.billNumber) ||
+        this.getBill(clientBill.id);
+
+      if (!existing) {
+        // Only allow a brand-new offline client bill to enter the kitchen queue as WAITING if it was
+        // explicitly created within the last 10 minutes. Stale browser cache bills default to COMPLETED.
+        const isFreshOfflineOrder =
+          (clientBill.orderStatus === 'WAITING' || clientBill.orderStatus === 'PREPARING') &&
+          nowMs - resolvedClientTs <= 10 * 60 * 1000;
+
+        const safeOrderStatus = isFreshOfflineOrder
+          ? clientBill.orderStatus
+          : 'COMPLETED';
+
+        const normalized = this.normalizeBillRecord({
+          ...clientBill,
+          orderStatus: safeOrderStatus,
+        });
+        this.bills.set(normalized.id, normalized);
+        addedOrUpdatedCount++;
+      } else {
+        const existingRank = statusRank[existing.orderStatus || 'COMPLETED'] || 4;
+        const clientRank = statusRank[clientBill.orderStatus || 'WAITING'] || 1;
+        const clientSynced = Boolean(
+          clientBill.savedToSheets || clientBill.sheetsSyncStatus === 'synced'
+        );
+        const existingSynced = Boolean(
+          existing.savedToSheets || existing.sheetsSyncStatus === 'synced'
+        );
+
+        if ((clientSynced && !existingSynced) || clientRank > existingRank) {
+          const updated = this.normalizeBillRecord({
+            ...existing,
+            savedToSheets: existingSynced || clientSynced,
+            sheetsSyncStatus:
+              existingSynced || clientSynced
+                ? 'synced'
+                : existing.sheetsSyncStatus || clientBill.sheetsSyncStatus,
+            orderStatus:
+              clientRank > existingRank ? clientBill.orderStatus : existing.orderStatus,
+            orderStartedAt: existing.orderStartedAt || clientBill.orderStartedAt,
+            orderLateAt: existing.orderLateAt || clientBill.orderLateAt,
+            orderCompletedAt: existing.orderCompletedAt || clientBill.orderCompletedAt,
+            startedBy: existing.startedBy || clientBill.startedBy,
+            completedBy: existing.completedBy || clientBill.completedBy,
+          });
+          this.bills.set(existing.id, updated);
+          addedOrUpdatedCount++;
+        }
+      }
+    }
+
+    if (addedOrUpdatedCount > 0) {
+      this.sequence = Math.max(this.sequence, this.bills.size + 1);
+      this.flushToDisk();
+    }
+
+    return addedOrUpdatedCount;
+  }
+
+  /**
+   * Returns any kitchen orders that are currently actively being prepared (`PREPARING` or `LATE`).
+   * Used to guard `RESET SALES DATA` from interrupting active kitchen preparation.
+   */
+  public getActivePreparingOrders(nowMs: number = Date.now()): KitchenOrder[] {
+    const allOrders = this.getKitchenOrders(nowMs);
+    return allOrders.filter((o) => o.status === 'PREPARING' || o.status === 'LATE');
+  }
+
+  /**
+   * Transactional Admin-Only Sales Data Reset.
+   * - Clears all historical bills, sales totals, revenue calculations, monthly calendar entries, and completed/waiting orders.
+   * - Updates `lastResetTimestamp` watermark so neither browser localStorage nor old Google Sheets rows can resurrect deleted records.
+   * - Records an immutable audit entry in `data/reset_audit.json` (without storing any password).
+   * - Rolls back in-memory state if disk persistence fails.
+   */
+  public async resetAllSalesData(
+    adminUsername: string,
+    nowMs: number = Date.now()
+  ): Promise<{
+    auditEntry: ResetSalesAuditEntry;
+    lastResetTimestamp: number;
+  }> {
+    // 1. Snapshot current state for transactional rollback on failure
+    const backupBills = new Map(this.bills);
+    const backupSequence = this.sequence;
+    const backupResetTimestamp = this.lastResetTimestamp;
+    const backupAuditLog = [...this.resetAuditLog];
+
+    const currentBills = this.getAllBills();
+    const deletedBillsCount = currentBills.length;
+    const deletedRevenuePaise = currentBills.reduce((sum, b) => {
+      const paise =
+        typeof b.grandTotalPaise === 'number' && !isNaN(b.grandTotalPaise)
+          ? b.grandTotalPaise
+          : Math.round((Number(b.grandTotalRupees) || 0) * 100);
+      return sum + paise;
+    }, 0);
+    const deletedRevenueRupees = Math.round(deletedRevenuePaise) / 100;
+
+    const dateTimeKolkata = `${new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(new Date(nowMs))} IST`;
+
+    const auditEntry: ResetSalesAuditEntry = {
+      resetId: `RST-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+      timestamp: nowMs,
+      dateTimeKolkata,
+      adminUsername,
+      deletedBillsCount,
+      deletedRevenueRupees,
+    };
+
+    try {
+      this.bills.clear();
+      this.sequence = 1;
+      this.lastResetTimestamp = nowMs;
+      this.resetAuditLog.push(auditEntry);
+
+      this.flushToDisk(true);
+      this.saveResetMetadata(
+        {
+          lastResetTimestamp: nowMs,
+          lastResetBy: adminUsername,
+        },
+        this.resetAuditLog
+      );
+
+      console.log(
+        `[Admin Reset] Sales data reset by ${adminUsername} at ${dateTimeKolkata} (${deletedBillsCount} bills cleared)`
+      );
+
+      return {
+        auditEntry,
+        lastResetTimestamp: nowMs,
+      };
+    } catch (err) {
+      // Rollback in-memory state if disk write failed
+      this.bills = backupBills;
+      this.sequence = backupSequence;
+      this.lastResetTimestamp = backupResetTimestamp;
+      this.resetAuditLog = backupAuditLog;
+      throw new Error(
+        `Database reset failed and was safely rolled back: ${(err as any)?.message || 'Disk write error'}`
+      );
+    }
   }
 
   /**
@@ -362,7 +706,6 @@ class BillStorage {
   } {
     let list = this.getAllBills();
 
-    // 1. Search query (matches Order ID, Bill Number, Customer Name, Mobile Number)
     if (options.search && options.search.trim()) {
       const q = options.search.trim().toLowerCase();
       list = list.filter(
@@ -375,22 +718,18 @@ class BillStorage {
       );
     }
 
-    // 2. Order Type filter
     if (options.orderType && options.orderType !== 'all') {
       list = list.filter((b) => b.orderType === options.orderType);
     }
 
-    // 3. Payment Method filter
     if (options.paymentMethod && options.paymentMethod !== 'all') {
       list = list.filter((b) => b.paymentMethod === options.paymentMethod);
     }
 
-    // 4. Sync Status filter
     if (options.syncStatus && options.syncStatus !== 'all') {
       list = list.filter((b) => b.sheetsSyncStatus === options.syncStatus);
     }
 
-    // 5. Date filter (Asia/Kolkata timezone & 24-hour rolling support)
     if (options.dateFilter && options.dateFilter !== 'all') {
       const nowMs = Date.now();
       const todayStr = getKolkataDateString(nowMs);
@@ -403,7 +742,7 @@ class BillStorage {
         const yestStr = getKolkataDateString(nowMs - 24 * 60 * 60 * 1000);
         list = list.filter((b) => getKolkataDateString(resolveBillTimestampMs(b)) === yestStr);
       } else if (options.dateFilter === 'this_month') {
-        const currentMonth = todayStr.slice(0, 7); // YYYY-MM
+        const currentMonth = todayStr.slice(0, 7);
         list = list.filter((b) =>
           getKolkataDateString(resolveBillTimestampMs(b)).startsWith(currentMonth)
         );
@@ -414,7 +753,6 @@ class BillStorage {
       }
     }
 
-    // Sort newest first using authoritative timestamp
     list.sort((a, b) => resolveBillTimestampMs(b) - resolveBillTimestampMs(a));
 
     const total = list.length;
@@ -435,9 +773,6 @@ class BillStorage {
 
   /**
    * Computes authoritative Business Metrics for Dashboard.
-   * Uses a strict 24-hour rolling window [nowMs - 24h, nowMs] based on actual transaction timestamps
-   * for `todaySalesRupees` and `todayBillsCount`.
-   * Historical records older than 24 hours are NEVER deleted and remain in total/monthly/calendar views.
    */
   public getMetrics(_userId?: string, nowMs: number = Date.now()): BusinessMetrics {
     const list = this.getAllBills();
@@ -446,7 +781,7 @@ class BillStorage {
 
   /**
    * Generates comprehensive monthly sales report for any specified Year and Month (1-12)
-   * Asia/Kolkata authoritative timezone. Historical data is permanently preserved.
+   * Asia/Kolkata authoritative timezone.
    */
   public getMonthlyReport(year: number, month: number, _userId?: string): MonthlyReportData {
     const list = this.getAllBills();
@@ -461,7 +796,6 @@ class BillStorage {
       year: 'numeric',
     }).format(monthLabelDate);
 
-    // Filter bills belonging to this specific month in IST
     const monthBills = list.filter((b) => {
       const bDateStr = getKolkataDateString(resolveBillTimestampMs(b));
       return bDateStr.startsWith(monthPrefix);
@@ -573,7 +907,7 @@ class BillStorage {
       this.flushToDisk();
     }
 
-    return Array.from(this.bills.values())
+    return this.getAllBills()
       .map((b) => billToKitchenOrder(b, nowMs))
       .sort((a, b) => b.createdAt - a.createdAt);
   }

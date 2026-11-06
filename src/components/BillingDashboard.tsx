@@ -27,6 +27,7 @@ import {
   ChefHat,
   KeyRound,
   MessageSquarePlus,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   Bill,
@@ -35,6 +36,7 @@ import {
   PaymentMethod,
   OFFICIAL_MENU_ITEMS,
   BusinessMetrics,
+  ResetSalesAuditEntry,
   UserRole,
 } from '../types/billing';
 import { googleSignIn } from '../services/firebaseAuth';
@@ -45,6 +47,7 @@ import { BillDetailsModal } from './BillDetailsModal';
 import { CopyMobileButton } from './CopyMobileButton';
 import { OrderDashboard } from './OrderDashboard';
 import { LiveOrderStatusPanel } from './LiveOrderStatusPanel';
+import { ResetSalesModal } from './ResetSalesModal';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
 import { computeBusinessMetricsFromBills } from '../utils/billTimestamp';
 import {
@@ -188,6 +191,10 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [isChangingPwd, setIsChangingPwd] = useState(false);
   const [pwdFeedback, setPwdFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  // Admin Reset Sales Data Modal State & Reset Epoch (forces immediate child view refresh after reset)
+  const [isResetSalesModalOpen, setIsResetSalesModalOpen] = useState(false);
+  const [resetEpoch, setResetEpoch] = useState(0);
+
   const isSheetsConnected = Boolean(googleToken || serverSheetsStatus?.configured);
 
   // Calendar Bill Inspection Modal
@@ -209,6 +216,11 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   });
 
   const [coldDrinkMRP, setColdDrinkMRP] = useState<string>('40');
+
+  // Stable Idempotency Key per bill draft (prevents duplicate bills/orders on double tap or network retry)
+  const [draftIdempotencyKey, setDraftIdempotencyKey] = useState<string>(
+    () => `IDEMP-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  );
 
   // Submission & Saving States
   const [isSaving, setIsSaving] = useState(false);
@@ -328,6 +340,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
     setItemsError(null);
     setDiscountError(null);
     setSaveErrorMessage(null);
+    setDraftIdempotencyKey(`IDEMP-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   }, []);
 
   // Immediate Client-Side Calculations in Integer Paise
@@ -721,6 +734,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         paymentMethod,
         paymentStatus: 'Paid',
         specialInstructions: specialInstructions.trim() || undefined,
+        idempotencyKey: draftIdempotencyKey,
         userId: googleUser?.email || adminUsername,
         googleAccessToken: isAdmin ? googleToken || undefined : undefined,
         customSpreadsheetId: isAdmin ? customSpreadsheetId.trim() || undefined : undefined,
@@ -1030,7 +1044,16 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                 className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 font-semibold rounded-md transition text-xs cursor-pointer flex items-center gap-1"
               >
                 <Settings2 className="w-3.5 h-3.5 text-slate-500" />
-                <span>{showSheetSettings ? 'Hide Settings' : 'Server, Sheets & Passwords'}</span>
+                <span>{showSheetSettings ? 'Hide Settings' : 'Settings & Passwords'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsResetSalesModalOpen(true)}
+                className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-md shadow-xs transition text-xs cursor-pointer flex items-center gap-1.5"
+                title="Reset Sales Data (Admin Dual Verification)"
+              >
+                <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                <span>RESET SALES DATA</span>
               </button>
             </div>
           </div>
@@ -1155,6 +1178,27 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
               )}
             </form>
 
+            {/* Admin-Only Reset Sales Data Danger Zone */}
+            <div className="pt-3 border-t border-rose-200/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-rose-50/60 p-3 rounded-lg border">
+              <div className="space-y-0.5">
+                <h4 className="font-extrabold text-rose-950 flex items-center gap-1.5 text-xs">
+                  <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>Danger Zone: Reset Sales Data (Admin Only)</span>
+                </h4>
+                <p className="text-[11px] text-rose-800">
+                  Permanently clears all historical bills, 24h &amp; monthly sales totals, revenue analytics, sales calendar entries, and completed kitchen orders back to ₹0.00. Preserves menu items, user accounts, and Google Sheets config.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsResetSalesModalOpen(true)}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-black rounded-lg text-xs transition cursor-pointer flex items-center gap-1.5 shrink-0 shadow-xs"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                <span>RESET SALES DATA</span>
+              </button>
+            </div>
+
             {batchSyncFeedback && (
               <div className="p-2.5 rounded-md bg-blue-50 border border-blue-200 text-xs font-semibold text-blue-800">
                 {batchSyncFeedback}
@@ -1249,6 +1293,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         {/* View Switch: New Bill Terminal vs Bill History vs Kitchen Orders / Status vs Monthly Calendar */}
         {isAdmin && activeTab === 'calendar' ? (
           <MonthlySalesCalendar
+            key={`cal-${resetEpoch}`}
             adminToken={adminToken}
             onSelectBill={(b) => setCalendarSelectedBill(b)}
             onShareWhatsApp={onShareWhatsApp}
@@ -1257,6 +1302,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         ) : activeTab === 'orders' ? (
           isAdmin ? (
             <OrderDashboard
+              key={`ord-admin-${resetEpoch}`}
               token={adminToken}
               username={adminUsername}
               userRole="admin"
@@ -1266,6 +1312,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             />
           ) : (
             <LiveOrderStatusPanel
+              key={`ord-billing-${resetEpoch}`}
               token={adminToken}
               userRole="billing"
               onLogout={onLogout}
@@ -1274,6 +1321,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           )
         ) : activeTab === 'history' ? (
           <BillHistoryView
+            key={`hist-${resetEpoch}`}
             adminToken={adminToken}
             googleToken={isAdmin ? googleToken : null}
             userRole={userRole}
@@ -1834,6 +1882,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
             {/* Live Order Status Strip right below New Bill so Billing & Admin can monitor active kitchen orders immediately */}
             <LiveOrderStatusPanel
+              key={`live-strip-${resetEpoch}`}
               token={adminToken}
               userRole={userRole}
               onLogout={onLogout}
@@ -1850,6 +1899,25 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
             onShareWhatsApp={onShareWhatsApp}
             onPreviewPdf={onPreviewPdf ? () => onPreviewPdf(calendarSelectedBill) : undefined}
             userRole={userRole}
+          />
+        )}
+
+        {/* Admin-Only Reset Sales Data Dual Verification Modal */}
+        {isAdmin && (
+          <ResetSalesModal
+            isOpen={isResetSalesModalOpen}
+            adminToken={adminToken}
+            currentMetrics={metrics}
+            onClose={() => setIsResetSalesModalOpen(false)}
+            onResetSuccess={(newMetrics: BusinessMetrics, auditEntry: ResetSalesAuditEntry) => {
+              setMetrics(newMetrics);
+              setResetEpoch((prev) => prev + 1);
+              if (onShowToast) {
+                onShowToast(
+                  `Sales data reset complete (${auditEntry.deletedBillsCount} bills cleared to ₹0.00).`
+                );
+              }
+            }}
           />
         )}
       </main>

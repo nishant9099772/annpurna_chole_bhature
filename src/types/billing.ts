@@ -136,6 +136,7 @@ export interface Bill {
   specialInstructions?: string;
   startedBy?: string;
   completedBy?: string;
+  idempotencyKey?: string;
 }
 
 /**
@@ -187,9 +188,19 @@ export interface CreateBillRequest {
   paymentMethod?: PaymentMethod;
   paymentStatus?: 'Paid' | 'Pending';
   specialInstructions?: string;
+  idempotencyKey?: string;
   userId?: string;
   googleAccessToken?: string;
   customSpreadsheetId?: string;
+}
+
+export interface ResetSalesAuditEntry {
+  resetId: string;
+  timestamp: number;
+  dateTimeKolkata: string;
+  adminUsername: string;
+  deletedBillsCount: number;
+  deletedRevenueRupees: number;
 }
 
 export interface AuthUser {

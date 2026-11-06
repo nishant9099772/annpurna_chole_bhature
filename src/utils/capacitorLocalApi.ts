@@ -17,6 +17,7 @@ import {
   OrderType,
   PaymentMethod,
   PREP_TIME_LIMIT_MS,
+  ResetSalesAuditEntry,
   UserRole,
   OFFICIAL_MENU_ITEMS,
 } from '../types/billing';
@@ -29,6 +30,8 @@ import {
 import { billToKitchenOrder } from './orderTimers';
 import {
   buildMonthlyReportFromBills,
+  clearAllPersistentBills,
+  getLocalLastResetTimestamp,
   loadPersistentBills,
   savePersistentBills,
   upsertPersistentBill,
@@ -59,8 +62,34 @@ const DEFAULT_ROLE_SCRYPT_HASHES: Record<UserRole, readonly string[]> = {
 };
 
 const LOCAL_CREDENTIALS_STORAGE_KEY = 'annpurna_local_role_hashes_v1';
+const LOCAL_RESET_AUDIT_STORAGE_KEY = 'annpurna_local_reset_audit_v1';
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const revokedLocalTokens = new Set<string>();
+
+function loadLocalResetAuditLog(): ResetSalesAuditEntry[] {
+  if (typeof window === 'undefined' || !window.localStorage) return [];
+  try {
+    const raw = window.localStorage.getItem(LOCAL_RESET_AUDIT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendLocalResetAuditEntry(entry: ResetSalesAuditEntry): ResetSalesAuditEntry[] {
+  const current = loadLocalResetAuditLog();
+  const next = [entry, ...current];
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.setItem(LOCAL_RESET_AUDIT_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // ignore storage errors
+    }
+  }
+  return next;
+}
 
 const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, number> = {
   CHOLE_BHATURE: 8000, // Rs 80.00
@@ -577,6 +606,7 @@ export async function handleCapacitorLocalApiRequest(
   if (pathname === '/api/auth/login' && method === 'POST') {
     const rawUsername = bodyData?.username ?? bodyData?.userId ?? '';
     const rawPassword = bodyData?.password ?? '';
+    const expectedProfileRole = bodyData?.expectedRole as UserRole | undefined;
 
     if (
       !rawUsername ||
@@ -588,18 +618,38 @@ export async function handleCapacitorLocalApiRequest(
     }
 
     const userCheck = isAuthorizedUserId(rawUsername);
-    const passwordValid = userCheck.authorized
-      ? await verifyPasswordForRoleScrypt(userCheck.role, rawPassword)
-      : false;
+    if (!userCheck.authorized) {
+      return jsonResponse(401, {
+        error: 'Invalid User ID or Password. Access denied.',
+      });
+    }
 
-    if (userCheck.authorized && passwordValid) {
+    if (
+      expectedProfileRole &&
+      ['admin', 'billing', 'order'].includes(expectedProfileRole) &&
+      userCheck.role !== expectedProfileRole
+    ) {
+      const targetLabel =
+        expectedProfileRole === 'admin'
+          ? 'Annapurna Admin'
+          : expectedProfileRole === 'billing'
+          ? 'Annapurna Billing'
+          : 'Annapurna Order';
+      return jsonResponse(401, {
+        error: `User ID "${rawUsername.trim()}" belongs to ${userCheck.profileLabel}, not ${targetLabel}. Please switch to the ${userCheck.profileLabel} tab.`,
+      });
+    }
+
+    const passwordValid = await verifyPasswordForRoleScrypt(userCheck.role, rawPassword);
+
+    if (passwordValid) {
       const { token, expiresAt } = await createLocalSignedToken(
         userCheck.canonicalUser,
         userCheck.role
       );
       return jsonResponse(200, {
         success: true,
-        message: 'Authentication successful',
+        message: `Authenticated as ${userCheck.profileLabel}`,
         token,
         username: userCheck.canonicalUser,
         role: userCheck.role,
@@ -904,9 +954,41 @@ export async function handleCapacitorLocalApiRequest(
     const grandTotalRupees = grandTotalPaise / 100;
 
     const existingBills = loadPersistentBills();
-    const seq = existingBills.length + 1;
     const now = new Date();
     const nowMs = now.getTime();
+    const itemDetailsSummary = computedItems.map((i) => `${i.name} (${i.quantity})`).join(', ');
+    const itemPricesSummary = computedItems.map((i) => `${i.name}: Rs ${i.unitPriceRupees}`).join(', ');
+    const cleanedIdempotencyKey =
+      typeof bodyData?.idempotencyKey === 'string' && bodyData.idempotencyKey.trim()
+        ? bodyData.idempotencyKey.trim().slice(0, 128)
+        : undefined;
+
+    // Idempotency & 15-second duplicate submission guard
+    const existingDuplicate = existingBills.find((b) => {
+      if (cleanedIdempotencyKey && b.idempotencyKey && b.idempotencyKey === cleanedIdempotencyKey) {
+        return true;
+      }
+      return (
+        Math.abs(nowMs - b.timestamp) <= 15_000 &&
+        b.customerName === customerName &&
+        b.mobileNumber === cleanMobile &&
+        b.orderType === orderType &&
+        b.grandTotalPaise === grandTotalPaise &&
+        b.itemDetailsSummary === itemDetailsSummary
+      );
+    });
+
+    if (existingDuplicate) {
+      return jsonResponse(200, {
+        success: true,
+        duplicatePrevented: true,
+        ...existingDuplicate,
+        bill: existingDuplicate,
+        order: billToKitchenOrder(existingDuplicate, nowMs),
+      });
+    }
+
+    const seq = existingBills.length + 1;
     const orderId = generateUniqueOrderId(seq);
     const billNumber = `ACB-${String(seq).padStart(4, '0')}`;
     const paymentMethod: PaymentMethod =
@@ -942,8 +1024,8 @@ export async function handleCapacitorLocalApiRequest(
       countryCode,
       items: computedItems,
       itemCount: computedItems.reduce((sum, i) => sum + i.quantity, 0),
-      itemDetailsSummary: computedItems.map((i) => `${i.name} (${i.quantity})`).join(', '),
-      itemPricesSummary: computedItems.map((i) => `${i.name}: Rs ${i.unitPriceRupees}`).join(', '),
+      itemDetailsSummary,
+      itemPricesSummary,
       subtotalPaise,
       subtotalRupees: subtotalPaise / 100,
       discountPercent,
@@ -967,13 +1049,109 @@ export async function handleCapacitorLocalApiRequest(
       orderStatus: 'WAITING',
       orderCreatedAt: nowMs,
       specialInstructions,
+      idempotencyKey: cleanedIdempotencyKey,
     };
 
     upsertPersistentBill(newBill);
 
-    return jsonResponse(201, {
+    return jsonResponse(200, {
+      success: true,
       ...newBill,
       bill: newBill,
+      order: billToKitchenOrder(newBill, nowMs),
+    });
+  }
+
+  // 10B. Admin-Only Reset Sales Data (POST /api/admin/reset-sales)
+  if (pathname === '/api/admin/reset-sales' && method === 'POST') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, {
+        error: `Forbidden: The ${
+          session.role === 'billing' ? 'Annapurna Billing' : 'Annapurna Order'
+        } profile is not authorized to reset sales data.`,
+      });
+    }
+
+    const adminPassword = bodyData?.adminPassword;
+    const confirmationPhrase = bodyData?.confirmationPhrase;
+
+    if (typeof adminPassword !== 'string' || !adminPassword.trim()) {
+      return jsonResponse(400, {
+        error: 'Admin password is required to authorize sales data reset.',
+      });
+    }
+
+    const adminVerified = await verifyPasswordForRoleScrypt('admin', adminPassword);
+    if (!adminVerified) {
+      return jsonResponse(401, {
+        error: 'Invalid Admin password. Sales data reset denied.',
+      });
+    }
+
+    const cleanedPhrase =
+      typeof confirmationPhrase === 'string' ? confirmationPhrase.trim() : '';
+    if (cleanedPhrase !== 'RESET ALL SALES DATA') {
+      return jsonResponse(400, {
+        error: 'Please type the exact confirmation phrase: RESET ALL SALES DATA',
+      });
+    }
+
+    const allOrders = buildLocalKitchenOrders();
+    const activePreparing = allOrders.filter(
+      (o) => o.status === 'PREPARING' || o.status === 'LATE'
+    );
+    if (activePreparing.length > 0) {
+      const activeNums = activePreparing.map((o) => o.orderNumber).join(', ');
+      return jsonResponse(409, {
+        error: `Cannot reset sales data while ${activePreparing.length} kitchen order(s) (${activeNums}) are actively being prepared. Please mark active kitchen orders as Completed first.`,
+        activeOrdersCount: activePreparing.length,
+        activeOrderNumbers: activePreparing.map((o) => o.orderNumber),
+      });
+    }
+
+    const currentBills = loadPersistentBills();
+    const deletedBillsCount = currentBills.length;
+    const deletedRevenuePaise = currentBills.reduce((sum, b) => {
+      const paise =
+        typeof b.grandTotalPaise === 'number' && !isNaN(b.grandTotalPaise)
+          ? b.grandTotalPaise
+          : Math.round((Number(b.grandTotalRupees) || 0) * 100);
+      return sum + paise;
+    }, 0);
+    const deletedRevenueRupees = Math.round(deletedRevenuePaise) / 100;
+    const nowMs = Date.now();
+    const dateTimeKolkata = `${formatKolkataDateTime(new Date(nowMs))} IST`;
+
+    const auditEntry: ResetSalesAuditEntry = {
+      resetId: `RST-${Math.random().toString(36).slice(2, 10).toUpperCase()}`,
+      timestamp: nowMs,
+      dateTimeKolkata,
+      adminUsername: session.sub || 'annapurna_admin',
+      deletedBillsCount,
+      deletedRevenueRupees,
+    };
+
+    clearAllPersistentBills(nowMs);
+    appendLocalResetAuditEntry(auditEntry);
+
+    return jsonResponse(200, {
+      success: true,
+      message: `All sales data, bill history, and completed orders (${deletedBillsCount} records) have been reset to ₹0.00.`,
+      auditEntry,
+      lastResetTimestamp: nowMs,
+      metrics: computeBusinessMetricsFromBills([], nowMs),
+    });
+  }
+
+  // 10C. Admin-Only Reset Audit Log (GET /api/admin/reset-audit)
+  if (pathname === '/api/admin/reset-audit' && method === 'GET') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, { error: 'Forbidden: Admin access required.' });
+    }
+    return jsonResponse(200, {
+      success: true,
+      lastResetTimestamp: getLocalLastResetTimestamp(),
+      auditLog: loadLocalResetAuditLog(),
     });
   }
 
