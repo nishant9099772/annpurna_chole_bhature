@@ -1,1 +1,51 @@
-[]
+[
+  {
+    "id": "BILL-7b388458-eb0b-42e8-b6d1-06bd71db1390",
+    "orderId": "ORD-20261107-1644",
+    "billNumber": "ACB-20261107-0001",
+    "orderType": "DINE_IN",
+    "orderTypeLabel": "Dine In",
+    "customerName": "Verification Test Ji",
+    "countryCode": "+91",
+    "mobileNumber": "9876543210",
+    "items": [
+      {
+        "id": "ea0c0905-f01f-4e8a-bc5d-fcdff2b4c6a5",
+        "itemKey": "CHOLE_BHATURE",
+        "name": "Chole Bhature",
+        "quantity": 2,
+        "unitPricePaise": 8000,
+        "unitPriceRupees": 80,
+        "lineTotalPaise": 16000,
+        "lineTotalRupees": 160
+      }
+    ],
+    "itemCount": 2,
+    "itemDetailsSummary": "Chole Bhature (2)",
+    "itemPricesSummary": "Chole Bhature: Rs 80",
+    "subtotalPaise": 16000,
+    "subtotalRupees": 160,
+    "discountPercent": 0,
+    "discountAmountPaise": 0,
+    "discountAmountRupees": 0,
+    "discountPaise": 0,
+    "discountRupees": 0,
+    "grandTotalPaise": 16000,
+    "grandTotalRupees": 160,
+    "paymentMethod": "Cash",
+    "paymentStatus": "Paid",
+    "billDate": "07/11/2026",
+    "billTime": "01:05 am",
+    "dateTimeKolkata": "07 Nov 2026, 01:05:14 am IST",
+    "timestamp": 1793993714926,
+    "userId": "annapurna_billing",
+    "savedToSheets": false,
+    "sheetsSyncStatus": "failed",
+    "orderStatus": "WAITING",
+    "orderCreatedAt": 1793993714926,
+    "idempotencyKey": "TEST-SYNC-1793993714899",
+    "sheetsSyncError": "Service Account: Service Account OAuth token exchange failed (HTTP 400): {\"error\":\"invalid_grant\",\"error_description\":\"Invalid grant: account not found\"}",
+    "spreadsheetId": "1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ",
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ/edit"
+  }
+]

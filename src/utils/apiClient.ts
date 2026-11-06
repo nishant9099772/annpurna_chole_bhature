@@ -31,8 +31,8 @@ import { UserRole } from '../types/billing';
 export const API_BASE_URL_STORAGE_KEY = 'annpurna_api_base_url';
 export const DEFAULT_PRODUCTION_API_BASE_URL = 'https://annpurnacholebhature.netlify.app';
 
-const STANDARD_API_TIMEOUT_MS = 12_000;
-const SHEETS_SYNC_TIMEOUT_MS = 20_000;
+const STANDARD_API_TIMEOUT_MS = 20_000;
+const SHEETS_SYNC_TIMEOUT_MS = 28_000;
 
 /**
  * Decodes a signed `acb.<payloadB64>.<sigB64>` session token on the client to inspect
@@ -58,7 +58,8 @@ export function normalizeApiBaseUrl(raw?: string | null): string {
     cleaned === 'undefined' ||
     cleaned === 'null' ||
     cleaned === 'http://localhost' ||
-    cleaned === 'https://localhost'
+    cleaned === 'https://localhost' ||
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(cleaned)
   ) {
     return '';
   }
@@ -75,31 +76,17 @@ export function normalizeApiBaseUrl(raw?: string | null): string {
   return cleaned.replace(/\/+$/, '');
 }
 
+const RAW_VITE_API_BASE_URL: string =
+  typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE_URL
+    ? String(import.meta.env.VITE_API_BASE_URL)
+    : DEFAULT_PRODUCTION_API_BASE_URL;
+
 /**
  * Authoritative production API base URL resolved directly from `import.meta.env.VITE_API_BASE_URL`
  * (`.env.production`: `VITE_API_BASE_URL=https://annpurnacholebhature.netlify.app`).
  */
 export const API_BASE_URL: string =
-  normalizeApiBaseUrl(import.meta.env?.VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
-
-/**
- * Detects whether the browser is running on the local Express development/preview server
- * (e.g. `localhost:3000` or `*.run.app`), as opposed to Capacitor Android or Netlify production.
- * Checked BEFORE `isCapacitorOrAndroidWebView()` so Android phones opening `*.run.app` or `localhost:3000`
- * always use the same-origin Express backend.
- */
-function isLocalExpressDevOrPreviewHost(): boolean {
-  if (typeof window === 'undefined') return false;
-  const hostname = (window.location?.hostname || '').toLowerCase();
-  const port = window.location?.port || '';
-  if ((hostname === 'localhost' || hostname === '127.0.0.1') && port !== '') {
-    return true;
-  }
-  if (hostname.endsWith('.run.app')) {
-    return true;
-  }
-  return false;
-}
+  normalizeApiBaseUrl(RAW_VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
 
 /**
  * Detects whether the app is running inside a Capacitor native container or Android APK WebView.
@@ -148,22 +135,28 @@ export function isCapacitorOrAndroidWebView(): boolean {
 }
 
 /**
- * Returns the active production Netlify API base URL (`import.meta.env.VITE_API_BASE_URL` or custom override).
+ * Returns the active production Netlify API base URL (`import.meta.env.VITE_API_BASE_URL` or custom HTTPS override).
  */
 export function getConfiguredApiBaseUrl(): string {
-  const envBaseUrl = normalizeApiBaseUrl(import.meta.env?.VITE_API_BASE_URL);
+  const envBaseUrl = normalizeApiBaseUrl(RAW_VITE_API_BASE_URL) || DEFAULT_PRODUCTION_API_BASE_URL;
 
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
-      const saved = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_URL_STORAGE_KEY));
-      if (saved) return saved;
+      const rawSaved = window.localStorage.getItem(API_BASE_URL_STORAGE_KEY);
+      if (rawSaved) {
+        const saved = normalizeApiBaseUrl(rawSaved);
+        if (saved && /^https:\/\//i.test(saved)) {
+          return saved;
+        }
+        // Clean up any stale or non-HTTPS override so Android always uses VITE_API_BASE_URL
+        window.localStorage.removeItem(API_BASE_URL_STORAGE_KEY);
+      }
     } catch {
       // ignore storage errors
     }
   }
 
-  if (envBaseUrl) return envBaseUrl;
-  return API_BASE_URL;
+  return envBaseUrl || API_BASE_URL;
 }
 
 /**
@@ -192,26 +185,14 @@ export function setConfiguredApiBaseUrl(url: string): string {
 }
 
 /**
- * Resolves any `/api/...` endpoint to the full backend URL.
- * - On Netlify & Android Capacitor APK: Always uses `import.meta.env.VITE_API_BASE_URL` (`https://annpurnacholebhature.netlify.app`).
- * - On local Express dev/preview (`localhost:3000` / `*.run.app`): Uses `window.location.origin` unless a custom URL override is saved.
+ * Resolves any `/api/...` endpoint to the full production backend URL (`https://annpurnacholebhature.netlify.app/api/...`).
+ * Ensures Desktop, Netlify Website, AI Studio Preview, and Android Capacitor APK all connect to the exact same backend.
  */
 export function resolveApiUrl(pathOrUrl: string): string {
   if (!pathOrUrl || typeof pathOrUrl !== 'string') return pathOrUrl;
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
 
   const cleanPath = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
-
-  if (isLocalExpressDevOrPreviewHost()) {
-    const customOverride =
-      typeof window !== 'undefined' && window.localStorage
-        ? normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_URL_STORAGE_KEY))
-        : '';
-    if (!customOverride && typeof window !== 'undefined' && window.location?.origin) {
-      return `${window.location.origin}${cleanPath}`;
-    }
-  }
-
   const baseUrl = getConfiguredApiBaseUrl() || API_BASE_URL;
   return `${baseUrl}${cleanPath}`;
 }
@@ -450,27 +431,48 @@ export function installCapacitorApiFetchInterceptor(): void {
       (apiPathWithQuery.startsWith('/api/bills') && (init?.method || 'GET').toUpperCase() === 'POST');
 
     const timeoutMs = isSheetsHeavyRoute ? SHEETS_SYNC_TIMEOUT_MS : STANDARD_API_TIMEOUT_MS;
-    const controller = new AbortController();
-    const callerSignal = init?.signal;
-    const onCallerAbort = () => controller.abort();
-    if (callerSignal) {
-      if (callerSignal.aborted) {
-        controller.abort();
-      } else {
-        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
-      }
-    }
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    const updatedInit: RequestInit = {
-      ...init,
-      headers: mergedHeaders,
-      signal: controller.signal,
-      ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
+    const executeRemoteFetch = async (attemptTimeoutMs: number): Promise<Response> => {
+      const controller = new AbortController();
+      const callerSignal = init?.signal;
+      const onCallerAbort = () => controller.abort();
+      if (callerSignal) {
+        if (callerSignal.aborted) {
+          controller.abort();
+        } else {
+          callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+        }
+      }
+      const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+      try {
+        return await originalFetch(resolvedUrl, {
+          ...init,
+          headers: mergedHeaders,
+          signal: controller.signal,
+          ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
+        });
+      } finally {
+        clearTimeout(timeoutId);
+        if (callerSignal) {
+          callerSignal.removeEventListener('abort', onCallerAbort);
+        }
+      }
     };
 
     try {
-      const response = await originalFetch(resolvedUrl, updatedInit);
+      let response: Response;
+      try {
+        response = await executeRemoteFetch(timeoutMs);
+      } catch (firstErr: any) {
+        // If caller explicitly aborted, do not retry
+        if (init?.signal?.aborted) {
+          throw firstErr;
+        }
+        // Automatic 1x retry after 500ms for transient mobile radio / cold-start hiccups
+        await new Promise((r) => setTimeout(r, 500));
+        response = await executeRemoteFetch(timeoutMs);
+      }
+
       const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
 
       if (contentType.includes('application/pdf')) {
@@ -483,70 +485,30 @@ export function installCapacitorApiFetchInterceptor(): void {
           .text()
           .catch(() => '');
         if (isHtmlPayload(clonedText)) {
-          if (
-            configuredBaseUrl &&
-            (apiPathWithQuery.includes('/retry-sheets') ||
-              apiPathWithQuery.includes('/batch-sync-sheets'))
-          ) {
-            return new Response(
-              JSON.stringify({
-                success: false,
-                error: `Backend URL (${configuredBaseUrl}) returned an HTML page instead of the Netlify API. Verify your Netlify deployment.`,
-              }),
-              { status: 502, headers: { 'Content-Type': 'application/json' } }
-            );
-          }
-          return handleCapacitorLocalApiRequest(apiPathWithQuery, {
-            ...init,
-            headers: mergedHeaders,
-          });
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: `Backend URL (${configuredBaseUrl}) returned an unexpected HTML page instead of JSON API response.`,
+            }),
+            { status: 502, headers: { 'Content-Type': 'application/json' } }
+          );
         }
       }
 
-      const localInit: RequestInit = {
-        ...init,
-        headers: mergedHeaders,
-      };
-
-      // 1. Fall back to local Capacitor API engine on 404 for /api/orders, /api/admin/reset-sales, /api/admin/reset-audit, /api/auth/change-password
+      // Only fall back to local handler if a newly added route returns 404 on an un-updated remote server
       if (
         response.status === 404 &&
-        (apiPathWithQuery.startsWith('/api/orders') ||
-          apiPathWithQuery.startsWith('/api/admin/reset-sales') ||
-          apiPathWithQuery.startsWith('/api/admin/reset-audit') ||
+        (apiPathWithQuery.startsWith('/api/admin/reset-audit') ||
           apiPathWithQuery.startsWith('/api/auth/change-password'))
       ) {
-        return handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
+        return handleCapacitorLocalApiRequest(apiPathWithQuery, {
+          ...init,
+          headers: mergedHeaders,
+        });
       }
 
-      // 2. If /api/auth/login returns 401 on a remote server that hasn't been redeployed with the new 3-profile credentials yet,
-      // check whether the credentials are valid in the local 3-profile scrypt authenticator
-      if (
-        (inCapacitor || isCrossOrigin) &&
-        response.status === 401 &&
-        apiPathWithQuery.startsWith('/api/auth/login')
-      ) {
-        const localLoginRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
-        if (localLoginRes.status === 200) {
-          return localLoginRes;
-        }
-      }
-
-      // 3. If a protected endpoint returns 401 when using a valid signed 3-profile token,
-      // verify against the local Capacitor API engine so valid Admin/Billing/Order sessions are never kicked out
-      if (
-        response.status === 401 &&
-        !apiPathWithQuery.startsWith('/api/auth/login') &&
-        !apiPathWithQuery.startsWith('/api/admin/reset-sales') &&
-        !apiPathWithQuery.startsWith('/api/auth/change-password') &&
-        mergedHeaders.has('Authorization')
-      ) {
-        const localFallbackRes = await handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
-        if (localFallbackRes.status !== 401) {
-          return localFallbackRes;
-        }
-      }
-
+      // Return the authoritative production backend response directly (including 200, 401, 403, etc.)
+      // Never swallow 401s into Local Database Mode so Android and Desktop always share real server sessions and data.
       return response;
     } catch (networkErr: any) {
       const isTimeout = networkErr?.name === 'AbortError';
@@ -586,16 +548,22 @@ export function installCapacitorApiFetchInterceptor(): void {
         );
       }
 
-      // For offline or transient mobile network resilience, fall back to local persistent engine
-      if (inCapacitor || mergedHeaders.has('Authorization') || apiPathWithQuery.startsWith('/api/auth/login')) {
+      // Only use local offline fallback if the device is genuinely offline (airplane mode / no internet)
+      const isBrowserOffline =
+        typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (isBrowserOffline && (inCapacitor || mergedHeaders.has('Authorization'))) {
         return handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
       }
-      throw networkErr;
-    } finally {
-      clearTimeout(timeoutId);
-      if (callerSignal) {
-        callerSignal.removeEventListener('abort', onCallerAbort);
-      }
+
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: isTimeout
+            ? `Request to ${configuredBaseUrl} timed out. Please check your internet connection.`
+            : `Cannot reach server (${configuredBaseUrl}): ${networkErr?.message || 'Network connection failed'}.`,
+        }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } }
+      );
     }
   };
 }

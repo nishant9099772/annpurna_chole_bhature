@@ -29,7 +29,7 @@ function getLocalServerPort(): Promise<number> {
 export async function handler(event: any) {
   const reqOrigin = event?.headers?.origin || event?.headers?.Origin || '*';
   const corsHeaders: Record<string, string> = {
-    'Access-Control-Allow-Origin': reqOrigin,
+    'Access-Control-Allow-Origin': reqOrigin || '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers':
       'Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin',
@@ -107,13 +107,18 @@ export async function handler(event: any) {
       body: body as any,
     });
 
-    // Exclude hop-by-hop headers that break HTTP/2 mobile clients (Android OkHttp / WebView)
     const blockedResponseHeaders = new Set([
       'transfer-encoding',
       'connection',
       'keep-alive',
       'content-length',
       'content-encoding',
+      'access-control-allow-origin',
+      'access-control-allow-methods',
+      'access-control-allow-headers',
+      'access-control-expose-headers',
+      'access-control-allow-credentials',
+      'content-type',
     ]);
 
     const resHeaders: Record<string, string> = {

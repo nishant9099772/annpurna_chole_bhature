@@ -449,9 +449,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
       'Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin'
     );
     res.setHeader('Access-Control-Expose-Headers', 'Content-Type');
-    if (reqOrigin) {
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-    }
     if (req.method === 'OPTIONS') {
       res.setHeader('Content-Length', '0');
       res.status(200).end();
@@ -771,6 +768,32 @@ app.get('/api/sheets/status', requireAdminOnly, async (req: Request, res: Respon
   const whatsappCloudConfigured = Boolean(
     process.env.WHATSAPP_ACCESS_TOKEN?.trim() && process.env.WHATSAPP_PHONE_NUMBER_ID?.trim()
   );
+
+  if (!status.configured && !process.env.NETLIFY && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    try {
+      const authHeader = req.headers.authorization || '';
+      const prodUrl = `https://annpurnacholebhature.netlify.app/api/sheets/status${
+        customSheetId ? `?sheetId=${encodeURIComponent(customSheetId)}` : ''
+      }`;
+      const prodRes = await fetch(prodUrl, {
+        headers: {
+          ...(authHeader ? { Authorization: authHeader } : {}),
+          ...(clientToken ? { 'x-google-token': clientToken } : {}),
+          Accept: 'application/json',
+        },
+      });
+      if (prodRes.ok) {
+        const prodData = await prodRes.json();
+        if (prodData && prodData.configured) {
+          res.json(prodData);
+          return;
+        }
+      }
+    } catch {
+      // Fall back to local status
+    }
+  }
+
   res.json({
     ...status,
     whatsappCloudConfigured,

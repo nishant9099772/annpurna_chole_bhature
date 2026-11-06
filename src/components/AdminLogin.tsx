@@ -146,7 +146,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     setIsLoading(true);
 
     try {
-      const response = await apiFetch('/api/auth/login', {
+      let response = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -158,6 +158,21 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           expectedRole: selectedProfile,
         }),
       });
+
+      if (response.status === 401 && trimmedUser.toLowerCase() !== canonicalForSelected) {
+        response = await apiFetch('/api/auth/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            username: canonicalForSelected,
+            password,
+            expectedRole: selectedProfile,
+          }),
+        });
+      }
 
       const { ok, status, data } = await parseApiJsonResponse<{
         success?: boolean;

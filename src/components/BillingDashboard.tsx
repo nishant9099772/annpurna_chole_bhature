@@ -225,6 +225,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   // Submission & Saving States
   const [isSaving, setIsSaving] = useState(false);
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
+  const [isBackendOnline, setIsBackendOnline] = useState<boolean>(true);
 
   // Fetch & Bidirectionally Hydrate Business Metrics & Server Google Sheets Status
   const refreshMetrics = useCallback(
@@ -234,6 +235,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
       try {
         if (!isAdmin) {
           await hydrateAndSyncBillsWithServer(currentToken, null, undefined, forceHydrate);
+          setIsBackendOnline(true);
           return;
         }
 
@@ -268,6 +270,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
         }
 
         if (statusRes.ok) {
+          setIsBackendOnline(true);
           const { data: statusData } = await parseApiJsonResponse(statusRes);
           if (statusData) {
             setServerSheetsStatus(statusData);
@@ -278,6 +281,7 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
           onLogout();
           return;
         }
+        setIsBackendOnline(false);
         if (isAdmin) {
           setMetrics(computeBusinessMetricsFromBills(loadPersistentBills(), Date.now()));
         }
@@ -917,6 +921,26 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
 
           {/* Right Header Controls */}
           <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+            <div
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] sm:text-xs font-bold border ${
+                isBackendOnline
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  : 'bg-rose-50 border-rose-200 text-rose-700'
+              }`}
+              title={
+                isBackendOnline
+                  ? `Connected to live production backend (${getConfiguredApiBaseUrl()})`
+                  : 'Reconnecting to production backend...'
+              }
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isBackendOnline ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                }`}
+              />
+              <span>{isBackendOnline ? 'LIVE ONLINE' : 'RECONNECTING'}</span>
+            </div>
+
             <LiveIstClock />
 
             {/* Google Sheets Connection Status (Admin Only) */}
