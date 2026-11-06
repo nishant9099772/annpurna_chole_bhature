@@ -1,11 +1,12 @@
 /**
- * Annpurna Chole Bhature - Main Application Entry
- * Full-stack orchestrator managing mandatory server-verified login, billing dashboard,
+ * Annapurna Chole Bhature - Main Application Entry
+ * Full-stack orchestrator managing 3-Profile RBAC authentication (Admin, Billing, Order),
+ * automatic 24-hour session expiration, synchronized live kitchen orders,
  * Google Sheets workspace token, PDF receipt viewer, and 3D Thali showcase.
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import { User as FirebaseUser } from 'firebase/auth';
-import { Bill } from './types/billing';
+import { Bill, UserRole } from './types/billing';
 import { initAuth } from './services/firebaseAuth';
 import {
   generateBillPdfBytes,
@@ -21,16 +22,18 @@ import {
 import { apiFetch, parseApiJsonResponse } from './utils/apiClient';
 import { AdminLogin } from './components/AdminLogin';
 import { BillingDashboard } from './components/BillingDashboard';
+import { OrderDashboard } from './components/OrderDashboard';
 import { BillSuccessModal } from './components/BillSuccessModal';
 import { PdfPreviewModal } from './components/PdfPreviewModal';
 import { RecentBillsDrawer } from './components/RecentBillsDrawer';
 import { ThaliCanvas3D } from './components/ThaliCanvas3D';
 
+const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Hours
+
 export default function App() {
-  // Admin Authentication State — strictly verified against backend /api/auth/me
+  // Authentication State — strictly verified against backend /api/auth/me
   const [adminToken, setAdminToken] = useState<string | null>(() => {
     const stored = localStorage.getItem('annpurna_admin_token');
-    // Reject legacy hardcoded bypass tokens
     if (!stored || !stored.startsWith('acb.')) {
       localStorage.removeItem('annpurna_admin_token');
       return null;
@@ -38,15 +41,26 @@ export default function App() {
     return stored;
   });
   const [adminUsername, setAdminUsername] = useState<string>(() => {
-    return localStorage.getItem('annpurna_admin_user') || 'admin';
+    return localStorage.getItem('annpurna_admin_user') || 'annapurna_admin';
   });
+  const [userRole, setUserRole] = useState<UserRole>(() => {
+    const storedRole = localStorage.getItem('annpurna_user_role');
+    if (storedRole === 'billing' || storedRole === 'order') return storedRole;
+    return 'admin';
+  });
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(() => {
+    const rawExp = localStorage.getItem('annpurna_session_expires_at');
+    const parsed = rawExp ? Number(rawExp) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  });
+
   const [isSessionVerified, setIsSessionVerified] = useState<boolean>(false);
   const [isCheckingSession, setIsCheckingSession] = useState<boolean>(() => {
     const stored = localStorage.getItem('annpurna_admin_token');
     return Boolean(stored && stored.startsWith('acb.'));
   });
 
-  // Google Workspace Auth State (for Google Sheets sync)
+  // Google Workspace Auth State (for Google Sheets sync — Admin only)
   const [googleUser, setGoogleUser] = useState<FirebaseUser | null>(null);
   const [googleToken, setGoogleToken] = useState<string | null>(null);
 
@@ -82,6 +96,40 @@ export default function App() {
     return () => window.removeEventListener('annpurna:toast', handleToastEvent);
   }, []);
 
+  // Handle Logout — ONLY clears authentication session token; NEVER deletes sales/bill/order records
+  const handleAdminLogout = useCallback(() => {
+    if (adminToken) {
+      apiFetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      }).catch(() => {});
+    }
+    localStorage.removeItem('annpurna_admin_token');
+    localStorage.removeItem('annpurna_admin_user');
+    localStorage.removeItem('annpurna_user_role');
+    localStorage.removeItem('annpurna_session_expires_at');
+    setAdminToken(null);
+    setSessionExpiresAt(null);
+    setIsSessionVerified(false);
+    setActiveCompletedBill(null);
+  }, [adminToken]);
+
+  // Automatic 24-Hour Session Expiration Watcher
+  useEffect(() => {
+    if (!adminToken || !sessionExpiresAt) return;
+
+    const checkExpiry = () => {
+      if (Date.now() >= sessionExpiresAt) {
+        handleAdminLogout();
+        setToastNotification('Your 24-hour session has expired. Please log in again.');
+      }
+    };
+
+    checkExpiry();
+    const timer = setInterval(checkExpiry, 1000);
+    return () => clearInterval(timer);
+  }, [adminToken, sessionExpiresAt, handleAdminLogout]);
+
   // Verify existing session token with server on mount and token changes
   useEffect(() => {
     if (!adminToken) {
@@ -114,6 +162,14 @@ export default function App() {
             setAdminUsername(data.username);
             localStorage.setItem('annpurna_admin_user', data.username);
           }
+          const resolvedRole: UserRole =
+            data.role === 'billing' || data.role === 'order' ? data.role : 'admin';
+          setUserRole(resolvedRole);
+          localStorage.setItem('annpurna_user_role', resolvedRole);
+          if (typeof data.expiresAt === 'number' && data.expiresAt > 0) {
+            setSessionExpiresAt(data.expiresAt);
+            localStorage.setItem('annpurna_session_expires_at', String(data.expiresAt));
+          }
         } else {
           throw new Error('Not authenticated');
         }
@@ -122,7 +178,10 @@ export default function App() {
         if (cancelled) return;
         localStorage.removeItem('annpurna_admin_token');
         localStorage.removeItem('annpurna_admin_user');
+        localStorage.removeItem('annpurna_user_role');
+        localStorage.removeItem('annpurna_session_expires_at');
         setAdminToken(null);
+        setSessionExpiresAt(null);
         setIsSessionVerified(false);
       })
       .finally(() => {
@@ -153,26 +212,12 @@ export default function App() {
     };
   }, []);
 
-  // Handle Admin Logout — ONLY clears authentication session token; NEVER deletes sales/bill records
-  const handleAdminLogout = useCallback(() => {
-    if (adminToken) {
-      apiFetch('/api/auth/logout', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${adminToken}` },
-      }).catch(() => {});
-    }
-    localStorage.removeItem('annpurna_admin_token');
-    localStorage.removeItem('annpurna_admin_user');
-    setAdminToken(null);
-    setIsSessionVerified(false);
-    setActiveCompletedBill(null);
-  }, [adminToken]);
-
-  // Bidirectionally hydrate & fetch persistent bills from backend after session is verified
+  // Bidirectionally hydrate & fetch persistent bills from backend after session is verified (Admin & Billing only)
   useEffect(() => {
     if (!adminToken || !isSessionVerified) return;
+    if (userRole === 'order') return;
 
-    hydrateAndSyncBillsWithServer(adminToken, googleToken)
+    hydrateAndSyncBillsWithServer(adminToken, userRole === 'admin' ? googleToken : null)
       .then(({ bills }) => {
         setShiftBills(bills);
       })
@@ -183,13 +228,28 @@ export default function App() {
         }
         console.log('Could not hydrate prior bills:', err);
       });
-  }, [adminToken, isSessionVerified, googleToken, handleAdminLogout]);
+  }, [adminToken, isSessionVerified, userRole, googleToken, handleAdminLogout]);
 
-  // Handle Admin Login Success
-  const handleAdminLoginSuccess = (token: string, username: string) => {
+  // Handle Login Success (3-Profile Aware)
+  const handleAdminLoginSuccess = (
+    token: string,
+    username: string,
+    role: UserRole,
+    expiresAt?: number
+  ) => {
+    const effectiveExpiresAt =
+      typeof expiresAt === 'number' && expiresAt > Date.now()
+        ? expiresAt
+        : Date.now() + SESSION_DURATION_MS;
+
     localStorage.setItem('annpurna_admin_token', token);
     localStorage.setItem('annpurna_admin_user', username);
+    localStorage.setItem('annpurna_user_role', role);
+    localStorage.setItem('annpurna_session_expires_at', String(effectiveExpiresAt));
+
     setAdminUsername(username);
+    setUserRole(role);
+    setSessionExpiresAt(effectiveExpiresAt);
     setAdminToken(token);
     setIsSessionVerified(true);
     setIsCheckingSession(false);
@@ -247,8 +307,9 @@ export default function App() {
     setPreviewPdfUrl(null);
   };
 
-  // Retry Sync Handler (supports Server Service Account, Apps Script, or Client OAuth Token)
+  // Retry Sync Handler (Admin Only)
   const handleRetrySync = async (bill: Bill) => {
+    if (userRole !== 'admin') return;
     setIsRetryingSync(true);
     try {
       const customSheetId = localStorage.getItem('annpurna_custom_sheet_id') || undefined;
@@ -413,20 +474,54 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
     return <AdminLogin onLoginSuccess={handleAdminLoginSuccess} />;
   }
 
+  // Profile 3: Annapurna Order — Dedicated Kitchen / Worker Dashboard Only (Zero Billing or Financial Data)
+  if (userRole === 'order') {
+    return (
+      <div className="min-h-screen bg-slate-100 select-text">
+        <OrderDashboard
+          token={adminToken}
+          username={adminUsername}
+          userRole="order"
+          onLogout={handleAdminLogout}
+          sessionExpiresAt={sessionExpiresAt}
+          onShowToast={(msg) => setToastNotification(msg)}
+        />
+
+        {toastNotification && (
+          <div className="fixed bottom-5 left-3 right-3 sm:left-auto sm:right-5 z-[60] max-w-md bg-slate-900 text-white text-xs sm:text-sm font-semibold px-3.5 py-2.5 rounded-lg shadow-2xl border border-slate-700/60 flex items-center justify-between gap-3">
+            <span className="break-words">{toastNotification}</span>
+            <button
+              onClick={() => setToastNotification(null)}
+              className="text-slate-400 hover:text-white p-1 rounded-md cursor-pointer shrink-0"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Profile 1 (Annapurna Admin) & Profile 2 (Annapurna Billing)
   return (
     <div className="min-h-screen bg-slate-50 select-text">
-      {/* Primary Billing Workspace */}
       <BillingDashboard
         adminUsername={adminUsername}
         adminToken={adminToken}
+        userRole={userRole}
+        sessionExpiresAt={sessionExpiresAt}
         onLogout={handleAdminLogout}
         onBillCompleted={handleBillCompleted}
-        onOpen3DModal={() => setIs3DModalOpen(true)}
-        googleUser={googleUser}
-        googleToken={googleToken}
+        onOpen3DModal={() => {
+          if (userRole === 'admin') setIs3DModalOpen(true);
+        }}
+        googleUser={userRole === 'admin' ? googleUser : null}
+        googleToken={userRole === 'admin' ? googleToken : null}
         onGoogleAuthChange={(u, t) => {
-          setGoogleUser(u);
-          setGoogleToken(t);
+          if (userRole === 'admin') {
+            setGoogleUser(u);
+            setGoogleToken(t);
+          }
         }}
         onShareWhatsApp={handleQuickWhatsAppShare}
         onPreviewPdf={handleOpenPdfPreview}
@@ -439,9 +534,10 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
           bill={activeCompletedBill}
           onNewBill={() => setActiveCompletedBill(null)}
           onPreviewPdf={() => handleOpenPdfPreview(activeCompletedBill)}
-          onRetrySync={handleRetrySync}
+          onRetrySync={userRole === 'admin' ? handleRetrySync : undefined}
           isRetryingSync={isRetryingSync}
           adminToken={adminToken}
+          userRole={userRole}
         />
       )}
 
@@ -464,8 +560,8 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
         onShareWhatsApp={handleQuickWhatsAppShare}
       />
 
-      {/* 3D Thali Full-Screen Interactive Inspection Modal */}
-      {is3DModalOpen && (
+      {/* 3D Thali Full-Screen Interactive Inspection Modal (Admin Only) */}
+      {userRole === 'admin' && is3DModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/70 backdrop-blur-xs">
           <div className="w-full max-w-4xl">
             <ThaliCanvas3D isModal onClose={() => setIs3DModalOpen(false)} />

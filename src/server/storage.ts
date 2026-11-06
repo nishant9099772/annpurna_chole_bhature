@@ -9,7 +9,14 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { Bill, BusinessMetrics, MonthlyReportData, DailySalesData } from '../types/billing';
+import {
+  Bill,
+  BusinessMetrics,
+  KitchenOrder,
+  MonthlyReportData,
+  DailySalesData,
+  PREP_TIME_LIMIT_MS,
+} from '../types/billing';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
 import {
   computeBusinessMetricsFromBills,
@@ -18,6 +25,7 @@ import {
   isWithinRolling24Hours,
   resolveBillTimestampMs,
 } from '../utils/billTimestamp';
+import { billToKitchenOrder, computeOrderTimers } from '../utils/orderTimers';
 
 const PRIMARY_DATA_DIR = path.resolve(process.cwd(), 'data');
 const PRIMARY_BILLS_FILE = path.resolve(PRIMARY_DATA_DIR, 'bills.json');
@@ -37,10 +45,45 @@ class BillStorage {
 
   private normalizeBillRecord(b: Bill): Bill {
     const resolvedTs = resolveBillTimestampMs(b);
+    const createdAt = b.orderCreatedAt || resolvedTs;
+    // Historical bills created before the 3-profile kitchen order system that have no orderStatus
+    // and are older than 2 hours default to 'COMPLETED' so old archive records don't clog the kitchen queue.
+    const defaultLegacyStatus =
+      Date.now() - createdAt > 2 * 60 * 60 * 1000 ? 'COMPLETED' : 'WAITING';
+    const currentStatus = b.orderStatus || defaultLegacyStatus;
+
+    let effectiveStatus = currentStatus;
+    let effectiveLateAt = b.orderLateAt;
+    if (
+      (currentStatus === 'PREPARING' || currentStatus === 'LATE') &&
+      b.orderStartedAt &&
+      !b.orderCompletedAt
+    ) {
+      const timer = computeOrderTimers(
+        {
+          status: currentStatus,
+          createdAt,
+          startedAt: b.orderStartedAt,
+          lateAt: b.orderLateAt,
+          completedAt: b.orderCompletedAt,
+        },
+        Date.now()
+      );
+      effectiveStatus = timer.effectiveStatus;
+      if (timer.lateAtTimestamp && !effectiveLateAt) {
+        effectiveLateAt = timer.lateAtTimestamp;
+      }
+    }
+
     return {
       ...b,
       customerName: formatCustomerNameWithJi(b.customerName || 'Customer'),
       timestamp: resolvedTs,
+      orderCreatedAt: createdAt,
+      orderStatus: effectiveStatus,
+      orderLateAt: effectiveLateAt,
+      orderCompletedAt:
+        effectiveStatus === 'COMPLETED' && !b.orderCompletedAt ? createdAt : b.orderCompletedAt,
     };
   }
 
@@ -497,6 +540,130 @@ class BillStorage {
       averageBillValueRupees,
       bestSalesDay: bestDayObj,
       dailyData,
+    };
+  }
+
+  /**
+   * Evaluates and returns all KitchenOrder records (zero financial data).
+   * Automatically persists the transition from PREPARING -> LATE once 3 minutes (180,000 ms) have elapsed.
+   */
+  public getKitchenOrders(nowMs: number = Date.now()): KitchenOrder[] {
+    let dirty = false;
+    const allBills = this.getAllBills();
+
+    for (const bill of allBills) {
+      if (
+        bill.orderStatus === 'PREPARING' &&
+        bill.orderStartedAt &&
+        !bill.orderCompletedAt &&
+        nowMs - bill.orderStartedAt >= PREP_TIME_LIMIT_MS
+      ) {
+        const lateAt = bill.orderLateAt || bill.orderStartedAt + PREP_TIME_LIMIT_MS;
+        const updated: Bill = {
+          ...bill,
+          orderStatus: 'LATE',
+          orderLateAt: lateAt,
+        };
+        this.bills.set(bill.id, updated);
+        dirty = true;
+      }
+    }
+
+    if (dirty) {
+      this.flushToDisk();
+    }
+
+    return Array.from(this.bills.values())
+      .map((b) => billToKitchenOrder(b, nowMs))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * Starts preparing a kitchen order (`WAITING` -> `PREPARING`), recording the exact start timestamp.
+   * Idempotent: prevents accidental duplicate starts if already started or completed.
+   */
+  public async startKitchenOrder(
+    idOrOrderId: string,
+    actorUsername: string,
+    nowMs: number = Date.now()
+  ): Promise<{ order: KitchenOrder; bill: Bill; alreadyStarted: boolean } | null> {
+    const existing = this.getBill(idOrOrderId);
+    if (!existing) return null;
+
+    if (
+      existing.orderStatus === 'PREPARING' ||
+      existing.orderStatus === 'LATE' ||
+      existing.orderStatus === 'COMPLETED' ||
+      (existing.orderStartedAt && existing.orderStartedAt > 0)
+    ) {
+      return {
+        order: billToKitchenOrder(existing, nowMs),
+        bill: existing,
+        alreadyStarted: true,
+      };
+    }
+
+    const updated: Bill = {
+      ...existing,
+      orderStatus: 'PREPARING',
+      orderCreatedAt: existing.orderCreatedAt || existing.timestamp || nowMs,
+      orderStartedAt: nowMs,
+      startedBy: actorUsername,
+    };
+
+    this.bills.set(existing.id, updated);
+    this.flushToDisk();
+
+    return {
+      order: billToKitchenOrder(updated, nowMs),
+      bill: updated,
+      alreadyStarted: false,
+    };
+  }
+
+  /**
+   * Completes a kitchen order (`PREPARING`/`LATE`/`WAITING` -> `COMPLETED`), stopping all timers
+   * and recording the exact completion timestamp.
+   */
+  public async completeKitchenOrder(
+    idOrOrderId: string,
+    actorUsername: string,
+    nowMs: number = Date.now()
+  ): Promise<{ order: KitchenOrder; bill: Bill; alreadyCompleted: boolean } | null> {
+    const existing = this.getBill(idOrOrderId);
+    if (!existing) return null;
+
+    if (existing.orderStatus === 'COMPLETED' && existing.orderCompletedAt) {
+      return {
+        order: billToKitchenOrder(existing, nowMs),
+        bill: existing,
+        alreadyCompleted: true,
+      };
+    }
+
+    const startedAt = existing.orderStartedAt || nowMs;
+    const elapsedMs = Math.max(0, nowMs - startedAt);
+    const wasLate = elapsedMs >= PREP_TIME_LIMIT_MS;
+
+    const updated: Bill = {
+      ...existing,
+      orderStatus: 'COMPLETED',
+      orderCreatedAt: existing.orderCreatedAt || existing.timestamp || nowMs,
+      orderStartedAt: startedAt,
+      orderLateAt: wasLate
+        ? existing.orderLateAt || startedAt + PREP_TIME_LIMIT_MS
+        : existing.orderLateAt,
+      orderCompletedAt: nowMs,
+      completedBy: actorUsername,
+    };
+
+    this.bills.set(existing.id, updated);
+    this.flushToDisk();
+
+    return {
+      order: billToKitchenOrder(updated, nowMs),
+      bill: updated,
+      alreadyCompleted: false,
     };
   }
 }

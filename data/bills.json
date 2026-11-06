@@ -1,5 +1,120 @@
 [
   {
+    "id": "BILL-a1ddbef3-6d1b-47ef-911b-a9ed22b75ea8",
+    "orderId": "ORD-20261106-3650",
+    "billNumber": "ACB-20261106-0007",
+    "orderType": "PACK",
+    "orderTypeLabel": "Pack",
+    "customerName": "Priya Verma Ji",
+    "countryCode": "+91",
+    "mobileNumber": "9876543211",
+    "items": [
+      {
+        "id": "0accb262-476a-4318-b26c-ef6e5f74d535",
+        "itemKey": "CHOLE_BHATURE",
+        "name": "Chole Bhature",
+        "quantity": 3,
+        "unitPricePaise": 8000,
+        "unitPriceRupees": 80,
+        "lineTotalPaise": 24000,
+        "lineTotalRupees": 240
+      }
+    ],
+    "itemCount": 3,
+    "itemDetailsSummary": "Chole Bhature (3)",
+    "itemPricesSummary": "Chole Bhature: Rs 80",
+    "subtotalPaise": 24000,
+    "subtotalRupees": 240,
+    "discountPercent": 5,
+    "discountAmountPaise": 1200,
+    "discountAmountRupees": 12,
+    "discountPaise": 1200,
+    "discountRupees": 12,
+    "grandTotalPaise": 22800,
+    "grandTotalRupees": 228,
+    "paymentMethod": "Cash",
+    "paymentStatus": "Paid",
+    "billDate": "06/11/2026",
+    "billTime": "10:26 pm",
+    "dateTimeKolkata": "06 Nov 2026, 10:26:09 pm IST",
+    "timestamp": 1793984169921,
+    "userId": "annapurna_billing",
+    "savedToSheets": false,
+    "sheetsSyncStatus": "failed",
+    "orderStatus": "COMPLETED",
+    "orderCreatedAt": 1793984169921,
+    "sheetsSyncError": "Service Account: Service Account OAuth token exchange failed (HTTP 400): {\"error\":\"invalid_grant\",\"error_description\":\"Invalid grant: account not found\"}",
+    "spreadsheetId": "1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ",
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ/edit",
+    "orderCompletedAt": 1793984169964,
+    "orderStartedAt": 1793984169960,
+    "startedBy": "annapurna_admin",
+    "completedBy": "annapurna_admin"
+  },
+  {
+    "id": "BILL-0546321e-05ed-488b-aaf0-7829469e9da2",
+    "orderId": "ORD-20261106-9009",
+    "billNumber": "ACB-20261106-0006",
+    "orderType": "DINE_IN",
+    "orderTypeLabel": "Dine In",
+    "customerName": "Aarav Sharma Ji",
+    "countryCode": "+91",
+    "mobileNumber": "9876543210",
+    "items": [
+      {
+        "id": "b70cd851-5e22-473f-8cac-0c20ffb9f84f",
+        "itemKey": "CHOLE_BHATURE",
+        "name": "Chole Bhature",
+        "quantity": 2,
+        "unitPricePaise": 8000,
+        "unitPriceRupees": 80,
+        "lineTotalPaise": 16000,
+        "lineTotalRupees": 160
+      },
+      {
+        "id": "5e3fade6-17aa-499f-b4f9-16ec76d39ac6",
+        "itemKey": "LASSI",
+        "name": "Lassi",
+        "quantity": 2,
+        "unitPricePaise": 4000,
+        "unitPriceRupees": 40,
+        "lineTotalPaise": 8000,
+        "lineTotalRupees": 80
+      }
+    ],
+    "itemCount": 4,
+    "itemDetailsSummary": "Chole Bhature (2), Lassi (2)",
+    "itemPricesSummary": "Chole Bhature: Rs 80, Lassi: Rs 40",
+    "subtotalPaise": 24000,
+    "subtotalRupees": 240,
+    "discountPercent": 0,
+    "discountAmountPaise": 0,
+    "discountAmountRupees": 0,
+    "discountPaise": 0,
+    "discountRupees": 0,
+    "grandTotalPaise": 24000,
+    "grandTotalRupees": 240,
+    "paymentMethod": "UPI",
+    "paymentStatus": "Paid",
+    "billDate": "06/11/2026",
+    "billTime": "10:26 pm",
+    "dateTimeKolkata": "06 Nov 2026, 10:26:09 pm IST",
+    "timestamp": 1793984169861,
+    "userId": "annapurna_billing",
+    "savedToSheets": false,
+    "sheetsSyncStatus": "failed",
+    "orderStatus": "COMPLETED",
+    "orderCreatedAt": 1793984169861,
+    "specialInstructions": "Extra onions and green chili",
+    "sheetsSyncError": "Service Account: Service Account OAuth token exchange failed (HTTP 400): {\"error\":\"invalid_grant\",\"error_description\":\"Invalid grant: account not found\"}",
+    "spreadsheetId": "1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ",
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ/edit",
+    "orderCompletedAt": 1793984169956,
+    "orderStartedAt": 1793984169951,
+    "startedBy": "annapurna_order",
+    "completedBy": "annapurna_order"
+  },
+  {
     "id": "BILL-b947a902-6b21-4edb-8294-7eb5de9e8bc0",
     "orderId": "ORD-20261101-1948",
     "billNumber": "ACB-20261101-0005",
@@ -41,7 +156,10 @@
     "userId": "admin",
     "savedToSheets": false,
     "sheetsSyncStatus": "failed",
-    "sheetsSyncError": "Google Sheets not connected (Access token missing)"
+    "sheetsSyncError": "Google Sheets not connected (Access token missing)",
+    "orderCreatedAt": 1793553716158,
+    "orderStatus": "COMPLETED",
+    "orderCompletedAt": 1793553716158
   },
   {
     "id": "BILL-f67d6eed-3d0d-406f-9315-325d36338d64",
@@ -79,7 +197,10 @@
     "userId": "annpurna_chole_bhature",
     "savedToSheets": false,
     "sheetsSyncStatus": "failed",
-    "sheetsSyncError": "Google Sheets not connected (Access token missing)"
+    "sheetsSyncError": "Google Sheets not connected (Access token missing)",
+    "orderCreatedAt": 1793553666071,
+    "orderStatus": "COMPLETED",
+    "orderCompletedAt": 1793553666071
   },
   {
     "id": "BILL-89c218a2-40ee-46c4-8768-8cd35acfeb26",
@@ -117,7 +238,10 @@
     "userId": "annpurna_chole_bhature",
     "savedToSheets": false,
     "sheetsSyncStatus": "failed",
-    "sheetsSyncError": "Google Sheets not connected (Access token missing)"
+    "sheetsSyncError": "Google Sheets not connected (Access token missing)",
+    "orderCreatedAt": 1793553597376,
+    "orderStatus": "COMPLETED",
+    "orderCompletedAt": 1793553597376
   },
   {
     "id": "BILL-4a3842f2-19f5-40c6-942c-9e600b358c2c",
@@ -155,7 +279,10 @@
     "userId": "annpurna_chole_bhature",
     "savedToSheets": false,
     "sheetsSyncStatus": "failed",
-    "sheetsSyncError": "Google Sheets not connected (Access token missing)"
+    "sheetsSyncError": "Google Sheets not connected (Access token missing)",
+    "orderCreatedAt": 1793553537505,
+    "orderStatus": "COMPLETED",
+    "orderCompletedAt": 1793553537505
   },
   {
     "id": "BILL-bb8e5275-64b1-4e56-8e4d-98e34039b0fa",
@@ -204,6 +331,9 @@
     "savedToSheets": true,
     "sheetsSyncStatus": "synced",
     "spreadsheetId": "1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ",
-    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ/edit"
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1s7II7oftLj4K8ZkDiBsfn7wTkhTaw5h5zo0UHx-AjZQ/edit",
+    "orderCreatedAt": 1793551825247,
+    "orderStatus": "COMPLETED",
+    "orderCompletedAt": 1793551825247
   }
 ]

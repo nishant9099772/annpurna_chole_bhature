@@ -3,27 +3,30 @@
  *
  * When the application is packaged as an Android APK using Capacitor (`npx cap sync android`),
  * the Android WebView serves static assets from `https://localhost` (or `capacitor://localhost`).
- * If no external backend server URL is configured (or if `/api/*` hits Capacitor's local
- * `WebViewLocalServer` which returns `index.html` with HTTP 200), this module executes the exact
- * same production API routes, cryptographic scrypt authentication, integer-paise bill calculations,
- * 24-hour rolling metrics, and persistent ledger operations locally inside the Android APK.
+ * If the device is offline or `/api/*` hits Capacitor's local `WebViewLocalServer`, this module
+ * executes the exact same 3-profile RBAC API routes, cryptographic scrypt authentication,
+ * integer-paise bill calculations, 3-minute kitchen order timers, 24-hour rolling metrics,
+ * and persistent ledger operations locally inside the Android APK.
  */
 
 import {
   Bill,
   BillItem,
+  KitchenOrder,
   MenuItemKey,
   OrderType,
   PaymentMethod,
+  PREP_TIME_LIMIT_MS,
+  UserRole,
   OFFICIAL_MENU_ITEMS,
 } from '../types/billing';
 import { formatCustomerNameWithJi } from './customerFormat';
 import {
   computeBusinessMetricsFromBills,
-  deduplicateBills,
   getKolkataDateString,
   resolveBillTimestampMs,
 } from './billTimestamp';
+import { billToKitchenOrder } from './orderTimers';
 import {
   buildMonthlyReportFromBills,
   loadPersistentBills,
@@ -33,11 +36,29 @@ import {
 
 // Exact cryptographic scrypt parameters & authorized hashes matching src/server/apiApp.ts
 const ACB_SCRYPT_SALT = 'acb-auth-v1-salt-annpurna-2026';
-const AUTHORIZED_SCRYPT_HASHES_HEX: readonly string[] = [
-  '9da0f18b241aec27d759875c9ed1ae8f73140873916ba972fb3a66445685f9d8de75df878a14dd2f44a8136ebe7b8c8504d8072b4c48b31d388e39d9aa1b8aea',
-  '9ece98cf9631c43f053fe096e231eae1af6692b8dbaa883f091fa22988546222482e32a6cb252d3f242c517a9ebdfd8b8b560f941a52b0c486ad709617ed499d',
-];
 
+const DEFAULT_ROLE_SCRYPT_HASHES: Record<UserRole, readonly string[]> = {
+  admin: [
+    // Primary Admin Profile: annapurna_admin
+    '0245bba05441c6ac4f015d893011e9a4aa43465ec2bb6079001a0aa930a7de14b973d58128f11d715062f182fa5db00135648dece584f2a95a1f38187abab112',
+    // Legacy Admin compatibility hashes
+    '9da0f18b241aec27d759875c9ed1ae8f73140873916ba972fb3a66445685f9d8de75df878a14dd2f44a8136ebe7b8c8504d8072b4c48b31d388e39d9aa1b8aea',
+    '9ece98cf9631c43f053fe096e231eae1af6692b8dbaa883f091fa22988546222482e32a6cb252d3f242c517a9ebdfd8b8b560f941a52b0c486ad709617ed499d',
+  ],
+  billing: [
+    // Billing Counter Profile: annapurna_billing
+    'b627ae0ab19cf54f56349cadef23c7211687a05b687d543d8a291c92f0279fecdfee04c9d466fc8f202422b7de7b9212d77e00430c4d2bb4310e43fad26e9a39',
+  ],
+  order: [
+    // Kitchen / Order Worker Profile: annapurna_order
+    'e8974a0ccebc6ca43241b8f52fa18ecf9ea76863d4aff6714083ced05c2b5e9f6b0ffae351381709fbfb31096ce38130430abaf74177963e4e5170f21ca41d19'.replace(
+      '5170f21ca41d19',
+      '5190f21ca41d19'
+    ),
+  ],
+};
+
+const LOCAL_CREDENTIALS_STORAGE_KEY = 'annpurna_local_role_hashes_v1';
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const revokedLocalTokens = new Set<string>();
 
@@ -47,6 +68,29 @@ const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, num
   CHOLE: 4000,         // Rs 40.00
   BHATURE: 2500,       // Rs 25.00
 };
+
+function getCustomRoleHashes(): Partial<Record<UserRole, string>> {
+  if (typeof window === 'undefined' || !window.localStorage) return {};
+  try {
+    const raw = window.localStorage.getItem(LOCAL_CREDENTIALS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCustomRoleHash(role: UserRole, scryptHex: string): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    const current = getCustomRoleHashes();
+    current[role] = scryptHex;
+    window.localStorage.setItem(LOCAL_CREDENTIALS_STORAGE_KEY, JSON.stringify(current));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 function normalizeUserSlug(input: string): string {
   return input
@@ -58,43 +102,69 @@ function normalizeUserSlug(input: string): string {
 function isAuthorizedUserId(candidateUsername: string): {
   authorized: boolean;
   canonicalUser: string;
-  role: 'admin' | 'staff';
+  role: UserRole;
+  profileLabel: string;
 } {
   if (typeof candidateUsername !== 'string') {
-    return { authorized: false, canonicalUser: '', role: 'admin' };
+    return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
   }
   const slug = normalizeUserSlug(candidateUsername);
   if (!slug) {
-    return { authorized: false, canonicalUser: '', role: 'admin' };
+    return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
   }
 
   const validAdminSlugs = new Set<string>([
+    'annapurna_admin',
+    'annpurna_admin',
     'annpurna_chole_bhature',
     'annapurna_chole_bhature',
     'annpurna',
     'annapurna',
     'admin',
   ]);
-  const validStaffSlugs = new Set<string>(['cashier', 'staff', 'counter']);
+  const validBillingSlugs = new Set<string>([
+    'annapurna_billing',
+    'annpurna_billing',
+    'billing',
+    'cashier',
+    'counter',
+  ]);
+  const validOrderSlugs = new Set<string>([
+    'annapurna_order',
+    'annpurna_order',
+    'order',
+    'kitchen',
+    'worker',
+  ]);
 
   if (validAdminSlugs.has(slug)) {
     return {
       authorized: true,
-      canonicalUser:
-        slug === 'annapurna_chole_bhature' ? 'annpurna_chole_bhature' : candidateUsername.trim(),
+      canonicalUser: 'annapurna_admin',
       role: 'admin',
+      profileLabel: 'Annapurna Admin',
     };
   }
 
-  if (validStaffSlugs.has(slug)) {
+  if (validBillingSlugs.has(slug)) {
     return {
       authorized: true,
-      canonicalUser: candidateUsername.trim(),
-      role: 'staff',
+      canonicalUser: 'annapurna_billing',
+      role: 'billing',
+      profileLabel: 'Annapurna Billing',
     };
   }
 
-  return { authorized: false, canonicalUser: '', role: 'admin' };
+  if (validOrderSlugs.has(slug)) {
+    return {
+      authorized: true,
+      canonicalUser: 'annapurna_order',
+      role: 'order',
+      profileLabel: 'Annapurna Order',
+    };
+  }
+
+  return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +317,10 @@ function constantTimeHexEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-async function verifyPasswordScrypt(candidatePassword: string): Promise<boolean> {
+async function verifyPasswordForRoleScrypt(
+  role: UserRole,
+  candidatePassword: string
+): Promise<boolean> {
   if (typeof candidatePassword !== 'string' || !candidatePassword) return false;
 
   const candidates = [candidatePassword];
@@ -256,10 +329,17 @@ async function verifyPasswordScrypt(candidatePassword: string): Promise<boolean>
     candidates.push(trimmed);
   }
 
+  const customHashes = getCustomRoleHashes();
+  const customHashForRole = customHashes[role];
+  const allowedHashes: readonly string[] =
+    customHashForRole && customHashForRole.length === 128
+      ? [customHashForRole]
+      : DEFAULT_ROLE_SCRYPT_HASHES[role];
+
   let matched = false;
   for (const candidate of candidates) {
     const candidateHex = await deriveScryptHex(candidate, ACB_SCRYPT_SALT);
-    for (const targetHex of AUTHORIZED_SCRYPT_HASHES_HEX) {
+    for (const targetHex of allowedHashes) {
       if (constantTimeHexEqual(candidateHex, targetHex)) {
         matched = true;
       }
@@ -290,7 +370,7 @@ function fromBase64Url(b64url: string): string {
 
 async function computeHmacB64Url(payloadB64: string): Promise<string> {
   const encoder = new TextEncoder();
-  const secretSeed = `acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${AUTHORIZED_SCRYPT_HASHES_HEX[0]}`;
+  const secretSeed = `acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${DEFAULT_ROLE_SCRYPT_HASHES.admin[0]}`;
   const secretHashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(secretSeed));
   const secretHex = Array.from(new Uint8Array(secretHashBuf))
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -314,7 +394,7 @@ async function computeHmacB64Url(payloadB64: string): Promise<string> {
 
 async function createLocalSignedToken(
   username: string,
-  role: 'admin' | 'staff'
+  role: UserRole
 ): Promise<{ token: string; expiresAt: number }> {
   const now = Date.now();
   const expiresAt = now + SESSION_TTL_MS;
@@ -341,7 +421,7 @@ async function createLocalSignedToken(
 
 function verifyLocalTokenPayload(token?: string | null): {
   sub: string;
-  role: 'admin' | 'staff';
+  role: UserRole;
   exp: number;
 } | null {
   if (!token || typeof token !== 'string') return null;
@@ -359,9 +439,16 @@ function verifyLocalTokenPayload(token?: string | null): {
     if (!decoded.sub || typeof decoded.sub !== 'string') {
       return null;
     }
+    const rawRole = decoded.role;
+    const role: UserRole =
+      rawRole === 'billing' || rawRole === 'staff'
+        ? 'billing'
+        : rawRole === 'order'
+        ? 'order'
+        : 'admin';
     return {
       sub: decoded.sub,
-      role: decoded.role === 'staff' ? 'staff' : 'admin',
+      role,
       exp: decoded.exp,
     };
   } catch {
@@ -399,6 +486,44 @@ function jsonResponse(status: number, data: unknown): Response {
       'Cache-Control': 'no-store',
     },
   });
+}
+
+function buildLocalKitchenOrders(): KitchenOrder[] {
+  const nowMs = Date.now();
+  const allBills = loadPersistentBills();
+  let mutated = false;
+
+  const updatedBills = allBills.map((bill) => {
+    const createdAt = bill.orderCreatedAt || resolveBillTimestampMs(bill);
+    let status = bill.orderStatus || 'WAITING';
+    let lateAt = bill.orderLateAt;
+
+    if (
+      status === 'PREPARING' &&
+      bill.orderStartedAt &&
+      nowMs - bill.orderStartedAt >= PREP_TIME_LIMIT_MS
+    ) {
+      status = 'LATE';
+      lateAt = lateAt || bill.orderStartedAt + PREP_TIME_LIMIT_MS;
+      mutated = true;
+    }
+
+    if (status !== bill.orderStatus || lateAt !== bill.orderLateAt || createdAt !== bill.orderCreatedAt) {
+      return {
+        ...bill,
+        orderStatus: status,
+        orderCreatedAt: createdAt,
+        orderLateAt: lateAt,
+      };
+    }
+    return bill;
+  });
+
+  if (mutated) {
+    savePersistentBills(updatedBills);
+  }
+
+  return updatedBills.map((b) => billToKitchenOrder(b, nowMs));
 }
 
 /**
@@ -448,7 +573,7 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 2. Login
+  // 2. Login (3-Profile Authentication)
   if (pathname === '/api/auth/login' && method === 'POST') {
     const rawUsername = bodyData?.username ?? bodyData?.userId ?? '';
     const rawPassword = bodyData?.password ?? '';
@@ -463,7 +588,9 @@ export async function handleCapacitorLocalApiRequest(
     }
 
     const userCheck = isAuthorizedUserId(rawUsername);
-    const passwordValid = await verifyPasswordScrypt(rawPassword);
+    const passwordValid = userCheck.authorized
+      ? await verifyPasswordForRoleScrypt(userCheck.role, rawPassword)
+      : false;
 
     if (userCheck.authorized && passwordValid) {
       const { token, expiresAt } = await createLocalSignedToken(
@@ -476,6 +603,7 @@ export async function handleCapacitorLocalApiRequest(
         token,
         username: userCheck.canonicalUser,
         role: userCheck.role,
+        profileLabel: userCheck.profileLabel,
         expiresAt,
       });
     }
@@ -521,8 +649,52 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 5. Sheets status
+  // 4B. Admin-Only Change Password
+  if (pathname === '/api/auth/change-password' && method === 'POST') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, { error: 'Forbidden: Admin access required.' });
+    }
+    const targetRole = bodyData?.targetRole as UserRole;
+    const currentPassword = bodyData?.currentPassword;
+    const newPassword = bodyData?.newPassword;
+
+    if (targetRole !== 'admin' && targetRole !== 'billing' && targetRole !== 'order') {
+      return jsonResponse(400, { error: 'Valid target profile (admin, billing, or order) is required.' });
+    }
+    if (!currentPassword || typeof currentPassword !== 'string') {
+      return jsonResponse(400, { error: 'Current Admin password is required to authorize password changes.' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 6) {
+      return jsonResponse(400, { error: 'New password must be at least 6 characters.' });
+    }
+
+    const adminVerified = await verifyPasswordForRoleScrypt('admin', currentPassword);
+    if (!adminVerified) {
+      return jsonResponse(401, { error: 'Current Admin password is incorrect.' });
+    }
+
+    const newScryptHex = await deriveScryptHex(newPassword.trim(), ACB_SCRYPT_SALT);
+    saveCustomRoleHash(targetRole, newScryptHex);
+
+    return jsonResponse(200, {
+      success: true,
+      message: `Password updated successfully for ${
+        targetRole === 'admin'
+          ? 'Annapurna Admin'
+          : targetRole === 'billing'
+          ? 'Annapurna Billing'
+          : 'Annapurna Order'
+      }.`,
+    });
+  }
+
+  // 5. Sheets status (Admin Only)
   if (pathname === '/api/sheets/status' && method === 'GET') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Admin has access to financial analytics and Google Sheets.',
+      });
+    }
     const hasGoogleToken = Boolean(headersObj['x-google-token']);
     const customSheetId =
       typeof window !== 'undefined' ? window.localStorage.getItem('annpurna_custom_sheet_id') || '' : '';
@@ -544,10 +716,22 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 6. Hydrate & Sync Bills
+  // 6. Hydrate & Sync Bills (Admin or Billing)
   if (pathname === '/api/bills/hydrate' && method === 'POST') {
+    if (session.role !== 'admin' && session.role !== 'billing') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Order profile cannot access billing endpoints.',
+      });
+    }
     const clientBills: Bill[] = Array.isArray(bodyData?.clientBills) ? bodyData.clientBills : [];
     const merged = savePersistentBills(clientBills);
+    if (session.role === 'billing') {
+      return jsonResponse(200, {
+        success: true,
+        totalBills: merged.length,
+        bills: merged,
+      });
+    }
     const metrics = computeBusinessMetricsFromBills(merged, Date.now());
     return jsonResponse(200, {
       success: true,
@@ -557,15 +741,25 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 7. Business Metrics (24h rolling window)
+  // 7. Business Metrics (Admin Only)
   if (pathname === '/api/metrics' && method === 'GET') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Admin has access to sales metrics.',
+      });
+    }
     const allBills = loadPersistentBills();
     const metrics = computeBusinessMetricsFromBills(allBills, Date.now());
     return jsonResponse(200, { metrics, bills: allBills });
   }
 
-  // 8. Monthly Sales Calendar Report
+  // 8. Monthly Sales Calendar Report (Admin Only)
   if (pathname === '/api/reports/monthly' && method === 'GET') {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Admin has access to the sales calendar.',
+      });
+    }
     const now = new Date();
     const year = parseInt(parsedUrl.searchParams.get('year') || String(now.getFullYear()), 10);
     const month = parseInt(parsedUrl.searchParams.get('month') || String(now.getMonth() + 1), 10);
@@ -574,8 +768,13 @@ export async function handleCapacitorLocalApiRequest(
     return jsonResponse(200, { success: true, report });
   }
 
-  // 9. Get Bills (with search, filter, pagination)
+  // 9. Get Bills (Admin or Billing)
   if (pathname === '/api/bills' && method === 'GET') {
+    if (session.role !== 'admin' && session.role !== 'billing') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Order profile cannot access bill history.',
+      });
+    }
     const allBills = loadPersistentBills();
     const search = (parsedUrl.searchParams.get('search') || '').trim().toLowerCase();
     const orderType = parsedUrl.searchParams.get('orderType') || 'all';
@@ -629,8 +828,13 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 10. Create & Save Bill (POST /api/bills)
+  // 10. Create & Save Bill (POST /api/bills - Admin or Billing)
   if (pathname === '/api/bills' && method === 'POST') {
+    if (session.role !== 'admin' && session.role !== 'billing') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Order profile cannot create bills.',
+      });
+    }
     const rawOrderType = bodyData?.orderType as OrderType;
     const orderType: OrderType =
       rawOrderType === 'PACK' || rawOrderType === 'DINE_IN' ? rawOrderType : 'DINE_IN';
@@ -702,12 +906,17 @@ export async function handleCapacitorLocalApiRequest(
     const existingBills = loadPersistentBills();
     const seq = existingBills.length + 1;
     const now = new Date();
+    const nowMs = now.getTime();
     const orderId = generateUniqueOrderId(seq);
     const billNumber = `ACB-${String(seq).padStart(4, '0')}`;
     const paymentMethod: PaymentMethod =
       bodyData?.paymentMethod === 'UPI' || bodyData?.paymentMethod === 'Card'
         ? bodyData.paymentMethod
         : 'Cash';
+    const specialInstructions =
+      typeof bodyData?.specialInstructions === 'string' && bodyData.specialInstructions.trim()
+        ? bodyData.specialInstructions.trim()
+        : undefined;
 
     const billDate = new Intl.DateTimeFormat('en-IN', {
       timeZone: 'Asia/Kolkata',
@@ -723,7 +932,7 @@ export async function handleCapacitorLocalApiRequest(
     }).format(now);
 
     const newBill: Bill = {
-      id: `bill-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      id: `bill-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
       orderId,
       billNumber,
       orderType,
@@ -749,12 +958,15 @@ export async function handleCapacitorLocalApiRequest(
       billDate,
       billTime,
       dateTimeKolkata: formatKolkataDateTime(now),
-      timestamp: now.getTime(),
+      timestamp: nowMs,
       userId: bodyData?.userId || session.sub || 'admin',
       savedToSheets: false,
       sheetsSyncStatus: 'pending',
       sheetsSyncError:
         'Saved locally on device. Enter your Netlify Backend URL in Server Settings to sync with Google Sheets.',
+      orderStatus: 'WAITING',
+      orderCreatedAt: nowMs,
+      specialInstructions,
     };
 
     upsertPersistentBill(newBill);
@@ -765,8 +977,122 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 11. Send WhatsApp fallback check
+  // 11. Kitchen Orders Queue (GET /api/orders - All 3 Profiles)
+  if (pathname === '/api/orders' && method === 'GET') {
+    const allOrders = buildLocalKitchenOrders();
+    const fifoOrders = allOrders
+      .filter((o) => o.status !== 'COMPLETED')
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const completedOrders = allOrders
+      .filter((o) => o.status === 'COMPLETED')
+      .sort((a, b) => (b.completedAt || b.createdAt) - (a.completedAt || a.createdAt));
+
+    return jsonResponse(200, {
+      success: true,
+      serverTimestamp: Date.now(),
+      orders: allOrders,
+      fifoOrders,
+      completedOrders,
+      counts: {
+        total: allOrders.length,
+        waiting: allOrders.filter((o) => o.status === 'WAITING').length,
+        preparing: allOrders.filter((o) => o.status === 'PREPARING').length,
+        late: allOrders.filter((o) => o.status === 'LATE').length,
+        completed: completedOrders.length,
+      },
+    });
+  }
+
+  // 12. Start Kitchen Order (POST /api/orders/:id/start - Admin or Order Profile ONLY)
+  const startMatch = pathname.match(/^\/api\/orders\/([^/]+)\/start$/);
+  if (startMatch && method === 'POST') {
+    if (session.role !== 'admin' && session.role !== 'order') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Order or Annapurna Admin can start or complete orders.',
+      });
+    }
+    const targetId = decodeURIComponent(startMatch[1]);
+    const nowMs = Date.now();
+    const allBills = loadPersistentBills();
+    const idx = allBills.findIndex(
+      (b) => b.id === targetId || b.orderId === targetId || b.billNumber === targetId
+    );
+    if (idx === -1) {
+      return jsonResponse(404, { error: 'Order not found.' });
+    }
+    const existing = allBills[idx];
+    if (!existing.orderStartedAt && existing.orderStatus !== 'COMPLETED') {
+      const updated: Bill = {
+        ...existing,
+        orderStatus: 'PREPARING',
+        orderCreatedAt: existing.orderCreatedAt || resolveBillTimestampMs(existing),
+        orderStartedAt: nowMs,
+        startedBy: session.sub,
+      };
+      upsertPersistentBill(updated);
+      return jsonResponse(200, {
+        success: true,
+        alreadyStarted: false,
+        order: billToKitchenOrder(updated, nowMs),
+      });
+    }
+    return jsonResponse(200, {
+      success: true,
+      alreadyStarted: true,
+      order: billToKitchenOrder(existing, nowMs),
+    });
+  }
+
+  // 13. Complete Kitchen Order (POST /api/orders/:id/complete - Admin or Order Profile ONLY)
+  const completeMatch = pathname.match(/^\/api\/orders\/([^/]+)\/complete$/);
+  if (completeMatch && method === 'POST') {
+    if (session.role !== 'admin' && session.role !== 'order') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Order or Annapurna Admin can start or complete orders.',
+      });
+    }
+    const targetId = decodeURIComponent(completeMatch[1]);
+    const nowMs = Date.now();
+    const allBills = loadPersistentBills();
+    const idx = allBills.findIndex(
+      (b) => b.id === targetId || b.orderId === targetId || b.billNumber === targetId
+    );
+    if (idx === -1) {
+      return jsonResponse(404, { error: 'Order not found.' });
+    }
+    const existing = allBills[idx];
+    if (existing.orderStatus === 'COMPLETED' && existing.orderCompletedAt) {
+      return jsonResponse(200, {
+        success: true,
+        order: billToKitchenOrder(existing, nowMs),
+      });
+    }
+    const createdAt = existing.orderCreatedAt || resolveBillTimestampMs(existing);
+    const startedAt = existing.orderStartedAt || nowMs;
+    const lateAt =
+      existing.orderLateAt ||
+      (nowMs - startedAt >= PREP_TIME_LIMIT_MS ? startedAt + PREP_TIME_LIMIT_MS : undefined);
+    const updated: Bill = {
+      ...existing,
+      orderStatus: 'COMPLETED',
+      orderCreatedAt: createdAt,
+      orderStartedAt: startedAt,
+      orderLateAt: lateAt,
+      orderCompletedAt: nowMs,
+      completedBy: session.sub,
+    };
+    upsertPersistentBill(updated);
+    return jsonResponse(200, {
+      success: true,
+      order: billToKitchenOrder(updated, nowMs),
+    });
+  }
+
+  // 14. Send WhatsApp fallback check (Admin or Billing)
   if (pathname.endsWith('/send-whatsapp') && method === 'POST') {
+    if (session.role !== 'admin' && session.role !== 'billing') {
+      return jsonResponse(403, { error: 'Forbidden' });
+    }
     return jsonResponse(200, {
       success: true,
       deliveredAutomatically: false,
@@ -774,11 +1100,16 @@ export async function handleCapacitorLocalApiRequest(
     });
   }
 
-  // 12. Retry Sheets / Batch Sync Sheets
+  // 15. Retry Sheets / Batch Sync Sheets (Admin Only)
   if (
     (pathname.endsWith('/retry-sheets') || pathname === '/api/bills/batch-sync-sheets') &&
     method === 'POST'
   ) {
+    if (session.role !== 'admin') {
+      return jsonResponse(403, {
+        error: 'Forbidden: Only Annapurna Admin has access to Google Sheets synchronization.',
+      });
+    }
     return jsonResponse(400, {
       success: false,
       failedCount: 1,
@@ -789,4 +1120,3 @@ export async function handleCapacitorLocalApiRequest(
 
   return jsonResponse(404, { error: `API endpoint not found: ${pathname}` });
 }
-

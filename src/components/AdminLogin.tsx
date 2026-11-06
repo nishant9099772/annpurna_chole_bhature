@@ -11,7 +11,10 @@ import {
   Server,
   CheckCircle2,
   RefreshCw,
+  Receipt,
+  ChefHat,
 } from 'lucide-react';
+import { UserRole } from '../types/billing';
 import {
   apiFetch,
   parseApiJsonResponse,
@@ -22,11 +25,43 @@ import {
 } from '../utils/apiClient';
 
 interface AdminLoginProps {
-  onLoginSuccess: (token: string, username: string) => void;
+  onLoginSuccess: (
+    token: string,
+    username: string,
+    role: UserRole,
+    expiresAt?: number
+  ) => void;
 }
 
+const PROFILE_OPTIONS: Array<{
+  role: UserRole;
+  label: string;
+  userId: string;
+  subtitle: string;
+}> = [
+  {
+    role: 'admin',
+    label: 'Annapurna Admin',
+    userId: 'annapurna_admin',
+    subtitle: 'Full Access • Sales • Sheets • Kitchen',
+  },
+  {
+    role: 'billing',
+    label: 'Annapurna Billing',
+    userId: 'annapurna_billing',
+    subtitle: 'New Bill • Bill History • Order Status',
+  },
+  {
+    role: 'order',
+    label: 'Annapurna Order',
+    userId: 'annapurna_order',
+    subtitle: 'Kitchen Queue • 3-Min Timer • Start/Done',
+  },
+];
+
 export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
-  const [username, setUsername] = useState('');
+  const [selectedProfile, setSelectedProfile] = useState<UserRole>('admin');
+  const [username, setUsername] = useState('annapurna_admin');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +78,13 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     ok: boolean;
     message: string;
   } | null>(null);
+
+  const handleSelectProfile = (option: (typeof PROFILE_OPTIONS)[number]) => {
+    setSelectedProfile(option.role);
+    setUsername(option.userId);
+    setPassword('');
+    setError(null);
+  };
 
   const handleSaveAndTestServerUrl = async () => {
     const trimmed = serverUrlInput.trim();
@@ -68,7 +110,6 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           message: `Connected to Netlify Backend (${saved}) in ${check.latencyMs}ms!`,
         });
       } else {
-        // Still save if user entered a valid HTTPS URL, but warn if unreachable right now
         const saved = setConfiguredApiBaseUrl(trimmed);
         setServerUrlInput(saved);
         setServerTestStatus({
@@ -111,6 +152,8 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         success?: boolean;
         token?: string;
         username?: string;
+        role?: UserRole;
+        expiresAt?: number;
         error?: string;
       }>(response);
 
@@ -129,7 +172,15 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         );
       }
 
-      onLoginSuccess(data.token, data.username || trimmedUser);
+      const resolvedRole: UserRole =
+        data.role === 'billing' || data.role === 'order' ? data.role : 'admin';
+
+      onLoginSuccess(
+        data.token,
+        data.username || trimmedUser,
+        resolvedRole,
+        data.expiresAt
+      );
     } catch (err: any) {
       setError(err.message || 'Login failed. Please verify your User ID and Password.');
     } finally {
@@ -139,21 +190,70 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
 
   return (
     <div className="min-h-dvh bg-[#FFFDF9] flex flex-col justify-center items-center px-3.5 py-6 sm:px-4 sm:py-8 safe-top safe-bottom">
-      <div className="relative w-full max-w-md bg-white border border-amber-200/90 rounded-xl shadow-lg shadow-amber-900/5 p-5 sm:p-8">
+      <div className="relative w-full max-w-md bg-white border border-amber-200/90 rounded-xl shadow-lg shadow-amber-900/5 p-5 sm:p-7">
         {/* Restaurant Header */}
-        <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center w-12 h-12 sm:w-14 sm:h-14 rounded-lg bg-amber-500 text-white shadow-sm mb-2.5">
+        <div className="text-center mb-5">
+          <div className="inline-flex items-center justify-center w-12 h-12 sm:w-14 sm:h-14 rounded-lg bg-amber-500 text-white shadow-sm mb-2">
             <UtensilsCrossed className="w-6 h-6 sm:w-7 sm:h-7" />
           </div>
           <h1 className="text-xl sm:text-2xl font-extrabold text-amber-950 tracking-tight">
-            Annpurna Chole Bhature
+            Annapurna Chole Bhature
           </h1>
           <p className="text-xs sm:text-sm font-medium text-amber-800/80 mt-0.5">
-            Billing &amp; Management Portal
+            Restaurant Management &amp; POS System
           </p>
-          <div className="inline-flex items-center gap-1.5 mt-2.5 px-2.5 py-1 bg-amber-50 border border-amber-200/70 rounded-md text-[11px] font-semibold text-amber-900">
+          <div className="inline-flex items-center gap-1.5 mt-2 px-2.5 py-1 bg-amber-50 border border-amber-200/70 rounded-md text-[11px] font-semibold text-amber-900">
             <ShieldCheck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-            <span>Protected Access — Sign In Required</span>
+            <span>Select Profile — Role-Based Access Control</span>
+          </div>
+        </div>
+
+        {/* 3-Profile Selector Tabs */}
+        <div className="mb-4">
+          <label className="block text-[11px] font-extrabold uppercase tracking-wider text-slate-600 mb-1.5">
+            Choose Login Profile
+          </label>
+          <div className="grid grid-cols-3 gap-1.5">
+            {PROFILE_OPTIONS.map((opt) => {
+              const isSelected = selectedProfile === opt.role;
+              return (
+                <button
+                  key={opt.role}
+                  type="button"
+                  onClick={() => handleSelectProfile(opt)}
+                  className={`p-2.5 rounded-lg border text-left transition cursor-pointer flex flex-col justify-between ${
+                    isSelected
+                      ? 'bg-amber-50 border-amber-500 ring-2 ring-amber-500/20 text-amber-950'
+                      : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    {opt.role === 'admin' && (
+                      <ShieldCheck
+                        className={`w-4 h-4 ${isSelected ? 'text-amber-600' : 'text-slate-400'}`}
+                      />
+                    )}
+                    {opt.role === 'billing' && (
+                      <Receipt
+                        className={`w-4 h-4 ${isSelected ? 'text-blue-600' : 'text-slate-400'}`}
+                      />
+                    )}
+                    {opt.role === 'order' && (
+                      <ChefHat
+                        className={`w-4 h-4 ${isSelected ? 'text-emerald-600' : 'text-slate-400'}`}
+                      />
+                    )}
+                    {isSelected && (
+                      <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" />
+                    )}
+                  </div>
+                  <div className="font-extrabold text-xs leading-tight">{opt.label}</div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 leading-tight line-clamp-2">
+                    {opt.subtitle}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -184,9 +284,16 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
                 autoCorrect="off"
                 autoComplete="username"
                 value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Enter your User ID"
-                className="w-full pl-9 pr-3.5 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-base sm:text-sm text-slate-900 font-medium transition"
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setUsername(val);
+                  const lower = val.trim().toLowerCase();
+                  if (lower.includes('billing')) setSelectedProfile('billing');
+                  else if (lower.includes('order')) setSelectedProfile('order');
+                  else if (lower.includes('admin')) setSelectedProfile('admin');
+                }}
+                placeholder="annapurna_admin / annapurna_billing / annapurna_order"
+                className="w-full pl-9 pr-3.5 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-base sm:text-sm text-slate-900 font-mono font-semibold transition"
               />
             </div>
           </div>
@@ -207,7 +314,13 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
                 autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter your password"
+                placeholder={`Enter password for ${
+                  selectedProfile === 'admin'
+                    ? 'Annapurna Admin'
+                    : selectedProfile === 'billing'
+                    ? 'Annapurna Billing'
+                    : 'Annapurna Order'
+                }`}
                 className="w-full pl-9 pr-10 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-base sm:text-sm text-slate-900 font-medium transition"
               />
               <button
@@ -233,7 +346,14 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
               </>
             ) : (
               <>
-                <span>Sign In to Billing Counter</span>
+                <span>
+                  Sign In as{' '}
+                  {selectedProfile === 'admin'
+                    ? 'Annapurna Admin'
+                    : selectedProfile === 'billing'
+                    ? 'Annapurna Billing'
+                    : 'Annapurna Order'}
+                </span>
                 <ArrowRight className="w-4 h-4" />
               </>
             )}
@@ -244,7 +364,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         <div className="mt-5 pt-4 border-t border-slate-100">
           <div className="flex items-center justify-between">
             <span className="text-[11px] text-slate-400">
-              24h Session • Encrypted Auth
+              24h Auto-Logout Session • Scrypt Encrypted
             </span>
             <button
               type="button"

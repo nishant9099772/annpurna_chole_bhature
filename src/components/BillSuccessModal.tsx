@@ -14,8 +14,9 @@ import {
   ArrowRight,
   Printer,
   Eye,
+  ChefHat,
 } from 'lucide-react';
-import { Bill } from '../types/billing';
+import { Bill, UserRole } from '../types/billing';
 import {
   generateBillPdfBytes,
   createBillPdfFile,
@@ -33,6 +34,7 @@ interface BillSuccessModalProps {
   onRetrySync?: (bill: Bill) => void;
   isRetryingSync?: boolean;
   adminToken?: string;
+  userRole?: UserRole;
 }
 
 export const BillSuccessModal: React.FC<BillSuccessModalProps> = ({
@@ -42,6 +44,7 @@ export const BillSuccessModal: React.FC<BillSuccessModalProps> = ({
   onRetrySync,
   isRetryingSync,
   adminToken,
+  userRole = 'admin',
 }) => {
   const [sharingStatus, setSharingStatus] = useState<string | null>(null);
   const formattedCustomerName = formatCustomerNameWithJi(bill.customerName);
@@ -184,6 +187,7 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
 
   // Strictly truthful Google Sheets status check
   const isSynced = bill.savedToSheets === true && bill.sheetsSyncStatus === 'synced';
+  const isAdmin = userRole === 'admin';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-5 bg-slate-950/65 backdrop-blur-xs overflow-y-auto">
@@ -218,6 +222,11 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
                   <span>Dine In</span>
                 </>
               )}
+            </span>
+
+            <span className="inline-flex items-center gap-1 bg-amber-400 text-slate-950 px-2.5 py-0.5 rounded-md text-xs font-extrabold">
+              <ChefHat className="w-3.5 h-3.5" />
+              <span>Sent to Kitchen ({bill.orderStatus || 'WAITING'})</span>
             </span>
           </div>
         </div>
@@ -304,61 +313,63 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! For feedback or queries, conta
             </div>
           </div>
 
-          {/* Truthful Google Sheets Synchronization Status */}
-          <div
-            className={`rounded-lg p-3 border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 ${
-              isSynced
-                ? 'bg-emerald-50/80 border-emerald-200 text-emerald-950'
-                : 'bg-amber-50/80 border-amber-200 text-amber-950'
-            }`}
-          >
-            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
-              <div
-                className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 ${
-                  isSynced ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
-                }`}
-              >
-                {isSynced ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+          {/* Truthful Google Sheets Synchronization Status (Admin Only) */}
+          {isAdmin && (
+            <div
+              className={`rounded-lg p-3 border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 ${
+                isSynced
+                  ? 'bg-emerald-50/80 border-emerald-200 text-emerald-950'
+                  : 'bg-amber-50/80 border-amber-200 text-amber-950'
+              }`}
+            >
+              <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                <div
+                  className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 ${
+                    isSynced ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                  }`}
+                >
+                  {isSynced ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+                </div>
+                <div className="min-w-0">
+                  <p className="font-bold">
+                    {isSynced
+                      ? 'Saved Successfully to Google Sheets'
+                      : 'Saved Locally — Pending Google Sheets Sync'}
+                  </p>
+                  <p className="text-[11px] text-slate-600 break-words">
+                    {isSynced
+                      ? 'Verified row written in Bills & Bill Items tabs'
+                      : bill.sheetsSyncError || 'Queued safely; tap Retry Sync to record in Google Sheets'}
+                  </p>
+                </div>
               </div>
-              <div className="min-w-0">
-                <p className="font-bold">
-                  {isSynced
-                    ? 'Saved Successfully to Google Sheets'
-                    : 'Saved Locally — Pending Google Sheets Sync'}
-                </p>
-                <p className="text-[11px] text-slate-600 break-words">
-                  {isSynced
-                    ? 'Verified row written in Bills & Bill Items tabs'
-                    : bill.sheetsSyncError || 'Queued safely; tap Retry Sync to record in Google Sheets'}
-                </p>
+
+              <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                {isSynced && bill.spreadsheetUrl && (
+                  <a
+                    href={bill.spreadsheetUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1.5 bg-white border border-emerald-300 text-emerald-800 font-semibold rounded-md text-xs hover:bg-emerald-50 transition flex items-center gap-1"
+                  >
+                    <span>Open Sheet</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+
+                {!isSynced && onRetrySync && (
+                  <button
+                    onClick={() => onRetrySync(bill)}
+                    disabled={isRetryingSync}
+                    className="px-3 py-1.5 bg-amber-600 text-white font-semibold rounded-md text-xs hover:bg-amber-700 transition flex items-center gap-1 disabled:opacity-50 cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isRetryingSync ? 'animate-spin' : ''}`} />
+                    <span>{isRetryingSync ? 'Syncing...' : 'Retry Sync'}</span>
+                  </button>
+                )}
               </div>
             </div>
-
-            <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-              {isSynced && bill.spreadsheetUrl && (
-                <a
-                  href={bill.spreadsheetUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="px-2.5 py-1.5 bg-white border border-emerald-300 text-emerald-800 font-semibold rounded-md text-xs hover:bg-emerald-50 transition flex items-center gap-1"
-                >
-                  <span>Open Sheet</span>
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              )}
-
-              {!isSynced && onRetrySync && (
-                <button
-                  onClick={() => onRetrySync(bill)}
-                  disabled={isRetryingSync}
-                  className="px-3 py-1.5 bg-amber-600 text-white font-semibold rounded-md text-xs hover:bg-amber-700 transition flex items-center gap-1 disabled:opacity-50 cursor-pointer"
-                >
-                  <RefreshCw className={`w-3 h-3 ${isRetryingSync ? 'animate-spin' : ''}`} />
-                  <span>{isRetryingSync ? 'Syncing...' : 'Retry Sync'}</span>
-                </button>
-              )}
-            </div>
-          </div>
+          )}
 
           {sharingStatus && (
             <p className="text-xs font-semibold text-blue-700 text-center bg-blue-50 py-1.5 px-3 rounded-lg">

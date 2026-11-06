@@ -5,6 +5,9 @@
  */
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import dotenv from 'dotenv';
 import {
   Bill,
@@ -12,6 +15,7 @@ import {
   MenuItemKey,
   OrderType,
   PaymentMethod,
+  UserRole,
   OFFICIAL_MENU_ITEMS,
 } from '../types/billing';
 import { generateBillPdfBytes } from '../services/pdfGenerator';
@@ -22,6 +26,7 @@ import {
 } from '../services/googleSheetsService';
 import { billStorage } from './storage';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import { billToKitchenOrder } from '../utils/orderTimers';
 
 dotenv.config();
 
@@ -45,8 +50,7 @@ function cleanEnvValue(raw?: string | null): string {
 }
 
 /**
- * Normalizes a User ID for case-insensitive and separator-tolerant matching
- * (e.g. "Annpurna_Chole_Bhature", "annpurna chole bhature", "admin").
+ * Normalizes a User ID for case-insensitive and separator-tolerant matching.
  */
 function normalizeUserSlug(input: string): string {
   return input
@@ -58,17 +62,65 @@ function normalizeUserSlug(input: string): string {
 // Cryptographic scrypt parameters (No plaintext passwords stored in code)
 const ACB_SCRYPT_SALT = 'acb-auth-v1-salt-annpurna-2026';
 
-// Pre-computed one-way scrypt hashes (64-byte hex) for existing authorized accounts:
-// 1. Primary AI Studio / Production account (annpurna_chole_bhature)
-// 2. Standard default admin account (admin)
-const AUTHORIZED_SCRYPT_HASHES_HEX: readonly string[] = [
+// Pre-computed one-way scrypt hashes (64-byte hex) for the 3 distinct profiles:
+// 1. Annapurna Admin (`annapurna_admin`) + legacy admin hashes
+const DEFAULT_ADMIN_SCRYPT_HASHES_HEX: readonly string[] = [
+  '0245bba05441c6ac4f015d893011e9a4aa43465ec2bb6079001a0aa930a7de14b973d58128f11d715062f182fa5db00135648dece584f2a95a1f38187abab112',
   '9da0f18b241aec27d759875c9ed1ae8f73140873916ba972fb3a66445685f9d8de75df878a14dd2f44a8136ebe7b8c8504d8072b4c48b31d388e39d9aa1b8aea',
   '9ece98cf9631c43f053fe096e231eae1af6692b8dbaa883f091fa22988546222482e32a6cb252d3f242c517a9ebdfd8b8b560f941a52b0c486ad709617ed499d',
 ];
 
-const AUTHORIZED_SCRYPT_BUFFERS: Buffer[] = AUTHORIZED_SCRYPT_HASHES_HEX.map((hex) =>
-  Buffer.from(hex, 'hex')
-);
+// 2. Annapurna Billing (`annapurna_billing`)
+const DEFAULT_BILLING_SCRYPT_HASH_HEX =
+  'b627ae0ab19cf54f56349cadef23c7211687a05b687d543d8a291c92f0279fecdfee04c9d466fc8f202422b7de7b9212d77e00430c4d2bb4310e43fad26e9a39';
+
+// 3. Annapurna Order (`annapurna_order`)
+const DEFAULT_ORDER_SCRYPT_HASH_HEX =
+  'e8974a0ccebc6ca43241b8f52fa18ecf9ea76863d4aff6714083ced05c2b5e9f6b0ffae351381709fbfb31096ce38130430abaf74177963e4e5190f21ca41d19';
+
+// Persistent custom scrypt credential overrides file (stores ONLY scrypt hashes when passwords are changed via UI/API)
+const PRIMARY_CREDENTIALS_FILE = path.resolve(process.cwd(), 'data', 'credentials.json');
+const TMP_CREDENTIALS_FILE = path.resolve(os.tmpdir(), 'annpurna-billing-data', 'credentials.json');
+
+interface StoredCredentialOverrides {
+  adminHashHex?: string;
+  billingHashHex?: string;
+  orderHashHex?: string;
+  updatedAt?: number;
+}
+
+function loadCredentialOverrides(): StoredCredentialOverrides {
+  for (const file of [PRIMARY_CREDENTIALS_FILE, TMP_CREDENTIALS_FILE]) {
+    try {
+      if (fs.existsSync(file)) {
+        const raw = fs.readFileSync(file, 'utf-8');
+        if (raw.trim()) {
+          return JSON.parse(raw) as StoredCredentialOverrides;
+        }
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+  return {};
+}
+
+function saveCredentialOverrides(overrides: StoredCredentialOverrides): void {
+  const payload = JSON.stringify({ ...overrides, updatedAt: Date.now() }, null, 2);
+  try {
+    const dir = path.dirname(PRIMARY_CREDENTIALS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PRIMARY_CREDENTIALS_FILE, payload, 'utf-8');
+  } catch {
+    try {
+      const tmpDir = path.dirname(TMP_CREDENTIALS_FILE);
+      if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+      fs.writeFileSync(TMP_CREDENTIALS_FILE, payload, 'utf-8');
+    } catch (err) {
+      console.error('[Auth] Could not persist credential overrides:', err);
+    }
+  }
+}
 
 function getConfiguredAdminUsername(): string {
   return (
@@ -76,7 +128,7 @@ function getConfiguredAdminUsername(): string {
       process.env.ADMIN_USERNAME ||
         process.env.APP_ADMIN_USERNAME ||
         process.env.VITE_ADMIN_USERNAME
-    ) || 'annpurna_chole_bhature'
+    ) || 'annapurna_admin'
   );
 }
 
@@ -87,11 +139,11 @@ function getSessionSecret(): string {
   if (envSecret) return envSecret;
   return crypto
     .createHash('sha256')
-    .update(`acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${AUTHORIZED_SCRYPT_HASHES_HEX[0]}`)
+    .update(`acb-stateless-jwt-secret-v2:${ACB_SCRYPT_SALT}:${DEFAULT_ADMIN_SCRYPT_HASHES_HEX[1]}`)
     .digest('hex');
 }
 
-// 24-Hour Session Validity
+// 24-Hour Session Validity (86,400,000 ms)
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 function matchesScryptTargetConstantTime(candidatePassword: string, targetHashBuf: Buffer): boolean {
@@ -105,11 +157,57 @@ function matchesScryptTargetConstantTime(candidatePassword: string, targetHashBu
 }
 
 /**
- * Verifies a password in constant time using scrypt against:
- * 1. Any custom ADMIN_PASSWORD / STAFF_PASSWORD configured in Netlify environment variables
- * 2. Pre-computed scrypt hashes of the existing authorized accounts
+ * Resolves the active scrypt hash buffers for a specific role ('admin' | 'billing' | 'order').
+ * Respects:
+ * 1. Any password changed via `/api/auth/change-password` (stored as scrypt hash in `credentials.json`)
+ * 2. Environment variables (`ADMIN_PASSWORD`, `BILLING_PASSWORD`, `ORDER_PASSWORD`)
+ * 3. Pre-computed scrypt hashes for each role
  */
-function verifyPasswordConstantTime(candidatePassword: string): boolean {
+function getTargetScryptBuffersForRole(role: UserRole): Buffer[] {
+  const overrides = loadCredentialOverrides();
+  const buffers: Buffer[] = [];
+
+  if (role === 'admin') {
+    if (overrides.adminHashHex && overrides.adminHashHex.length === 128) {
+      buffers.push(Buffer.from(overrides.adminHashHex, 'hex'));
+    }
+    const rawEnvPass = process.env.ADMIN_PASSWORD || process.env.APP_ADMIN_PASSWORD;
+    if (rawEnvPass && typeof rawEnvPass === 'string') {
+      const cleaned = cleanEnvValue(rawEnvPass);
+      if (cleaned) buffers.push(crypto.scryptSync(cleaned, ACB_SCRYPT_SALT, 64));
+    }
+    for (const hex of DEFAULT_ADMIN_SCRYPT_HASHES_HEX) {
+      buffers.push(Buffer.from(hex, 'hex'));
+    }
+  } else if (role === 'billing') {
+    if (overrides.billingHashHex && overrides.billingHashHex.length === 128) {
+      buffers.push(Buffer.from(overrides.billingHashHex, 'hex'));
+    }
+    const rawEnvPass = process.env.BILLING_PASSWORD || process.env.STAFF_PASSWORD;
+    if (rawEnvPass && typeof rawEnvPass === 'string') {
+      const cleaned = cleanEnvValue(rawEnvPass);
+      if (cleaned) buffers.push(crypto.scryptSync(cleaned, ACB_SCRYPT_SALT, 64));
+    }
+    buffers.push(Buffer.from(DEFAULT_BILLING_SCRYPT_HASH_HEX, 'hex'));
+  } else if (role === 'order') {
+    if (overrides.orderHashHex && overrides.orderHashHex.length === 128) {
+      buffers.push(Buffer.from(overrides.orderHashHex, 'hex'));
+    }
+    const rawEnvPass = process.env.ORDER_PASSWORD || process.env.KITCHEN_PASSWORD;
+    if (rawEnvPass && typeof rawEnvPass === 'string') {
+      const cleaned = cleanEnvValue(rawEnvPass);
+      if (cleaned) buffers.push(crypto.scryptSync(cleaned, ACB_SCRYPT_SALT, 64));
+    }
+    buffers.push(Buffer.from(DEFAULT_ORDER_SCRYPT_HASH_HEX, 'hex'));
+  }
+
+  return buffers;
+}
+
+/**
+ * Verifies a password in constant time using scrypt for a specific profile role.
+ */
+function verifyRolePasswordConstantTime(candidatePassword: string, role: UserRole): boolean {
   if (typeof candidatePassword !== 'string' || !candidatePassword) return false;
 
   const candidatesToCheck = [candidatePassword];
@@ -118,23 +216,10 @@ function verifyPasswordConstantTime(candidatePassword: string): boolean {
     candidatesToCheck.push(trimmedCandidate);
   }
 
-  // Build active target hashes dynamically so Netlify env var changes are respected immediately
-  const activeTargetBuffers: Buffer[] = [...AUTHORIZED_SCRYPT_BUFFERS];
-
-  const rawEnvPass = process.env.ADMIN_PASSWORD || process.env.APP_ADMIN_PASSWORD || process.env.STAFF_PASSWORD;
-  if (rawEnvPass && typeof rawEnvPass === 'string') {
-    const cleanedEnvPass = cleanEnvValue(rawEnvPass);
-    if (cleanedEnvPass) {
-      activeTargetBuffers.unshift(crypto.scryptSync(cleanedEnvPass, ACB_SCRYPT_SALT, 64));
-    }
-    if (rawEnvPass !== cleanedEnvPass && rawEnvPass.length > 0) {
-      activeTargetBuffers.unshift(crypto.scryptSync(rawEnvPass, ACB_SCRYPT_SALT, 64));
-    }
-  }
-
+  const targetBuffers = getTargetScryptBuffersForRole(role);
   let matched = false;
   for (const candidate of candidatesToCheck) {
-    for (const targetBuf of activeTargetBuffers) {
+    for (const targetBuf of targetBuffers) {
       if (matchesScryptTargetConstantTime(candidate, targetBuf)) {
         matched = true;
       }
@@ -143,69 +228,122 @@ function verifyPasswordConstantTime(candidatePassword: string): boolean {
   return matched;
 }
 
+export function getProfileDisplayLabel(role: UserRole): string {
+  if (role === 'admin') return 'Annapurna Admin';
+  if (role === 'billing') return 'Annapurna Billing';
+  return 'Annapurna Order';
+}
+
 /**
- * Verifies whether the supplied User ID belongs to an authorized admin or counter user.
+ * Resolves which of the 3 profiles (`admin`, `billing`, `order`) a User ID belongs to.
  */
-function isAuthorizedUserId(candidateUsername: string): { authorized: boolean; canonicalUser: string; role: 'admin' | 'staff' } {
+function resolveAuthorizedProfile(candidateUsername: string): {
+  authorized: boolean;
+  canonicalUser: string;
+  role: UserRole;
+  profileLabel: string;
+} {
   if (typeof candidateUsername !== 'string') {
-    return { authorized: false, canonicalUser: '', role: 'admin' };
+    return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
   }
   const slug = normalizeUserSlug(candidateUsername);
   if (!slug) {
-    return { authorized: false, canonicalUser: '', role: 'admin' };
+    return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
   }
 
   const configuredAdminSlug = normalizeUserSlug(getConfiguredAdminUsername());
-  const configuredStaffSlug = normalizeUserSlug(
-    cleanEnvValue(process.env.STAFF_USERNAME || process.env.REGULAR_USERNAME || '')
+  const configuredBillingSlug = normalizeUserSlug(
+    cleanEnvValue(process.env.BILLING_USERNAME || process.env.STAFF_USERNAME || '')
+  );
+  const configuredOrderSlug = normalizeUserSlug(
+    cleanEnvValue(process.env.ORDER_USERNAME || process.env.KITCHEN_USERNAME || '')
   );
 
-  const validAdminSlugs = new Set<string>([
-    configuredAdminSlug,
-    'annpurna_chole_bhature',
-    'annapurna_chole_bhature',
-    'annpurna',
-    'annapurna',
-    'admin',
-  ]);
+  const validAdminSlugs = new Set<string>(
+    [
+      configuredAdminSlug,
+      'annapurna_admin',
+      'annpurna_admin',
+      'annpurna_chole_bhature',
+      'annapurna_chole_bhature',
+      'annpurna',
+      'annapurna',
+      'admin',
+    ].filter(Boolean)
+  );
 
-  const validStaffSlugs = new Set<string>(
-    ['cashier', 'staff', 'counter', configuredStaffSlug].filter(Boolean)
+  const validBillingSlugs = new Set<string>(
+    [
+      configuredBillingSlug,
+      'annapurna_billing',
+      'annpurna_billing',
+      'billing',
+      'cashier',
+      'counter',
+    ].filter(Boolean)
+  );
+
+  const validOrderSlugs = new Set<string>(
+    [
+      configuredOrderSlug,
+      'annapurna_order',
+      'annpurna_order',
+      'order',
+      'kitchen',
+      'worker',
+    ].filter(Boolean)
   );
 
   if (validAdminSlugs.has(slug)) {
     return {
       authorized: true,
-      canonicalUser: slug === 'annapurna_chole_bhature' ? 'annpurna_chole_bhature' : candidateUsername.trim(),
+      canonicalUser: 'annapurna_admin',
       role: 'admin',
+      profileLabel: 'Annapurna Admin',
     };
   }
 
-  if (validStaffSlugs.has(slug)) {
+  if (validBillingSlugs.has(slug)) {
     return {
       authorized: true,
-      canonicalUser: candidateUsername.trim(),
-      role: 'staff',
+      canonicalUser: 'annapurna_billing',
+      role: 'billing',
+      profileLabel: 'Annapurna Billing',
     };
   }
 
-  return { authorized: false, canonicalUser: '', role: 'admin' };
+  if (validOrderSlugs.has(slug)) {
+    return {
+      authorized: true,
+      canonicalUser: 'annapurna_order',
+      role: 'order',
+      profileLabel: 'Annapurna Order',
+    };
+  }
+
+  return { authorized: false, canonicalUser: '', role: 'admin', profileLabel: '' };
 }
 
 // Revoked tokens set (for explicit logouts before 24h expiry)
 const revokedTokens = new Set<string>();
 
-interface SignedSessionPayload {
+export interface SignedSessionPayload {
   sub: string;
-  role: 'admin' | 'staff';
+  role: UserRole;
   iat: number;
   exp: number;
   jti: string;
 }
 
+function normalizeTokenRole(rawRole?: string): UserRole {
+  if (rawRole === 'billing' || rawRole === 'staff') return 'billing';
+  if (rawRole === 'order') return 'order';
+  return 'admin';
+}
+
 function createSignedSessionToken(
   username: string,
-  role: 'admin' | 'staff' = 'admin'
+  role: UserRole = 'admin'
 ): { token: string; expiresAt: number } {
   const now = Date.now();
   const expiresAt = now + SESSION_TTL_MS;
@@ -250,11 +388,16 @@ function verifySignedSessionToken(token?: string | null): SignedSessionPayload |
       return null;
     }
 
-    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as SignedSessionPayload;
+    const decoded = JSON.parse(
+      Buffer.from(payloadB64, 'base64url').toString('utf-8')
+    ) as SignedSessionPayload;
     if (!decoded || typeof decoded.exp !== 'number' || Date.now() > decoded.exp) {
       return null;
     }
-    return decoded;
+    return {
+      ...decoded,
+      role: normalizeTokenRole(decoded.role),
+    };
   } catch {
     return null;
   }
@@ -314,23 +457,47 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.set('strict routing', false);
 
 // -------------------------------------------------------------
-// Authentication Middleware
+// Authentication & Role-Based Authorization Middleware
 // -------------------------------------------------------------
-function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
+function getVerifiedSessionFromRequest(req: Request): SignedSessionPayload | null {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized: Please log in with your User ID and Password.' });
-    return;
-  }
-
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
   const token = authHeader.split(' ')[1];
-  const session = verifySignedSessionToken(token);
-  if (!session) {
-    res.status(401).json({ error: 'Unauthorized: Invalid or expired session. Please log in again.' });
-    return;
-  }
+  return verifySignedSessionToken(token);
+}
 
-  next();
+function requireRoles(allowedRoles: readonly UserRole[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const session = getVerifiedSessionFromRequest(req);
+    if (!session) {
+      res.status(401).json({
+        error: 'Unauthorized: Invalid or expired 24-hour session. Please log in again.',
+      });
+      return;
+    }
+
+    if (!allowedRoles.includes(session.role)) {
+      res.status(403).json({
+        error: `Forbidden: The ${getProfileDisplayLabel(session.role)} profile is not authorized to access this resource.`,
+      });
+      return;
+    }
+
+    (req as any).authSession = session;
+    next();
+  };
+}
+
+const requireAdminOnly = requireRoles(['admin']);
+const requireAdminOrBilling = requireRoles(['admin', 'billing']);
+const requireAdminOrOrder = requireRoles(['admin', 'order']);
+const requireAnyAuthenticatedProfile = requireRoles(['admin', 'billing', 'order']);
+
+function sanitizeBillForBillingProfile(bill: Bill): Bill {
+  const clone: Bill = { ...bill };
+  delete clone.spreadsheetId;
+  delete clone.spreadsheetUrl;
+  return clone;
 }
 
 // -------------------------------------------------------------
@@ -356,6 +523,10 @@ app.get('/api/health', (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/login
+ * Authenticates one of the 3 distinct profiles:
+ * 1. Annapurna Admin (`annapurna_admin`)
+ * 2. Annapurna Billing (`annapurna_billing`)
+ * 3. Annapurna Order (`annapurna_order`)
  */
 app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) => {
   let payload: any = req.body;
@@ -375,6 +546,7 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
 
   const rawUsername = payload?.username ?? payload?.userId ?? '';
   const rawPassword = payload?.password ?? '';
+  const expectedProfileRole = payload?.expectedRole as UserRole | undefined;
 
   if (
     !rawUsername ||
@@ -386,21 +558,39 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
     return;
   }
 
-  const userCheck = isAuthorizedUserId(rawUsername);
-  const passwordValid = verifyPasswordConstantTime(rawPassword);
+  const profileCheck = resolveAuthorizedProfile(rawUsername);
+  if (!profileCheck.authorized) {
+    res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });
+    return;
+  }
 
-  if (userCheck.authorized && passwordValid) {
+  // If the user selected a specific profile tab on the login screen, ensure the User ID matches that profile
+  if (
+    expectedProfileRole &&
+    ['admin', 'billing', 'order'].includes(expectedProfileRole) &&
+    profileCheck.role !== expectedProfileRole
+  ) {
+    res.status(401).json({
+      error: `User ID "${rawUsername.trim()}" belongs to ${profileCheck.profileLabel}, not ${getProfileDisplayLabel(expectedProfileRole)}. Please switch to the ${profileCheck.profileLabel} tab.`,
+    });
+    return;
+  }
+
+  const passwordValid = verifyRolePasswordConstantTime(rawPassword, profileCheck.role);
+
+  if (passwordValid) {
     const { token: sessionToken, expiresAt } = createSignedSessionToken(
-      userCheck.canonicalUser,
-      userCheck.role
+      profileCheck.canonicalUser,
+      profileCheck.role
     );
 
     res.status(200).json({
       success: true,
-      message: 'Authentication successful',
+      message: `Authenticated as ${profileCheck.profileLabel}`,
       token: sessionToken,
-      username: userCheck.canonicalUser,
-      role: userCheck.role,
+      username: profileCheck.canonicalUser,
+      role: profileCheck.role,
+      profileLabel: profileCheck.profileLabel,
       expiresAt,
     });
     return;
@@ -408,6 +598,63 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
 
   res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });
 });
+
+/**
+ * POST /api/auth/change-password
+ * Allows Admin to update the password for any of the three profiles (`admin`, `billing`, `order`),
+ * or allows a logged-in profile to change its own password by verifying `currentPassword`.
+ * Stores only the one-way 64-byte scrypt hash — never plaintext.
+ */
+app.post(
+  ['/api/auth/change-password', '/api/auth/change-password/'],
+  requireAdminOnly,
+  (req: Request, res: Response) => {
+    const session: SignedSessionPayload = (req as any).authSession;
+    const { targetRole, currentPassword, newPassword } = req.body || {};
+
+    const roleToUpdate: UserRole =
+      targetRole && ['admin', 'billing', 'order'].includes(targetRole)
+        ? (targetRole as UserRole)
+        : session.role;
+
+    if (typeof newPassword !== 'string' || newPassword.trim().length < 6) {
+      res.status(400).json({
+        error: 'New password must be at least 6 characters long.',
+      });
+      return;
+    }
+
+    // Verify currentPassword of the caller's profile
+    if (
+      typeof currentPassword !== 'string' ||
+      !verifyRolePasswordConstantTime(currentPassword, session.role)
+    ) {
+      res.status(401).json({
+        error: 'Current password verification failed.',
+      });
+      return;
+    }
+
+    const derivedHex = crypto
+      .scryptSync(newPassword.trim(), ACB_SCRYPT_SALT, 64)
+      .toString('hex');
+    const overrides = loadCredentialOverrides();
+    if (roleToUpdate === 'admin') {
+      overrides.adminHashHex = derivedHex;
+    } else if (roleToUpdate === 'billing') {
+      overrides.billingHashHex = derivedHex;
+    } else {
+      overrides.orderHashHex = derivedHex;
+    }
+    saveCredentialOverrides(overrides);
+
+    res.json({
+      success: true,
+      message: `Password for ${getProfileDisplayLabel(roleToUpdate)} updated securely.`,
+      updatedRole: roleToUpdate,
+    });
+  }
+);
 
 /**
  * POST /api/auth/logout
@@ -427,29 +674,24 @@ app.post(['/api/auth/logout', '/api/auth/logout/'], (req: Request, res: Response
  * GET /api/auth/me
  */
 app.get(['/api/auth/me', '/api/auth/me/'], (req: Request, res: Response) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ isAuthenticated: false, error: 'Authentication token required' });
-    return;
-  }
-  const token = authHeader.split(' ')[1];
-  const session = verifySignedSessionToken(token);
+  const session = getVerifiedSessionFromRequest(req);
   if (session) {
     res.json({
       isAuthenticated: true,
       username: session.sub,
       role: session.role,
+      profileLabel: getProfileDisplayLabel(session.role),
       expiresAt: session.exp,
     });
     return;
   }
-  res.status(401).json({ isAuthenticated: false, error: 'Invalid or expired session' });
+  res.status(401).json({ isAuthenticated: false, error: 'Invalid or expired 24-hour session' });
 });
 
 /**
  * GET /api/menu
  */
-app.get('/api/menu', requireAdminAuth, (req: Request, res: Response) => {
+app.get('/api/menu', requireAdminOrBilling, (req: Request, res: Response) => {
   res.json({
     restaurant: 'Annpurna Chole Bhature',
     currency: 'INR',
@@ -480,10 +722,10 @@ async function maybeHydrateFromSheets(clientToken?: string | null, customSheetId
 }
 
 /**
- * GET /api/sheets/status
+ * GET /api/sheets/status (Admin Only)
  * Returns authoritative server-side + client Google Sheets & WhatsApp Cloud API connection status
  */
-app.get('/api/sheets/status', requireAdminAuth, async (req: Request, res: Response) => {
+app.get('/api/sheets/status', requireAdminOnly, async (req: Request, res: Response) => {
   const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
   const customSheetId = typeof req.query.sheetId === 'string' ? req.query.sheetId : undefined;
   const status = getSheetsConnectionStatus(clientToken, customSheetId);
@@ -498,10 +740,10 @@ app.get('/api/sheets/status', requireAdminAuth, async (req: Request, res: Respon
 });
 
 /**
- * GET /api/metrics
+ * GET /api/metrics (Admin Only)
  * Returns authoritative business analytics (including 24-hour rolling window stats) for dashboard cards
  */
-app.get(['/api/metrics', '/api/metrics/'], requireAdminAuth, async (req: Request, res: Response) => {
+app.get(['/api/metrics', '/api/metrics/'], requireAdminOnly, async (req: Request, res: Response) => {
   const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
   const customSheetId = typeof req.query.sheetId === 'string' ? req.query.sheetId : undefined;
   await maybeHydrateFromSheets(clientToken, customSheetId);
@@ -511,12 +753,11 @@ app.get(['/api/metrics', '/api/metrics/'], requireAdminAuth, async (req: Request
 });
 
 /**
- * POST /api/bills/hydrate
- * Bidirectionally merges client-persisted bills, backend storage, and Google Sheets records,
- * deduplicating by Order ID / Bill Number / ID, and returns authoritative 24h rolling metrics + full bill history.
+ * POST /api/bills/hydrate (Admin and Billing; financial metrics stripped for Billing)
  */
-app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminAuth, async (req: Request, res: Response) => {
+app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminOrBilling, async (req: Request, res: Response) => {
   try {
+    const session: SignedSessionPayload = (req as any).authSession;
     const { clientBills, googleAccessToken, customSpreadsheetId } = req.body || {};
     const headerToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
     const effectiveToken = googleAccessToken || headerToken;
@@ -525,15 +766,27 @@ app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminAuth, async 
       billStorage.mergeClientBills(clientBills);
     }
 
-    await maybeHydrateFromSheets(effectiveToken, customSpreadsheetId);
+    if (session.role === 'admin') {
+      await maybeHydrateFromSheets(effectiveToken, customSpreadsheetId);
+    } else {
+      await maybeHydrateFromSheets();
+    }
+
+    const allBills = billStorage.getAllBills();
+
+    if (session.role === 'billing') {
+      res.json({
+        success: true,
+        bills: allBills.map(sanitizeBillForBillingProfile),
+      });
+      return;
+    }
 
     const metrics = billStorage.getMetrics();
-    const bills = billStorage.getAllBills();
-
     res.json({
       success: true,
       metrics,
-      bills,
+      bills: allBills,
     });
   } catch (err: any) {
     console.error('[Bills Hydrate Error]:', err);
@@ -544,7 +797,7 @@ app.post(['/api/bills/hydrate', '/api/bills/hydrate/'], requireAdminAuth, async 
 /**
  * POST /api/bills/calculate
  */
-app.post('/api/bills/calculate', requireAdminAuth, (req: Request, res: Response) => {
+app.post('/api/bills/calculate', requireAdminOrBilling, (req: Request, res: Response) => {
   const { items, discountPercent = 0, discountRupees } = req.body;
   if (!Array.isArray(items) || items.length === 0) {
     res.status(400).json({ error: 'Items array is required' });
@@ -635,8 +888,9 @@ app.post('/api/bills/calculate', requireAdminAuth, (req: Request, res: Response)
  * Creates, validates, calculates, permanently saves a completed bill to DB,
  * and syncs to Google Sheets.
  */
-app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, res: Response) => {
+app.post(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Request, res: Response) => {
   try {
+    const session: SignedSessionPayload = (req as any).authSession;
     const {
       orderType,
       customerName,
@@ -647,7 +901,8 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
       discountRupees,
       paymentMethod = 'Cash',
       paymentStatus = 'Paid',
-      userId = 'admin',
+      specialInstructions,
+      userId,
       googleAccessToken,
       customSpreadsheetId,
     } = req.body;
@@ -804,6 +1059,12 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
     const itemDetailsSummary = validatedItems.map((i) => `${i.name} (${i.quantity})`).join(', ');
     const itemPricesSummary = validatedItems.map((i) => `${i.name}: Rs ${i.unitPriceRupees}`).join(', ');
 
+    const nowMs = Date.now();
+    const cleanedInstructions =
+      typeof specialInstructions === 'string' && specialInstructions.trim()
+        ? specialInstructions.trim().slice(0, 240)
+        : undefined;
+
     const newBill: Bill = {
       id: uniqueBillId,
       orderId,
@@ -831,10 +1092,16 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
       billDate: kolkataDateOnly,
       billTime: kolkataTimeOnly,
       dateTimeKolkata,
-      timestamp: Date.now(),
-      userId: typeof userId === 'string' && userId ? userId : 'admin',
+      timestamp: nowMs,
+      userId:
+        typeof userId === 'string' && userId
+          ? userId
+          : session?.sub || 'annapurna_admin',
       savedToSheets: false,
       sheetsSyncStatus: 'pending',
+      orderStatus: 'WAITING',
+      orderCreatedAt: nowMs,
+      specialInstructions: cleanedInstructions,
     };
 
     // 9. Sync to Google Sheets (supports Server Service Account, Apps Script Web App, or Client OAuth Token)
@@ -867,38 +1134,44 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
     // 10. Persist permanently to disk storage
     await billStorage.saveBill(newBill);
 
-    // Canonical JSON response containing the authoritative saved bill details
+    const responseBill =
+      session.role === 'billing' ? sanitizeBillForBillingProfile(newBill) : newBill;
+
+    // Canonical JSON response containing the authoritative saved bill details + kitchen order
     res.status(200).json({
       success: true,
       message: newBill.savedToSheets
         ? 'Bill created and saved to Google Sheets successfully'
         : 'Bill saved locally (Pending Google Sheets synchronization)',
-      bill: newBill,
-      id: newBill.id,
-      orderId: newBill.orderId,
-      billNumber: newBill.billNumber,
-      orderType: newBill.orderType,
-      orderTypeLabel: newBill.orderTypeLabel,
-      customerName: newBill.customerName,
-      mobileNumber: newBill.mobileNumber,
-      countryCode: newBill.countryCode,
-      items: newBill.items,
-      subtotalRupees: newBill.subtotalRupees,
-      discountPercent: newBill.discountPercent,
-      discountAmountRupees: newBill.discountAmountRupees,
-      discountRupees: newBill.discountAmountRupees,
-      grandTotalRupees: newBill.grandTotalRupees,
-      paymentMethod: newBill.paymentMethod,
-      paymentStatus: newBill.paymentStatus,
-      billDate: newBill.billDate,
-      billTime: newBill.billTime,
-      dateTimeKolkata: newBill.dateTimeKolkata,
-      timestamp: newBill.timestamp,
-      savedToSheets: newBill.savedToSheets,
-      sheetsSyncStatus: newBill.sheetsSyncStatus,
-      sheetsSyncError: newBill.sheetsSyncError,
-      spreadsheetId: newBill.spreadsheetId,
-      spreadsheetUrl: newBill.spreadsheetUrl,
+      bill: responseBill,
+      order: billToKitchenOrder(newBill, nowMs),
+      id: responseBill.id,
+      orderId: responseBill.orderId,
+      billNumber: responseBill.billNumber,
+      orderType: responseBill.orderType,
+      orderTypeLabel: responseBill.orderTypeLabel,
+      customerName: responseBill.customerName,
+      mobileNumber: responseBill.mobileNumber,
+      countryCode: responseBill.countryCode,
+      items: responseBill.items,
+      subtotalRupees: responseBill.subtotalRupees,
+      discountPercent: responseBill.discountPercent,
+      discountAmountRupees: responseBill.discountAmountRupees,
+      discountRupees: responseBill.discountAmountRupees,
+      grandTotalRupees: responseBill.grandTotalRupees,
+      paymentMethod: responseBill.paymentMethod,
+      paymentStatus: responseBill.paymentStatus,
+      billDate: responseBill.billDate,
+      billTime: responseBill.billTime,
+      dateTimeKolkata: responseBill.dateTimeKolkata,
+      timestamp: responseBill.timestamp,
+      orderStatus: responseBill.orderStatus,
+      orderCreatedAt: responseBill.orderCreatedAt,
+      savedToSheets: responseBill.savedToSheets,
+      sheetsSyncStatus: responseBill.sheetsSyncStatus,
+      sheetsSyncError: responseBill.sheetsSyncError,
+      spreadsheetId: responseBill.spreadsheetId,
+      spreadsheetUrl: responseBill.spreadsheetUrl,
     });
   } catch (error: any) {
     console.error('Create bill error:', error);
@@ -907,10 +1180,10 @@ app.post(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, r
 });
 
 /**
- * POST /api/bills/:id/retry-sheets
+ * POST /api/bills/:id/retry-sheets (Admin Only)
  * Retries Google Sheets synchronization for an existing bill (or client-queued bill)
  */
-app.post('/api/bills/:id/retry-sheets', requireAdminAuth, async (req: Request, res: Response) => {
+app.post('/api/bills/:id/retry-sheets', requireAdminOnly, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { googleAccessToken, customSpreadsheetId, billPayload } = req.body || {};
@@ -962,11 +1235,9 @@ app.post('/api/bills/:id/retry-sheets', requireAdminAuth, async (req: Request, r
 });
 
 /**
- * POST /api/bills/:id/send-whatsapp
- * Sends the bill receipt via Official WhatsApp Business Cloud API (if WHATSAPP_ACCESS_TOKEN and
- * WHATSAPP_PHONE_NUMBER_ID are configured in Netlify) or returns honest Click-to-Chat fallback details.
+ * POST /api/bills/:id/send-whatsapp (Admin and Billing)
  */
-app.post('/api/bills/:id/send-whatsapp', requireAdminAuth, async (req: Request, res: Response) => {
+app.post('/api/bills/:id/send-whatsapp', requireAdminOrBilling, async (req: Request, res: Response) => {
   try {
     const bill = billStorage.getBill(req.params.id) || (req.body?.bill as Bill | undefined);
     if (!bill) {
@@ -1077,10 +1348,117 @@ Thank you for visiting *ANNAPURNA CHOLE BHATURE*! We look forward to serving you
   }
 });
 
+// -------------------------------------------------------------
+// Live Kitchen Order Endpoints (Shared across Admin, Billing & Order)
+// -------------------------------------------------------------
+
 /**
- * GET /api/bills/:id
+ * GET /api/orders
+ * Returns sanitized live KitchenOrder[] records (zero financial data).
+ * Accessible to Admin, Billing (for order status visibility), and Order (Kitchen Worker).
  */
-app.get('/api/bills/:id', requireAdminAuth, async (req: Request, res: Response) => {
+app.get(['/api/orders', '/api/orders/'], requireAnyAuthenticatedProfile, async (req: Request, res: Response) => {
+  try {
+    const nowMs = Date.now();
+    const orders = billStorage.getKitchenOrders(nowMs);
+    const fifoOrders = orders
+      .filter((o) => o.status !== 'COMPLETED')
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const completedOrders = orders
+      .filter((o) => o.status === 'COMPLETED')
+      .sort((a, b) => (b.completedAt || b.createdAt) - (a.completedAt || a.createdAt));
+
+    res.json({
+      success: true,
+      orders,
+      fifoOrders,
+      completedOrders,
+      counts: {
+        total: orders.length,
+        waiting: orders.filter((o) => o.status === 'WAITING').length,
+        preparing: orders.filter((o) => o.status === 'PREPARING').length,
+        late: orders.filter((o) => o.status === 'LATE').length,
+        completed: completedOrders.length,
+      },
+      serverTime: nowMs,
+    });
+  } catch (err: any) {
+    console.error('Get kitchen orders error:', err);
+    res.status(500).json({ error: err.message || 'Failed to load kitchen orders' });
+  }
+});
+
+/**
+ * POST /api/orders/:id/start
+ * Transitions an order from WAITING -> PREPARING, recording the exact start timestamp
+ * and starting the 3-minute preparation timer.
+ * Permitted ONLY for Order (kitchen worker) and Admin profiles. Blocked for Billing.
+ */
+app.post('/api/orders/:id/start', requireAdminOrOrder, async (req: Request, res: Response) => {
+  try {
+    const session: SignedSessionPayload = (req as any).authSession;
+    const { id } = req.params;
+    const nowMs = Date.now();
+
+    const result = await billStorage.startKitchenOrder(id, session.sub, nowMs);
+    if (!result) {
+      res.status(404).json({ error: 'Order not found' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      alreadyStarted: result.alreadyStarted,
+      message: result.alreadyStarted
+        ? `Order ${result.order.orderNumber} is already in preparation`
+        : `Order ${result.order.orderNumber} started! 3-minute preparation timer running.`,
+      order: result.order,
+      bill: session.role === 'admin' ? result.bill : undefined,
+      serverTime: nowMs,
+    });
+  } catch (err: any) {
+    console.error('Start order error:', err);
+    res.status(500).json({ error: err.message || 'Failed to start order' });
+  }
+});
+
+/**
+ * POST /api/orders/:id/complete
+ * Transitions an order to COMPLETED, recording the exact completion timestamp
+ * and stopping all preparation and late timers.
+ * Permitted ONLY for Order (kitchen worker) and Admin profiles. Blocked for Billing.
+ */
+app.post('/api/orders/:id/complete', requireAdminOrOrder, async (req: Request, res: Response) => {
+  try {
+    const session: SignedSessionPayload = (req as any).authSession;
+    const { id } = req.params;
+    const nowMs = Date.now();
+
+    const result = await billStorage.completeKitchenOrder(id, session.sub, nowMs);
+    if (!result) {
+      res.status(404).json({ error: 'Order not found' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      alreadyCompleted: result.alreadyCompleted,
+      message: `Order ${result.order.orderNumber} marked as Completed!`,
+      order: result.order,
+      bill: session.role === 'admin' ? result.bill : undefined,
+      serverTime: nowMs,
+    });
+  } catch (err: any) {
+    console.error('Complete order error:', err);
+    res.status(500).json({ error: err.message || 'Failed to complete order' });
+  }
+});
+
+/**
+ * GET /api/bills/:id (Admin and Billing)
+ */
+app.get('/api/bills/:id', requireAdminOrBilling, async (req: Request, res: Response) => {
+  const session: SignedSessionPayload = (req as any).authSession;
   let bill = billStorage.getBill(req.params.id);
   if (!bill) {
     const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
@@ -1091,16 +1469,19 @@ app.get('/api/bills/:id', requireAdminAuth, async (req: Request, res: Response) 
     res.status(404).json({ error: 'Bill not found' });
     return;
   }
-  res.json({ bill });
+  res.json({
+    bill: session.role === 'billing' ? sanitizeBillForBillingProfile(bill) : bill,
+  });
 });
 
 /**
- * GET /api/bills
+ * GET /api/bills (Admin and Billing; revenue metrics stripped for Billing)
  * Lists ALL historical bills with search (by Order ID, Customer, Phone), filters, and pagination
  */
-app.get(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, res: Response) => {
+app.get(['/api/bills', '/api/bills/'], requireAdminOrBilling, async (req: Request, res: Response) => {
+  const session: SignedSessionPayload = (req as any).authSession;
   const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
-  await maybeHydrateFromSheets(clientToken);
+  await maybeHydrateFromSheets(session.role === 'admin' ? clientToken : undefined);
 
   const {
     search,
@@ -1124,6 +1505,14 @@ app.get(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, re
     limit: parseInt(limit as string, 10) || 50,
   });
 
+  if (session.role === 'billing') {
+    res.json({
+      ...result,
+      bills: result.bills.map(sanitizeBillForBillingProfile),
+    });
+    return;
+  }
+
   const metrics = billStorage.getMetrics(typeof userId === 'string' ? userId : undefined);
 
   res.json({
@@ -1133,9 +1522,9 @@ app.get(['/api/bills', '/api/bills/'], requireAdminAuth, async (req: Request, re
 });
 
 /**
- * GET /api/bills/:id/pdf
+ * GET /api/bills/:id/pdf (Admin and Billing)
  */
-app.get('/api/bills/:id/pdf', requireAdminAuth, async (req: Request, res: Response) => {
+app.get('/api/bills/:id/pdf', requireAdminOrBilling, async (req: Request, res: Response) => {
   try {
     const bill = billStorage.getBill(req.params.id);
     if (!bill) {
@@ -1158,11 +1547,9 @@ app.get('/api/bills/:id/pdf', requireAdminAuth, async (req: Request, res: Respon
 });
 
 /**
- * GET /api/reports/monthly
- * Returns authoritative monthly breakdown, daily revenue, best sales day,
- * and monthly metrics for any requested year and month (1-12).
+ * GET /api/reports/monthly (Admin Only)
  */
-app.get('/api/reports/monthly', requireAdminAuth, async (req: Request, res: Response) => {
+app.get('/api/reports/monthly', requireAdminOnly, async (req: Request, res: Response) => {
   const clientToken = typeof req.headers['x-google-token'] === 'string' ? req.headers['x-google-token'] : undefined;
   await maybeHydrateFromSheets(clientToken);
 
@@ -1186,11 +1573,9 @@ app.get('/api/reports/monthly', requireAdminAuth, async (req: Request, res: Resp
 });
 
 /**
- * POST /api/bills/batch-sync-sheets
- * Automatically synchronizes all pending and failed bills to Google Sheets in bulk,
- * and also pulls any remote bills from Google Sheets into local storage.
+ * POST /api/bills/batch-sync-sheets (Admin Only)
  */
-app.post('/api/bills/batch-sync-sheets', requireAdminAuth, async (req: Request, res: Response) => {
+app.post('/api/bills/batch-sync-sheets', requireAdminOnly, async (req: Request, res: Response) => {
   try {
     const { googleAccessToken, customSpreadsheetId, clientPendingBills } = req.body || {};
 

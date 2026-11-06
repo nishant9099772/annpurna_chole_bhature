@@ -8,16 +8,20 @@
  * `https://annpurnacholebhature.netlify.app`) as the production API base URL for all backend requests.
  *
  * Key Guarantees:
- * 1. Production Base URL: Every backend request is resolved via `resolveApiUrl('/api/...')` / `apiFetch('/api/...')`
+ * 1. Production Base URL: On the deployed Netlify website and inside the Android Capacitor APK,
+ *    every backend request is resolved via `resolveApiUrl('/api/...')` / `apiFetch('/api/...')`
  *    against `import.meta.env.VITE_API_BASE_URL` (`https://annpurnacholebhature.netlify.app`).
  *    No relative `/api/...` paths are ever sent in the Android Capacitor app.
- * 2. Infinite loading protection: Every `/api/*` request is guarded by an `AbortController` timeout
+ * 2. Local Preview Compatibility: When running on the local Express dev/preview server
+ *    (`localhost:3000` or `*.run.app`), requests route directly to the local Express backend
+ *    so newly implemented features can be tested without overwriting production prematurely.
+ * 3. Infinite loading protection: Every `/api/*` request is guarded by an `AbortController` timeout
  *    (12s for standard endpoints, 20s for Google Sheets sync endpoints) so Android WebView requests
  *    can never hang indefinitely.
- * 3. Cross-origin CORS compatibility: Uses stateless `Authorization: Bearer <token>` headers with
+ * 4. Cross-origin CORS compatibility: Uses stateless `Authorization: Bearer <token>` headers with
  *    `credentials: 'omit'` and `mode: 'cors'` on cross-origin requests so Netlify's CORS headers
  *    work seamlessly with Android WebView and standard browsers.
- * 4. Resilient JSON parsing: Always parses HTTP 200 JSON payloads even when Android WebView bridges
+ * 5. Resilient JSON parsing: Always parses HTTP 200 JSON payloads even when Android WebView bridges
  *    alter or omit `Content-Type` headers, while accurately detecting HTML SPA fallbacks.
  */
 
@@ -107,6 +111,24 @@ export function isCapacitorOrAndroidWebView(): boolean {
 }
 
 /**
+ * Detects whether the browser is running on the local Express development/preview server
+ * (e.g. `localhost:3000` or `*.run.app`), as opposed to Capacitor Android or Netlify production.
+ */
+function isLocalExpressDevOrPreviewHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (isCapacitorOrAndroidWebView()) return false;
+  const hostname = (window.location?.hostname || '').toLowerCase();
+  const port = window.location?.port || '';
+  if ((hostname === 'localhost' || hostname === '127.0.0.1') && port !== '') {
+    return true;
+  }
+  if (hostname.endsWith('.run.app')) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Returns the active production Netlify API base URL (`import.meta.env.VITE_API_BASE_URL` or custom override).
  */
 export function getConfiguredApiBaseUrl(): string {
@@ -151,20 +173,32 @@ export function setConfiguredApiBaseUrl(url: string): string {
 }
 
 /**
- * Resolves any `/api/...` endpoint to the full production Netlify URL using `import.meta.env.VITE_API_BASE_URL`.
- * Ensures relative `/api/...` paths are never used in the Android Capacitor app.
+ * Resolves any `/api/...` endpoint to the full backend URL.
+ * - On Netlify & Android Capacitor APK: Always uses `import.meta.env.VITE_API_BASE_URL` (`https://annpurnacholebhature.netlify.app`).
+ * - On local Express dev/preview (`localhost:3000` / `*.run.app`): Uses `window.location.origin` unless a custom URL override is saved.
  */
 export function resolveApiUrl(pathOrUrl: string): string {
   if (!pathOrUrl || typeof pathOrUrl !== 'string') return pathOrUrl;
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
 
   const cleanPath = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
+
+  if (isLocalExpressDevOrPreviewHost()) {
+    const customOverride =
+      typeof window !== 'undefined' && window.localStorage
+        ? normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_URL_STORAGE_KEY))
+        : '';
+    if (!customOverride && typeof window !== 'undefined' && window.location?.origin) {
+      return `${window.location.origin}${cleanPath}`;
+    }
+  }
+
   const baseUrl = getConfiguredApiBaseUrl() || API_BASE_URL;
   return `${baseUrl}${cleanPath}`;
 }
 
 /**
- * Executes an API request against the production Netlify backend URL (`import.meta.env.VITE_API_BASE_URL`).
+ * Executes an API request against the resolved backend URL (`import.meta.env.VITE_API_BASE_URL` in production/Android).
  * Works identically on both the Netlify website and the Android Capacitor APK.
  */
 export function apiFetch(endpoint: string, init?: RequestInit): Promise<Response> {
@@ -335,7 +369,7 @@ let fetchInterceptorInstalled = false;
  * Installs a global `window.fetch` wrapper for all backend API requests.
  *
  * - Ensures any `/api/*` request is always resolved to the full production Netlify URL
- *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`).
+ *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`) in production & Android APK.
  * - Enforces an `AbortController` timeout on every API call so Android WebView requests never hang forever.
  * - Uses `credentials: 'omit'` and `mode: 'cors'` on cross-origin requests so Bearer token auth
  *   works across Capacitor (`https://localhost`) -> Netlify (`https://annpurnacholebhature.netlify.app`) without CORS failures.
@@ -445,6 +479,12 @@ export function installCapacitorApiFetchInterceptor(): void {
           }
           return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
         }
+      }
+
+      // If inside Capacitor and the remote Netlify server has not yet been redeployed with /api/orders,
+      // fall back to the local Capacitor API engine for 404 on /api/orders
+      if (inCapacitor && response.status === 404 && apiPathWithQuery.startsWith('/api/orders')) {
+        return handleCapacitorLocalApiRequest(apiPathWithQuery, init);
       }
 
       return response;

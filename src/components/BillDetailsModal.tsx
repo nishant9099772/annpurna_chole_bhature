@@ -12,8 +12,9 @@ import {
   AlertCircle,
   RefreshCw,
   Printer,
+  ChefHat,
 } from 'lucide-react';
-import { Bill } from '../types/billing';
+import { Bill, UserRole } from '../types/billing';
 import {
   generateBillPdfBytes,
   createBillPdfBlobUrl,
@@ -29,6 +30,7 @@ interface BillDetailsModalProps {
   onRetrySync?: (bill: Bill) => void;
   isRetryingSync?: boolean;
   onPreviewPdf?: () => void;
+  userRole?: UserRole;
 }
 
 export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
@@ -37,6 +39,7 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
   onShareWhatsApp,
   onRetrySync,
   isRetryingSync,
+  userRole = 'admin',
 }) => {
   if (!bill) return null;
 
@@ -60,6 +63,8 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
   const discAmt =
     bill.discountAmountRupees !== undefined ? bill.discountAmountRupees : bill.discountRupees || 0;
   const isSynced = bill.savedToSheets === true && bill.sheetsSyncStatus === 'synced';
+  const isAdmin = userRole === 'admin';
+  const orderStatus = bill.orderStatus || 'WAITING';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-5 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
@@ -83,6 +88,20 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
                   }`}
                 >
                   {bill.orderTypeLabel}
+                </span>
+                <span
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1 ${
+                    orderStatus === 'COMPLETED'
+                      ? 'bg-emerald-100 text-emerald-900'
+                      : orderStatus === 'LATE'
+                      ? 'bg-rose-600 text-white'
+                      : orderStatus === 'PREPARING'
+                      ? 'bg-blue-100 text-blue-900'
+                      : 'bg-amber-100 text-amber-900'
+                  }`}
+                >
+                  <ChefHat className="w-3 h-3" />
+                  <span>{orderStatus}</span>
                 </span>
               </div>
               <p className="text-[11px] sm:text-xs text-slate-500 font-mono mt-0.5 truncate">
@@ -190,51 +209,53 @@ export const BillDetailsModal: React.FC<BillDetailsModalProps> = ({
             </div>
           </div>
 
-          {/* Sync Status Banner */}
-          <div className="p-3 rounded-lg border flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs bg-white">
-            <div className="flex items-start sm:items-center gap-2 min-w-0">
-              {isSynced ? (
-                <>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5 sm:mt-0" />
-                  <div className="min-w-0">
-                    <span className="font-bold text-emerald-800">Saved in Google Sheets</span>
-                    {bill.spreadsheetUrl && (
-                      <a
-                        href={bill.spreadsheetUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline text-[11px] flex items-center gap-1"
-                      >
-                        <span>Open Spreadsheet</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5 sm:mt-0" />
-                  <div className="min-w-0">
-                    <span className="font-bold text-amber-900">Saved Locally — Pending Sheets Sync</span>
-                    <p className="text-[11px] text-slate-500 break-words">
-                      {bill.sheetsSyncError || 'Not yet recorded in connected Google Sheet'}
-                    </p>
-                  </div>
-                </>
+          {/* Sync Status Banner (Admin Only) */}
+          {isAdmin && (
+            <div className="p-3 rounded-lg border flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs bg-white">
+              <div className="flex items-start sm:items-center gap-2 min-w-0">
+                {isSynced ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5 sm:mt-0" />
+                    <div className="min-w-0">
+                      <span className="font-bold text-emerald-800">Saved in Google Sheets</span>
+                      {bill.spreadsheetUrl && (
+                        <a
+                          href={bill.spreadsheetUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline text-[11px] flex items-center gap-1"
+                        >
+                          <span>Open Spreadsheet</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5 sm:mt-0" />
+                    <div className="min-w-0">
+                      <span className="font-bold text-amber-900">Saved Locally — Pending Sheets Sync</span>
+                      <p className="text-[11px] text-slate-500 break-words">
+                        {bill.sheetsSyncError || 'Not yet recorded in connected Google Sheet'}
+                      </p>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {!isSynced && onRetrySync && (
+                <button
+                  onClick={() => onRetrySync(bill)}
+                  disabled={isRetryingSync}
+                  className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold rounded-md text-xs flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer shrink-0 self-end sm:self-center"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRetryingSync ? 'animate-spin' : ''}`} />
+                  <span>{isRetryingSync ? 'Syncing...' : 'Retry Sync'}</span>
+                </button>
               )}
             </div>
-
-            {!isSynced && onRetrySync && (
-              <button
-                onClick={() => onRetrySync(bill)}
-                disabled={isRetryingSync}
-                className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold rounded-md text-xs flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer shrink-0 self-end sm:self-center"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isRetryingSync ? 'animate-spin' : ''}`} />
-                <span>{isRetryingSync ? 'Syncing...' : 'Retry Sync'}</span>
-              </button>
-            )}
-          </div>
+          )}
         </div>
 
         {/* Modal Actions Footer */}

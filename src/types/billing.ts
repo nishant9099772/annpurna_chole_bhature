@@ -1,6 +1,7 @@
 /**
- * Annpurna Chole Bhature - Billing & Receipt Types
- * Light mode, English-only concise copy, strict integer paise money representation.
+ * Annpurna Chole Bhature - Billing, Receipt & Kitchen Order Types
+ * Light mode, English-only concise copy, strict integer paise money representation,
+ * and three-profile Role-Based Access Control (Admin, Billing, Order).
  */
 
 export type MenuItemKey = 'CHOLE_BHATURE' | 'LASSI' | 'CHOLE' | 'BHATURE' | 'COLD_DRINK';
@@ -10,6 +11,15 @@ export type OrderType = 'DINE_IN' | 'PACK';
 export type PaymentMethod = 'Cash' | 'UPI' | 'Card';
 
 export type SyncStatus = 'synced' | 'syncing' | 'failed' | 'pending';
+
+export type UserRole = 'admin' | 'billing' | 'order';
+
+export type KitchenOrderStatus = 'WAITING' | 'PREPARING' | 'LATE' | 'COMPLETED';
+
+/**
+ * 3-minute (180,000 ms) target preparation time before an active order is automatically marked LATE.
+ */
+export const PREP_TIME_LIMIT_MS = 3 * 60 * 1000;
 
 export interface MenuItemDefinition {
   key: MenuItemKey;
@@ -116,6 +126,50 @@ export interface Bill {
   spreadsheetUrl?: string;
   sheetRowBills?: number;
   pdfUrl?: string;
+
+  // Kitchen Order Lifecycle & Timestamps (shared across Admin, Billing, and Order profiles)
+  orderStatus?: KitchenOrderStatus;
+  orderCreatedAt?: number;
+  orderStartedAt?: number;
+  orderLateAt?: number;
+  orderCompletedAt?: number;
+  specialInstructions?: string;
+  startedBy?: string;
+  completedBy?: string;
+}
+
+/**
+ * Sanitized Kitchen Order representation containing ZERO financial, pricing, discount,
+ * revenue, or Google Sheets fields. Safe for the Order (Kitchen/Worker) profile.
+ */
+export interface KitchenOrderItem {
+  id: string;
+  itemKey: MenuItemKey;
+  name: string;
+  quantity: number;
+}
+
+export interface KitchenOrder {
+  id: string; // matches Bill.id
+  orderId: string; // e.g. ORD-20260330-9481
+  billNumber: string; // e.g. ACB-20260330-0001
+  orderNumber: string; // prominent short display number e.g. "#0001"
+  orderType: OrderType;
+  orderTypeLabel: 'DINE-IN' | 'PACKING';
+  customerName: string;
+  items: KitchenOrderItem[];
+  totalQuantity: number;
+  specialInstructions?: string;
+  status: KitchenOrderStatus;
+  createdAt: number;
+  createdTimeFormatted: string;
+  startedAt?: number;
+  startedTimeFormatted?: string;
+  lateAt?: number;
+  completedAt?: number;
+  completedTimeFormatted?: string;
+  startedBy?: string;
+  completedBy?: string;
 }
 
 export interface CreateBillRequest {
@@ -132,6 +186,7 @@ export interface CreateBillRequest {
   discountRupees?: number; // backward compatibility
   paymentMethod?: PaymentMethod;
   paymentStatus?: 'Paid' | 'Pending';
+  specialInstructions?: string;
   userId?: string;
   googleAccessToken?: string;
   customSpreadsheetId?: string;
@@ -140,7 +195,9 @@ export interface CreateBillRequest {
 export interface AuthUser {
   username: string;
   token: string;
-  role: 'admin';
+  role: UserRole;
+  profileLabel?: string;
+  expiresAt?: number;
 }
 
 export interface BusinessMetrics {

@@ -283,6 +283,19 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
           normalizedBill.sheetsSyncStatus === 'synced'
       );
 
+      const statusRank: Record<string, number> = {
+        WAITING: 1,
+        PREPARING: 2,
+        LATE: 3,
+        COMPLETED: 4,
+      };
+      const prevRank = statusRank[prev.orderStatus || 'WAITING'] || 1;
+      const nextRank = statusRank[normalizedBill.orderStatus || 'WAITING'] || 1;
+      const mergedOrderStatus =
+        nextRank > prevRank
+          ? normalizedBill.orderStatus
+          : prev.orderStatus || normalizedBill.orderStatus || 'WAITING';
+
       const merged: Bill = {
         ...normalizedBill,
         ...prev,
@@ -299,6 +312,14 @@ export function deduplicateBills(bills: Bill[]): Bill[] {
           Array.isArray(prev.items) && prev.items.length > 0
             ? prev.items
             : normalizedBill.items || [],
+        orderStatus: mergedOrderStatus,
+        orderCreatedAt: prev.orderCreatedAt || normalizedBill.orderCreatedAt || preferTimestamp,
+        orderStartedAt: prev.orderStartedAt || normalizedBill.orderStartedAt,
+        orderLateAt: prev.orderLateAt || normalizedBill.orderLateAt,
+        orderCompletedAt: prev.orderCompletedAt || normalizedBill.orderCompletedAt,
+        startedBy: prev.startedBy || normalizedBill.startedBy,
+        completedBy: prev.completedBy || normalizedBill.completedBy,
+        specialInstructions: prev.specialInstructions || normalizedBill.specialInstructions,
       };
 
       byCanonicalKey.set(existingCanonicalKey, merged);

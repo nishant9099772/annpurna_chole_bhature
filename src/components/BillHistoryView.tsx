@@ -13,11 +13,15 @@ import {
   ChevronLeft,
   ChevronRight,
   Receipt,
+  Clock,
+  Timer,
+  AlertTriangle,
 } from 'lucide-react';
-import { Bill } from '../types/billing';
+import { Bill, UserRole } from '../types/billing';
 import { BillDetailsModal } from './BillDetailsModal';
 import { CopyMobileButton } from './CopyMobileButton';
 import { formatCustomerNameWithJi } from '../utils/customerFormat';
+import { computeOrderTimers } from '../utils/orderTimers';
 import {
   hydrateAndSyncBillsWithServer,
   loadPersistentBills,
@@ -29,6 +33,7 @@ import { apiFetch, parseApiJsonResponse } from '../utils/apiClient';
 interface BillHistoryViewProps {
   adminToken: string;
   googleToken: string | null;
+  userRole?: UserRole;
   onShareWhatsApp: (bill: Bill) => void;
   onRefreshMetrics?: () => void;
 }
@@ -36,12 +41,15 @@ interface BillHistoryViewProps {
 export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
   adminToken,
   googleToken,
+  userRole = 'admin',
   onShareWhatsApp,
   onRefreshMetrics,
 }) => {
+  const isAdmin = userRole === 'admin';
   const [bills, setBills] = useState<Bill[]>(() => loadPersistentBills().slice(0, 20));
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   // Filters & Search
   const [searchTerm, setSearchTerm] = useState('');
@@ -59,6 +67,15 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
   // Selected Bill for Full Modal Inspection
   const [selectedBillForDetails, setSelectedBillForDetails] = useState<Bill | null>(null);
   const [retryingBillId, setRetryingBillId] = useState<string | null>(null);
+
+  // 1-second timer tick for live order prep & late timers inside Bill History
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // Hydrate once on mount (throttled via persistentBillsStorage)
   useEffect(() => {
@@ -84,7 +101,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         if (searchTerm.trim()) params.append('search', searchTerm.trim());
         if (selectedOrderType !== 'all') params.append('orderType', selectedOrderType);
         if (selectedPaymentMethod !== 'all') params.append('paymentMethod', selectedPaymentMethod);
-        if (selectedSyncStatus !== 'all') params.append('syncStatus', selectedSyncStatus);
+        if (isAdmin && selectedSyncStatus !== 'all') params.append('syncStatus', selectedSyncStatus);
         if (selectedDateFilter !== 'all') params.append('dateFilter', selectedDateFilter);
 
         const res = await apiFetch(`/api/bills?${params.toString()}`, {
@@ -121,6 +138,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     [
       adminToken,
       googleToken,
+      isAdmin,
       searchTerm,
       selectedOrderType,
       selectedPaymentMethod,
@@ -129,7 +147,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     ]
   );
 
-  // Refetch when filters or search change (debounced)
+  // Refetch when filters or search change (debounced) + periodic live status refresh
   useEffect(() => {
     const timeout = setTimeout(() => {
       fetchBills(1, false);
@@ -137,8 +155,17 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     return () => clearTimeout(timeout);
   }, [fetchBills]);
 
-  // Handle Retry Sync (Android APK -> Netlify Backend -> Google Sheets API)
+  useEffect(() => {
+    const livePoll = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchBills(currentPage, false);
+    }, 5000);
+    return () => clearInterval(livePoll);
+  }, [fetchBills, currentPage]);
+
+  // Handle Retry Sync (Admin Only)
   const handleRetrySync = async (bill: Bill) => {
+    if (!isAdmin) return;
     setRetryingBillId(bill.id);
     setErrorMessage(null);
     try {
@@ -212,7 +239,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
     searchTerm.trim() !== '' ||
     selectedOrderType !== 'all' ||
     selectedPaymentMethod !== 'all' ||
-    selectedSyncStatus !== 'all' ||
+    (isAdmin && selectedSyncStatus !== 'all') ||
     selectedDateFilter !== 'all';
 
   return (
@@ -247,7 +274,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
             onClick={() => fetchBills(currentPage, true)}
             disabled={isLoading}
             className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0 disabled:opacity-50"
-            title="Refresh from Server & Google Sheets"
+            title="Refresh Bills & Order Status"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">Refresh</span>
@@ -301,19 +328,21 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
             </select>
           </div>
 
-          {/* Sync Status Filter */}
-          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-700">
-            <CheckCircle2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-            <select
-              value={selectedSyncStatus}
-              onChange={(e) => setSelectedSyncStatus(e.target.value)}
-              className="w-full bg-transparent focus:outline-hidden text-xs font-semibold cursor-pointer text-slate-800"
-            >
-              <option value="all">All Sync States</option>
-              <option value="synced">Synced</option>
-              <option value="failed">Pending Sync</option>
-            </select>
-          </div>
+          {/* Sync Status Filter (Admin Only) */}
+          {isAdmin && (
+            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-700">
+              <CheckCircle2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <select
+                value={selectedSyncStatus}
+                onChange={(e) => setSelectedSyncStatus(e.target.value)}
+                className="w-full bg-transparent focus:outline-hidden text-xs font-semibold cursor-pointer text-slate-800"
+              >
+                <option value="all">All Sync States</option>
+                <option value="synced">Synced</option>
+                <option value="failed">Pending Sync</option>
+              </select>
+            </div>
+          )}
 
           {hasActiveFilters && (
             <button
@@ -376,13 +405,14 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
             {bills.map((bill) => {
               const isSynced = bill.sheetsSyncStatus === 'synced' || bill.savedToSheets;
               const isRetrying = retryingBillId === bill.id;
+              const timers = computeOrderTimers(bill, nowMs);
 
               return (
                 <div
                   key={bill.id}
                   className="p-3.5 sm:p-4 hover:bg-slate-50/80 transition flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 sm:gap-3"
                 >
-                  {/* Left Column: Order ID, Type, Customer */}
+                  {/* Left Column: Order ID, Type, Kitchen Order Status & Timer, Customer */}
                   <div className="space-y-1 min-w-0">
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="font-mono font-bold text-xs text-blue-800 bg-blue-50 border border-blue-200/60 px-2 py-0.5 rounded">
@@ -403,17 +433,47 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                         {bill.paymentMethod || 'Cash'}
                       </span>
 
-                      {isSynced ? (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200/60 px-2 py-0.5 rounded">
-                          <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                          <span>Synced</span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200/60 px-2 py-0.5 rounded">
-                          <AlertCircle className="w-3 h-3 text-amber-600" />
-                          <span>Pending Sync</span>
+                      {/* Live Kitchen Order Status & Timer Badge */}
+                      {timers.status === 'WAITING' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-amber-100 text-amber-900 px-2 py-0.5 rounded">
+                          <Clock className="w-3 h-3" />
+                          <span>Kitchen: Waiting</span>
                         </span>
                       )}
+                      {timers.status === 'PREPARING' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-blue-100 text-blue-900 px-2 py-0.5 rounded font-mono">
+                          <Timer className="w-3 h-3" />
+                          <span>Preparing ({timers.prepTimerFormatted})</span>
+                        </span>
+                      )}
+                      {timers.status === 'LATE' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-rose-600 text-white px-2 py-0.5 rounded font-mono">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>
+                            LATE ({timers.prepTimerFormatted} • {timers.lateTimerFormatted})
+                          </span>
+                        </span>
+                      )}
+                      {timers.status === 'COMPLETED' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-100 text-emerald-900 px-2 py-0.5 rounded">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-700" />
+                          <span>Order Completed ({timers.prepTimerFormatted})</span>
+                        </span>
+                      )}
+
+                      {/* Google Sheets Sync Badge (Admin Only) */}
+                      {isAdmin &&
+                        (isSynced ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200/60 px-2 py-0.5 rounded">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                            <span>Sheets Synced</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200/60 px-2 py-0.5 rounded">
+                            <AlertCircle className="w-3 h-3 text-amber-600" />
+                            <span>Pending Sheets</span>
+                          </span>
+                        ))}
                     </div>
 
                     <div className="flex items-center gap-1.5 text-xs text-slate-600 pt-0.5 flex-wrap">
@@ -458,7 +518,7 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
                     </div>
 
                     <div className="flex items-center gap-1.5">
-                      {!isSynced && (
+                      {isAdmin && !isSynced && (
                         <button
                           onClick={() => handleRetrySync(bill)}
                           disabled={isRetrying}
@@ -531,8 +591,9 @@ export const BillHistoryView: React.FC<BillHistoryViewProps> = ({
         bill={selectedBillForDetails}
         onClose={() => setSelectedBillForDetails(null)}
         onShareWhatsApp={onShareWhatsApp}
-        onRetrySync={handleRetrySync}
+        onRetrySync={isAdmin ? handleRetrySync : undefined}
         isRetryingSync={retryingBillId === selectedBillForDetails?.id}
+        userRole={userRole}
       />
     </div>
   );
