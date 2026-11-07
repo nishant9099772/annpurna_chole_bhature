@@ -438,6 +438,44 @@ const AUTHORITATIVE_PRICES_PAISE: Record<Exclude<MenuItemKey, 'COLD_DRINK'>, num
   BHATURE: 2500,       // Rs 25.00
 };
 
+// Normalize incoming Netlify Function & Capacitor paths (/.netlify/functions/api/*, /api/api/*, etc.)
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  let rawUrl = req.url || '/';
+  const qIndex = rawUrl.indexOf('?');
+  let pathname = qIndex !== -1 ? rawUrl.slice(0, qIndex) : rawUrl;
+  const search = qIndex !== -1 ? rawUrl.slice(qIndex) : '';
+
+  pathname = pathname.replace(/\/{2,}/g, '/');
+
+  while (pathname.startsWith('/.netlify/functions/api')) {
+    pathname = pathname.slice('/.netlify/functions/api'.length) || '/';
+  }
+  while (pathname.startsWith('/api/api/') || pathname === '/api/api') {
+    pathname = '/api' + pathname.slice('/api/api'.length);
+  }
+
+  const knownBareApiPrefixes = [
+    '/auth/',
+    '/health',
+    '/orders',
+    '/bills',
+    '/metrics',
+    '/sheets/',
+    '/menu',
+    '/reports/',
+    '/admin/',
+  ];
+  if (
+    !pathname.startsWith('/api') &&
+    knownBareApiPrefixes.some((p) => pathname === p || pathname.startsWith(p))
+  ) {
+    pathname = `/api${pathname}`;
+  }
+
+  req.url = `${pathname}${search}`;
+  next();
+});
+
 // CORS & Preflight Middleware for API routes (ensures Netlify & Capacitor Android WebView compatibility)
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.url.startsWith('/api')) {
@@ -458,7 +496,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.text({ type: ['text/*', 'application/octet-stream'], limit: '2mb' }));
 
 // Handle malformed JSON body parser errors with a clean 400 JSON response instead of HTML
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
@@ -531,7 +571,7 @@ function sanitizeBillForBillingProfile(bill: Bill): Bill {
 /**
  * GET /api/health
  */
-app.get('/api/health', (req: Request, res: Response) => {
+app.get(['/api/health', '/api/health/'], (req: Request, res: Response) => {
   res.json({
     status: 'UP',
     service: 'annpurna-chole-bhature-billing-api',
@@ -546,18 +586,29 @@ app.get('/api/health', (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/auth/login
+ * POST /api/auth/login (also handles GET /api/auth/login if a native HTTP redirect converted POST -> GET)
  * Authenticates one of the 3 distinct profiles:
  * 1. Annapurna Admin (`annapurna_admin`)
  * 2. Annapurna Billing (`annapurna_billing`)
  * 3. Annapurna Order (`annapurna_order`)
  */
-app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) => {
+const handleAuthLogin = (req: Request, res: Response): void => {
   let payload: any = req.body;
   if (typeof payload === 'string') {
-    try {
-      payload = JSON.parse(payload);
-    } catch {
+    const trimmed = payload.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        payload = JSON.parse(trimmed);
+      } catch {
+        payload = {};
+      }
+    } else if (trimmed.includes('=')) {
+      try {
+        payload = Object.fromEntries(new URLSearchParams(trimmed).entries());
+      } catch {
+        payload = {};
+      }
+    } else {
       payload = {};
     }
   } else if (Buffer.isBuffer(payload)) {
@@ -568,9 +619,34 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
     }
   }
 
-  const rawUsername = payload?.username ?? payload?.userId ?? '';
-  const rawPassword = payload?.password ?? '';
-  const expectedProfileRole = payload?.expectedRole as UserRole | undefined;
+  let rawUsername = payload?.username ?? payload?.userId ?? '';
+  let rawPassword = payload?.password ?? '';
+  let expectedProfileRole = payload?.expectedRole as UserRole | undefined;
+
+  // Fallback: if CapacitorHttp / Android HttpURLConnection converted POST -> GET or dropped body,
+  // check standard HTTP Basic Authorization header (`Authorization: Basic <base64(username:password)>`)
+  const authHeader = req.headers.authorization;
+  if (
+    (!rawUsername || !rawPassword) &&
+    typeof authHeader === 'string' &&
+    authHeader.startsWith('Basic ')
+  ) {
+    try {
+      const b64 = authHeader.slice(6).trim();
+      const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+      const colonIdx = decoded.indexOf(':');
+      if (colonIdx > 0) {
+        if (!rawUsername) rawUsername = decoded.slice(0, colonIdx);
+        if (!rawPassword) rawPassword = decoded.slice(colonIdx + 1);
+      }
+    } catch {
+      // ignore malformed Basic header
+    }
+  }
+
+  if (!expectedProfileRole && typeof req.query?.expectedRole === 'string') {
+    expectedProfileRole = req.query.expectedRole as UserRole;
+  }
 
   if (
     !rawUsername ||
@@ -633,7 +709,10 @@ app.post(['/api/auth/login', '/api/auth/login/'], (req: Request, res: Response) 
   }
 
   res.status(401).json({ error: 'Invalid User ID or Password. Access denied.' });
-});
+};
+
+app.post(['/api/auth/login', '/api/auth/login/', '/auth/login'], handleAuthLogin);
+app.get(['/api/auth/login', '/api/auth/login/', '/auth/login'], handleAuthLogin);
 
 /**
  * POST /api/auth/change-password

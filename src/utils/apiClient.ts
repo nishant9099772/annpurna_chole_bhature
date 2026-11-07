@@ -477,6 +477,82 @@ export function getLastAndroidApiFailure(): AndroidApiDiagnostic | null {
 }
 
 /**
+/**
+ * Extracts a secret-safe error summary from a non-2xx HTTP response body for Android diagnostics.
+ */
+async function extractSafeResponseErrorDetail(response: Response): Promise<string> {
+  try {
+    const cloned = typeof response.clone === 'function' ? response.clone() : response;
+    const text = (await cloned.text()).trim();
+    if (!text) return `HTTP ${response.status} (empty body)`;
+    if (isHtmlPayload(text)) return `HTTP ${response.status} (HTML fallback page)`;
+    try {
+      const parsed = JSON.parse(text);
+      const errField = parsed?.error || parsed?.message;
+      if (typeof errField === 'string' && errField.trim()) {
+        return `HTTP ${response.status}: ${errField.trim().slice(0, 140)}`;
+      }
+    } catch {
+      // not JSON
+    }
+    const sanitized = text.replace(/[\r\n]+/g, ' ').slice(0, 120);
+    return `HTTP ${response.status}: ${sanitized}`;
+  } catch {
+    return `HTTP ${response.status}`;
+  }
+}
+
+/**
+ * Returns true when an HTTP 404 or 405 on `apiPathWithQuery` indicates a routing or transport rewrite issue
+ * (rather than an item-level "Order not found" / "Bill not found" response), meaning the client should
+ * fall through to the next transport or direct `/.netlify/functions/api/*` endpoint.
+ */
+function isRouting404Or405(status: number, apiPathWithQuery: string): boolean {
+  if (status !== 404 && status !== 405) return false;
+  const cleanPath = apiPathWithQuery.split('?')[0].replace(/\/+$/, '');
+  const staticEndpoints = new Set([
+    '/api/auth/login',
+    '/api/auth/me',
+    '/api/auth/logout',
+    '/api/auth/change-password',
+    '/api/health',
+    '/api/orders',
+    '/api/bills',
+    '/api/bills/calculate',
+    '/api/bills/hydrate',
+    '/api/bills/batch-sync-sheets',
+    '/api/metrics',
+    '/api/sheets/status',
+    '/api/menu',
+    '/api/reports/monthly',
+    '/api/admin/reset-sales',
+    '/api/admin/reset-audit',
+  ]);
+  return staticEndpoints.has(cleanPath);
+}
+
+/**
+ * Converts a resolved `https://<host>/api/...` URL into its direct Netlify Function URL
+ * `https://<host>/.netlify/functions/api/...` so requests can bypass CDN `/api/*` redirect edge issues if needed.
+ */
+function buildDirectNetlifyFunctionUrl(resolvedApiUrl: string): string | null {
+  try {
+    const u = new URL(resolvedApiUrl);
+    if (u.pathname.startsWith('/api/')) {
+      u.pathname = '/.netlify/functions/api/' + u.pathname.slice('/api/'.length);
+      return u.toString();
+    }
+    if (u.pathname === '/api') {
+      u.pathname = '/.netlify/functions/api';
+      return u.toString();
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
  * Executes an HTTP request using Capacitor's built-in native `CapacitorHttp` plugin if available.
  * Runs in native Android Java (`HttpURLConnection`), completely bypassing `WebViewLocalServer.shouldInterceptRequest`
  * and WebView CORS limitations while preserving `Authorization`, `Content-Type`, and JSON request bodies.
@@ -494,12 +570,21 @@ async function executeCapacitorNativeHttp(
     win.Capacitor?.Plugins?.CapacitorHttp ||
     win.CapacitorCustomPlatform?.plugins?.CapacitorHttp;
 
-  if (!capHttp || typeof capHttp.request !== 'function') {
+  if (!capHttp || (typeof capHttp.request !== 'function' && typeof capHttp.post !== 'function')) {
     return null;
   }
 
+  const normalizedMethod = (method || 'GET').toUpperCase();
+  const reqHeaders: Record<string, string> = { ...headers };
+  if (!reqHeaders['Accept']) {
+    reqHeaders['Accept'] = 'application/json';
+  }
+
   let dataPayload: any = undefined;
-  if (method !== 'GET' && method !== 'HEAD') {
+  if (normalizedMethod !== 'GET' && normalizedMethod !== 'HEAD') {
+    if (!reqHeaders['Content-Type']) {
+      reqHeaders['Content-Type'] = 'application/json';
+    }
     if (bodyString && bodyString.trim().length > 0) {
       try {
         dataPayload = JSON.parse(bodyString);
@@ -511,14 +596,22 @@ async function executeCapacitorNativeHttp(
     }
   }
 
-  const capRes = await capHttp.request({
+  const requestOptions: Record<string, any> = {
     url,
-    method,
-    headers,
-    ...(dataPayload !== undefined ? { data: dataPayload } : {}),
+    method: normalizedMethod,
+    headers: reqHeaders,
+    responseType: 'text',
     connectTimeout: timeoutMs,
     readTimeout: timeoutMs,
-  });
+    ...(dataPayload !== undefined ? { data: dataPayload, dataType: 'json' } : {}),
+  };
+
+  const capRes =
+    normalizedMethod === 'POST' && typeof capHttp.post === 'function'
+      ? await capHttp.post(requestOptions)
+      : normalizedMethod === 'GET' && typeof capHttp.get === 'function'
+      ? await capHttp.get(requestOptions)
+      : await capHttp.request(requestOptions);
 
   if (!capRes || typeof capRes.status !== 'number') {
     return null;
@@ -550,8 +643,8 @@ async function executeCapacitorNativeHttp(
 }
 
 /**
- * Executes an HTTP request via standard `XMLHttpRequest` as a resilient fallback when
- * Android WebView `window.fetch` throws `TypeError: Failed to fetch`.
+ * Executes an HTTP request via `XMLHttpRequest` (preferring Capacitor's unpatched `CapacitorWebXMLHttpRequest`
+ * when available) as a resilient fallback when Android WebView `window.fetch` throws `TypeError: Failed to fetch`.
  */
 function executeXhrFetch(
   url: string,
@@ -561,26 +654,37 @@ function executeXhrFetch(
   timeoutMs: number
 ): Promise<Response> {
   return new Promise((resolve, reject) => {
-    if (typeof XMLHttpRequest === 'undefined') {
+    const win = typeof window !== 'undefined' ? (window as any) : undefined;
+    const XhrCtor =
+      win?.CapacitorWebXMLHttpRequest?.constructor ||
+      (typeof XMLHttpRequest !== 'undefined' ? XMLHttpRequest : undefined);
+
+    if (!XhrCtor) {
       reject(new Error('XMLHttpRequest is not available'));
       return;
     }
 
-    const xhr = new XMLHttpRequest();
-    xhr.open(method, url, true);
+    const xhr = new XhrCtor();
+    const openFn = win?.CapacitorWebXMLHttpRequest?.open || xhr.open;
+    const setHeaderFn = win?.CapacitorWebXMLHttpRequest?.setRequestHeader || xhr.setRequestHeader;
+    const sendFn = win?.CapacitorWebXMLHttpRequest?.send || xhr.send;
+
+    openFn.call(xhr, (method || 'GET').toUpperCase(), url, true);
     xhr.timeout = timeoutMs;
     xhr.withCredentials = false;
 
     for (const [k, v] of Object.entries(headers)) {
       try {
-        xhr.setRequestHeader(k, v);
+        setHeaderFn.call(xhr, k, v);
       } catch {
         // ignore restricted header names
       }
     }
 
     xhr.onload = () => {
-      const contentType = xhr.getResponseHeader('content-type') || 'application/json; charset=utf-8';
+      const contentType =
+        (typeof xhr.getResponseHeader === 'function' && xhr.getResponseHeader('content-type')) ||
+        'application/json; charset=utf-8';
       resolve(
         new Response(xhr.responseText ?? '', {
           status: xhr.status || 200,
@@ -603,10 +707,11 @@ function executeXhrFetch(
     };
 
     try {
-      if (method !== 'GET' && method !== 'HEAD' && bodyString !== undefined) {
-        xhr.send(bodyString);
+      const upperMethod = (method || 'GET').toUpperCase();
+      if (upperMethod !== 'GET' && upperMethod !== 'HEAD' && bodyString !== undefined) {
+        sendFn.call(xhr, bodyString);
       } else {
-        xhr.send();
+        sendFn.call(xhr);
       }
     } catch (sendErr) {
       reject(sendErr);
@@ -623,6 +728,8 @@ let fetchInterceptorInstalled = false;
  *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`) in production & Android APK.
  * - Uses plain `Record<string, string>` headers and explicit stringified bodies so `Authorization`,
  *   `Content-Type`, and JSON request bodies survive across WebView `fetch`, `CapacitorHttp`, and `XMLHttpRequest`.
+ * - Automatically falls through across `capacitor-http` -> `web-fetch` -> `bare-fetch` -> `xhr` AND
+ *   direct `/.netlify/functions/api/*` URL if any transport throws or returns an unexpected routing 404.
  * - Never substitutes local offline responses for `/api/auth/login`, `/api/auth/me`, or `/api/sheets/status`.
  */
 export function installCapacitorApiFetchInterceptor(): void {
@@ -630,7 +737,12 @@ export function installCapacitorApiFetchInterceptor(): void {
   if (fetchInterceptorInstalled) return;
   fetchInterceptorInstalled = true;
 
+  const win = window as any;
   const originalFetch = window.fetch.bind(window);
+  const unpatchedWebFetch: typeof window.fetch =
+    typeof win.CapacitorWebFetch === 'function'
+      ? win.CapacitorWebFetch.bind(window)
+      : originalFetch;
 
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     let rawUrl = '';
@@ -708,6 +820,31 @@ export function installCapacitorApiFetchInterceptor(): void {
       }
     }
 
+    // For /api/auth/login over HTTPS, also attach standard RFC 7617 Basic Auth header as a backup
+    // so if an Android native HTTP redirect or bridge ever strips POST body or converts POST -> GET,
+    // the backend still receives the credentials securely over TLS.
+    if (
+      apiPathWithQuery.startsWith('/api/auth/login') &&
+      bodyString &&
+      !plainHeaders['Authorization'] &&
+      typeof window.btoa === 'function'
+    ) {
+      try {
+        const parsedBody = JSON.parse(bodyString);
+        const uName = parsedBody?.username || parsedBody?.userId;
+        const uPass = parsedBody?.password;
+        if (typeof uName === 'string' && typeof uPass === 'string' && uName && uPass) {
+          const utf8Bytes = encodeURIComponent(`${uName}:${uPass}`).replace(
+            /%([0-9A-F]{2})/g,
+            (_, p1) => String.fromCharCode(parseInt(p1, 16))
+          );
+          plainHeaders['Authorization'] = `Basic ${window.btoa(utf8Bytes)}`;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     const isSheetsHeavyRoute =
       apiPathWithQuery.includes('/batch-sync-sheets') ||
       apiPathWithQuery.includes('/retry-sheets') ||
@@ -730,6 +867,7 @@ export function installCapacitorApiFetchInterceptor(): void {
     const transportsAttempted: string[] = [];
 
     const executeStandardFetch = async (
+      targetUrl: string,
       attemptTimeoutMs: number,
       useBareOptions: boolean
     ): Promise<Response> => {
@@ -758,7 +896,7 @@ export function installCapacitorApiFetchInterceptor(): void {
               signal: controller.signal,
               ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
             };
-        return await originalFetch(resolvedUrl, fetchInit);
+        return await unpatchedWebFetch(targetUrl, fetchInit);
       } finally {
         clearTimeout(timeoutId);
         if (callerSignal) {
@@ -767,18 +905,24 @@ export function installCapacitorApiFetchInterceptor(): void {
       }
     };
 
-    const runMultiTransportAttempt = async (): Promise<{
+    const runMultiTransportOnUrl = async (
+      targetUrl: string,
+      labelSuffix: string
+    ): Promise<{
       response: Response;
       transport: string;
+      wasRouting404: boolean;
     }> => {
       let lastError: any = null;
+      let fallbackRouting404: { response: Response; transport: string } | null = null;
 
       // 1. On Android Capacitor, try native CapacitorHttp first if available on window.Capacitor
       if (inCapacitor) {
         try {
-          transportsAttempted.push('capacitor-http');
+          const tName = `capacitor-http${labelSuffix}`;
+          transportsAttempted.push(tName);
           const capRes = await executeCapacitorNativeHttp(
-            resolvedUrl,
+            targetUrl,
             method,
             plainHeaders,
             bodyString,
@@ -790,7 +934,10 @@ export function installCapacitorApiFetchInterceptor(): void {
               .text()
               .catch(() => '');
             if (!isHtmlPayload(text)) {
-              return { response: capRes, transport: 'capacitor-http' };
+              if (!isRouting404Or405(capRes.status, apiPathWithQuery)) {
+                return { response: capRes, transport: tName, wasRouting404: false };
+              }
+              fallbackRouting404 = { response: capRes, transport: tName };
             }
           }
         } catch (capErr: any) {
@@ -798,10 +945,11 @@ export function installCapacitorApiFetchInterceptor(): void {
         }
       }
 
-      // 2. Standard window.fetch with CORS & AbortController
+      // 2. Unpatched WebView / Browser window.fetch with CORS & AbortController
       try {
-        transportsAttempted.push('fetch');
-        const stdRes = await executeStandardFetch(timeoutMs, false);
+        const tName = `fetch${labelSuffix}`;
+        transportsAttempted.push(tName);
+        const stdRes = await executeStandardFetch(targetUrl, timeoutMs, false);
         const text =
           typeof stdRes.clone === 'function'
             ? await stdRes
@@ -810,21 +958,25 @@ export function installCapacitorApiFetchInterceptor(): void {
                 .catch(() => '')
             : '';
         if (!isHtmlPayload(text)) {
-          return { response: stdRes, transport: 'fetch' };
+          if (!isRouting404Or405(stdRes.status, apiPathWithQuery)) {
+            return { response: stdRes, transport: tName, wasRouting404: false };
+          }
+          fallbackRouting404 = { response: stdRes, transport: tName };
+        } else {
+          lastError = new Error(
+            `Received unexpected HTML payload (HTTP ${stdRes.status}) from ${safeDiagUrl}`
+          );
         }
-        lastError = new Error(
-          `Received unexpected HTML payload (HTTP ${stdRes.status}) from ${safeDiagUrl}`
-        );
       } catch (fetchErr: any) {
         lastError = fetchErr;
       }
 
-      // 3. On Android Capacitor, if standard fetch failed (e.g. "TypeError: Failed to fetch"),
-      //    try bare fetch (without AbortSignal / credentials options) and then XMLHttpRequest
+      // 3. On Android Capacitor, try bare fetch (without AbortSignal / credentials options) and then XMLHttpRequest
       if (inCapacitor) {
         try {
-          transportsAttempted.push('bare-fetch');
-          const bareRes = await executeStandardFetch(timeoutMs, true);
+          const tName = `bare-fetch${labelSuffix}`;
+          transportsAttempted.push(tName);
+          const bareRes = await executeStandardFetch(targetUrl, timeoutMs, true);
           const text =
             typeof bareRes.clone === 'function'
               ? await bareRes
@@ -833,16 +985,20 @@ export function installCapacitorApiFetchInterceptor(): void {
                   .catch(() => '')
               : '';
           if (!isHtmlPayload(text)) {
-            return { response: bareRes, transport: 'bare-fetch' };
+            if (!isRouting404Or405(bareRes.status, apiPathWithQuery)) {
+              return { response: bareRes, transport: tName, wasRouting404: false };
+            }
+            fallbackRouting404 = { response: bareRes, transport: tName };
           }
         } catch (bareErr: any) {
           lastError = bareErr;
         }
 
         try {
-          transportsAttempted.push('xhr');
+          const tName = `xhr${labelSuffix}`;
+          transportsAttempted.push(tName);
           const xhrRes = await executeXhrFetch(
-            resolvedUrl,
+            targetUrl,
             method,
             plainHeaders,
             bodyString,
@@ -853,17 +1009,79 @@ export function installCapacitorApiFetchInterceptor(): void {
             .text()
             .catch(() => '');
           if (!isHtmlPayload(text)) {
-            return { response: xhrRes, transport: 'xhr' };
+            if (!isRouting404Or405(xhrRes.status, apiPathWithQuery)) {
+              return { response: xhrRes, transport: tName, wasRouting404: false };
+            }
+            fallbackRouting404 = { response: xhrRes, transport: tName };
+          } else {
+            lastError = new Error(
+              `XHR received unexpected HTML payload (HTTP ${xhrRes.status}) from ${safeDiagUrl}`
+            );
           }
-          lastError = new Error(
-            `XHR received unexpected HTML payload (HTTP ${xhrRes.status}) from ${safeDiagUrl}`
-          );
         } catch (xhrErr: any) {
           lastError = xhrErr;
         }
       }
 
+      if (fallbackRouting404) {
+        return {
+          response: fallbackRouting404.response,
+          transport: fallbackRouting404.transport,
+          wasRouting404: true,
+        };
+      }
+
       throw lastError || new Error('Network request failed');
+    };
+
+    const runMultiTransportAttempt = async (): Promise<{
+      response: Response;
+      transport: string;
+    }> => {
+      let primaryResult: {
+        response: Response;
+        transport: string;
+        wasRouting404: boolean;
+      } | null = null;
+      let primaryError: any = null;
+
+      try {
+        primaryResult = await runMultiTransportOnUrl(resolvedUrl, '');
+        if (!primaryResult.wasRouting404) {
+          return {
+            response: primaryResult.response,
+            transport: primaryResult.transport,
+          };
+        }
+      } catch (err: any) {
+        primaryError = err;
+      }
+
+      // If /api/* returned a routing 404/405 or threw a network error, try the direct
+      // Netlify Serverless Function URL (`/.netlify/functions/api/*`) as an automatic fallback.
+      const directFnUrl = buildDirectNetlifyFunctionUrl(resolvedUrl);
+      if (directFnUrl && directFnUrl !== resolvedUrl) {
+        try {
+          const fnResult = await runMultiTransportOnUrl(directFnUrl, '(direct-fn)');
+          if (!fnResult.wasRouting404 || !primaryResult) {
+            return {
+              response: fnResult.response,
+              transport: fnResult.transport,
+            };
+          }
+        } catch (fnErr: any) {
+          if (!primaryError) primaryError = fnErr;
+        }
+      }
+
+      if (primaryResult) {
+        return {
+          response: primaryResult.response,
+          transport: primaryResult.transport,
+        };
+      }
+
+      throw primaryError || new Error('Network request failed');
     };
 
     try {
@@ -879,6 +1097,7 @@ export function installCapacitorApiFetchInterceptor(): void {
       }
 
       const { response, transport } = result;
+      const errorDetail = response.ok ? null : await extractSafeResponseErrorDetail(response);
       recordAndroidDiagnostic({
         timestamp: new Date().toISOString(),
         method,
@@ -886,7 +1105,7 @@ export function installCapacitorApiFetchInterceptor(): void {
         status: response.status,
         transport,
         latencyMs: Date.now() - startMs,
-        error: response.ok ? null : `HTTP ${response.status}`,
+        error: errorDetail,
       });
 
       return response;
@@ -956,3 +1175,4 @@ export function installCapacitorApiFetchInterceptor(): void {
     }
   };
 }
+

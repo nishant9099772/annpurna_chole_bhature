@@ -26,6 +26,69 @@ function getLocalServerPort(): Promise<number> {
   return serverPromise;
 }
 
+function normalizeNetlifyEventPath(event: any): string {
+  const headers = event?.headers || {};
+  const headerOrigPath =
+    headers['x-nf-original-pathname'] ||
+    headers['X-Nf-Original-Pathname'] ||
+    headers['x-forwarded-uri'] ||
+    headers['X-Forwarded-Uri'] ||
+    '';
+
+  let rawUrlPath = '';
+  if (typeof event?.rawUrl === 'string' && event.rawUrl.trim()) {
+    try {
+      const parsed = new URL(event.rawUrl);
+      rawUrlPath = parsed.pathname || '';
+    } catch {
+      rawUrlPath = '';
+    }
+  }
+
+  let candidate = String(event?.path || '').trim();
+  if (
+    (!candidate ||
+      candidate === '/' ||
+      candidate === '/api' ||
+      candidate === '/api/' ||
+      candidate === '/.netlify/functions/api' ||
+      candidate === '/.netlify/functions/api/') &&
+    (rawUrlPath || headerOrigPath)
+  ) {
+    candidate = rawUrlPath || headerOrigPath;
+  }
+
+  if (!candidate) {
+    candidate = '/';
+  }
+
+  // Strip query string if accidentally attached to path
+  const qIdx = candidate.indexOf('?');
+  if (qIdx !== -1) {
+    candidate = candidate.slice(0, qIdx);
+  }
+
+  // Collapse consecutive slashes
+  candidate = candidate.replace(/\/{2,}/g, '/');
+
+  // Strip any leading /.netlify/functions/api prefix (even if repeated)
+  while (candidate.startsWith('/.netlify/functions/api')) {
+    candidate = candidate.slice('/.netlify/functions/api'.length) || '/';
+  }
+
+  // Collapse duplicate /api/api/... prefixes
+  while (candidate.startsWith('/api/api/') || candidate === '/api/api') {
+    candidate = '/api' + candidate.slice('/api/api'.length);
+  }
+
+  // Ensure canonical /api/... prefix
+  if (!candidate.startsWith('/api/') && candidate !== '/api') {
+    candidate = '/api' + (candidate.startsWith('/') ? candidate : `/${candidate}`);
+  }
+
+  return candidate;
+}
+
 export async function handler(event: any) {
   const reqOrigin = event?.headers?.origin || event?.headers?.Origin || '*';
   const corsHeaders: Record<string, string> = {
@@ -36,7 +99,12 @@ export async function handler(event: any) {
     'Access-Control-Expose-Headers': 'Content-Type',
   };
 
-  const method = (event?.httpMethod || 'GET').toUpperCase();
+  const method = (
+    event?.httpMethod ||
+    event?.requestContext?.http?.method ||
+    'GET'
+  ).toUpperCase();
+
   if (method === 'OPTIONS') {
     return {
       statusCode: 200,
@@ -51,13 +119,7 @@ export async function handler(event: any) {
   try {
     const port = await getLocalServerPort();
 
-    // Normalize path so /.netlify/functions/api/auth/login -> /api/auth/login
-    let rawPath: string = event.path || '/';
-    if (rawPath.startsWith('/.netlify/functions/api')) {
-      rawPath = '/api' + rawPath.slice('/.netlify/functions/api'.length);
-    } else if (!rawPath.startsWith('/api')) {
-      rawPath = '/api' + (rawPath.startsWith('/') ? rawPath : `/${rawPath}`);
-    }
+    const rawPath = normalizeNetlifyEventPath(event);
 
     const qs = event.rawQuery
       ? `?${event.rawQuery}`
@@ -92,7 +154,7 @@ export async function handler(event: any) {
       } else if (event.isBase64Encoded && typeof event.body === 'string') {
         body = Buffer.from(event.body, 'base64').toString('utf-8');
       } else {
-        body = event.body;
+        body = String(event.body);
       }
 
       const hasContentType = Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');

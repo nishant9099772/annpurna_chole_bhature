@@ -1,0 +1,6 @@
+# Route all /api/* requests to the Netlify Serverless Function (preserving path splat & HTTP method)
+/api/*  /.netlify/functions/api/:splat  200!
+/.netlify/functions/api/*  /.netlify/functions/api/:splat  200!
+
+# SPA fallback for frontend routes (must remain after /api/*)
+/*  /index.html  200

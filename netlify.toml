@@ -22,10 +22,20 @@
     Access-Control-Allow-Origin = "*"
     Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
     Access-Control-Allow-Headers = "Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin"
+    Access-Control-Expose-Headers = "Content-Type"
 
-# SPA fallback for frontend routes
+[[headers]]
+  for = "/.netlify/functions/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization, Accept, X-Google-Token, X-Requested-With, Origin"
+    Access-Control-Expose-Headers = "Content-Type"
+
+# SPA fallback for frontend routes (strictly after /api/*)
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+
 
