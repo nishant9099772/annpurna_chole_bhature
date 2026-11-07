@@ -515,11 +515,16 @@ function generateUniqueOrderId(billSeq: number): string {
 }
 
 function jsonResponse(status: number, data: unknown): Response {
-  return new Response(JSON.stringify(data), {
+  const payload =
+    data && typeof data === 'object' && !Array.isArray(data)
+      ? { ...(data as Record<string, unknown>), _source: 'local-offline-fallback', isOfflineFallback: true }
+      : data;
+  return new Response(JSON.stringify(payload), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      'X-Annapurna-Source': 'local-offline-fallback',
     },
   });
 }

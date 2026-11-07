@@ -62,6 +62,7 @@ import {
   setConfiguredApiBaseUrl,
   verifyNetlifyBackendUrl,
   isCapacitorOrAndroidWebView,
+  isOfflineFallbackResponse,
 } from '../utils/apiClient';
 
 /**
@@ -226,66 +227,86 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
   const [isBackendOnline, setIsBackendOnline] = useState<boolean>(true);
+  const [isCheckingSheetsStatus, setIsCheckingSheetsStatus] = useState<boolean>(() => isAdmin);
 
   // Fetch & Bidirectionally Hydrate Business Metrics & Server Google Sheets Status
   const refreshMetrics = useCallback(
     async (forceHydrate: boolean = false) => {
       const currentToken = adminToken;
       if (!currentToken) return;
-      try {
-        if (!isAdmin) {
+
+      if (!isAdmin) {
+        try {
           await hydrateAndSyncBillsWithServer(currentToken, null, undefined, forceHydrate);
           setIsBackendOnline(true);
-          return;
+        } catch (err: any) {
+          if (err?.status === 401 && (!err.token || err.token === currentToken)) {
+            onLogout();
+            return;
+          }
+          setIsBackendOnline(false);
         }
+        return;
+      }
 
-        const headers: Record<string, string> = {
-          Authorization: `Bearer ${currentToken}`,
-        };
-        if (googleToken) {
-          headers['x-google-token'] = googleToken;
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${currentToken}`,
+      };
+      if (googleToken) {
+        headers['x-google-token'] = googleToken;
+      }
+
+      const sheetQuery = customSpreadsheetId.trim()
+        ? `?sheetId=${encodeURIComponent(customSpreadsheetId.trim())}`
+        : '';
+
+      // 1. Fetch /api/sheets/status independently so it resolves immediately without waiting on /api/bills/hydrate
+      const sheetsStatusTask = (async () => {
+        try {
+          const statusRes = await apiFetch(`/api/sheets/status${sheetQuery}`, { headers });
+          if (statusRes.status === 401) {
+            onLogout();
+            return;
+          }
+          const isFallback = isOfflineFallbackResponse(statusRes);
+          if (statusRes.ok && !isFallback) {
+            setIsBackendOnline(true);
+            const { data: statusData } = await parseApiJsonResponse(statusRes);
+            if (statusData) {
+              setServerSheetsStatus(statusData);
+            }
+          } else if (isFallback || statusRes.status === 503 || statusRes.status === 504) {
+            setIsBackendOnline(false);
+          }
+        } catch {
+          setIsBackendOnline(false);
+        } finally {
+          setIsCheckingSheetsStatus(false);
         }
+      })();
 
-        const sheetQuery = customSpreadsheetId.trim()
-          ? `?sheetId=${encodeURIComponent(customSpreadsheetId.trim())}`
-          : '';
-
-        const [hydratedResult, statusRes] = await Promise.all([
-          hydrateAndSyncBillsWithServer(
+      // 2. Hydrate bills & metrics independently
+      const hydrateTask = (async () => {
+        try {
+          const hydratedResult = await hydrateAndSyncBillsWithServer(
             currentToken,
             googleToken,
             customSpreadsheetId,
             forceHydrate
-          ),
-          apiFetch(`/api/sheets/status${sheetQuery}`, { headers }),
-        ]);
-
-        if (statusRes.status === 401) {
-          onLogout();
-          return;
-        }
-
-        if (hydratedResult?.metrics) {
-          setMetrics(hydratedResult.metrics);
-        }
-
-        if (statusRes.ok) {
-          setIsBackendOnline(true);
-          const { data: statusData } = await parseApiJsonResponse(statusRes);
-          if (statusData) {
-            setServerSheetsStatus(statusData);
+          );
+          if (hydratedResult?.metrics) {
+            setMetrics(hydratedResult.metrics);
           }
-        }
-      } catch (err: any) {
-        if (err?.status === 401 && (!err.token || err.token === currentToken)) {
-          onLogout();
-          return;
-        }
-        setIsBackendOnline(false);
-        if (isAdmin) {
+        } catch (err: any) {
+          if (err?.status === 401 && (!err.token || err.token === currentToken)) {
+            onLogout();
+            return;
+          }
           setMetrics(computeBusinessMetricsFromBills(loadPersistentBills(), Date.now()));
         }
-      }
+      })();
+
+      await Promise.allSettled([sheetsStatusTask, hydrateTask]);
     },
     [adminToken, googleToken, customSpreadsheetId, isAdmin, onLogout]
   );
@@ -1017,6 +1038,8 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                   <span className="font-extrabold text-xs sm:text-sm">
                     {isSheetsConnected
                       ? 'Google Sheets Auto-Sync Active'
+                      : isCheckingSheetsStatus
+                      ? 'Connecting to Production Server & Google Sheets...'
                       : isNativeApk && !getConfiguredApiBaseUrl()
                       ? 'Android APK: Connect Netlify Backend for Google Sheets'
                       : 'Local Database Mode (Google Sheets Sync Pending)'}
@@ -1032,6 +1055,8 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                       ? serverSheetsStatus.modeLabel
                       : googleToken
                       ? 'Google Workspace Connected'
+                      : isCheckingSheetsStatus
+                      ? 'Verifying Netlify API...'
                       : getConfiguredApiBaseUrl()
                       ? `Server: ${getConfiguredApiBaseUrl().replace(/^https?:\/\//, '')}`
                       : 'Offline Queue Active'}
@@ -1040,6 +1065,8 @@ export const BillingDashboard: React.FC<BillingDashboardProps> = ({
                 <p className="text-[11px] text-slate-600 mt-0.5 leading-snug">
                   {isSheetsConnected
                     ? `Every bill is verified and recorded in your Google Sheet (${metrics.syncedBillsCount} bills synced).`
+                    : isCheckingSheetsStatus
+                    ? 'Verifying live connection to https://annpurnacholebhature.netlify.app/api/sheets/status...'
                     : isNativeApk && !getConfiguredApiBaseUrl()
                     ? 'Enter your deployed Netlify HTTPS URL in Server & Sheet Settings below so this Android app routes all Google Sheets operations through your Netlify backend.'
                     : 'Bills are saved locally and queued safely. Configure Netlify backend or Service Account variables for automatic Google Sheets recording.'}

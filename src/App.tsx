@@ -23,6 +23,7 @@ import {
 import {
   apiFetch,
   decodeSessionTokenRole,
+  isOfflineFallbackResponse,
   parseApiJsonResponse,
 } from './utils/apiClient';
 import { AdminLogin } from './components/AdminLogin';
@@ -316,6 +317,11 @@ export default function App() {
       },
     })
       .then(async (res) => {
+        if (isOfflineFallbackResponse(res)) {
+          const err: any = new Error('Offline fallback response cannot verify production session');
+          err.status = 503;
+          throw err;
+        }
         const { ok, status, data } = await parseApiJsonResponse<any>(res);
         if (!ok || !data) {
           const err: any = new Error('Session invalid or expired');
@@ -326,7 +332,7 @@ export default function App() {
       })
       .then((data) => {
         if (cancelled) return;
-        if (data?.isAuthenticated) {
+        if (data?.isAuthenticated && !data?.isOfflineFallback) {
           setIsSessionVerified(true);
           const resolvedUsername =
             data.username || decodedLocal?.sub || adminUsername || 'annapurna_admin';
@@ -352,8 +358,13 @@ export default function App() {
       })
       .catch((err: any) => {
         if (cancelled) return;
-        // If transient network failure occurred on mobile but token is cryptographically valid & unexpired, keep session active
-        if (err?.status !== 401 && decodedLocal && decodedLocal.exp > Date.now()) {
+        // Only preserve session during a genuine offline network outage (HTTP 503) if the token is unexpired
+        if (
+          err?.status !== 401 &&
+          err?.status !== 403 &&
+          decodedLocal &&
+          decodedLocal.exp > Date.now()
+        ) {
           setIsSessionVerified(true);
           setUserRole(decodedLocal.role);
           setAdminUsername(decodedLocal.sub);

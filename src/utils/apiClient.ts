@@ -363,6 +363,61 @@ export async function parseApiJsonResponse<T = any>(
   };
 }
 
+/**
+ * Returns true if a Response came from the local offline fallback engine rather than the live production Netlify API.
+ */
+export function isOfflineFallbackResponse(response?: Response | null): boolean {
+  if (!response || !response.headers) return false;
+  const source =
+    typeof response.headers.get === 'function'
+      ? response.headers.get('X-Annapurna-Source') || response.headers.get('x-annapurna-source')
+      : '';
+  return source === 'local-offline-fallback';
+}
+
+/**
+ * Converts any `HeadersInit` into a plain `Record<string, string>` with canonical header names
+ * so Capacitor's native Android bridge (`CapacitorHttp` / WebView fetch) never drops `Authorization` or `Content-Type`.
+ */
+function buildPlainHeadersRecord(initHeaders?: HeadersInit): Record<string, string> {
+  const out: Record<string, string> = {};
+  const setCanonical = (rawKey: string, rawVal: string) => {
+    const k = rawKey.trim();
+    if (!k) return;
+    const lower = k.toLowerCase();
+    if (lower === 'authorization') {
+      out['Authorization'] = rawVal;
+    } else if (lower === 'content-type') {
+      out['Content-Type'] = rawVal;
+    } else if (lower === 'accept') {
+      out['Accept'] = rawVal;
+    } else if (lower === 'x-google-token') {
+      out['x-google-token'] = rawVal;
+    } else {
+      out[k] = rawVal;
+    }
+  };
+
+  if (initHeaders) {
+    if (initHeaders instanceof Headers) {
+      initHeaders.forEach((v, k) => setCanonical(k, v));
+    } else if (Array.isArray(initHeaders)) {
+      for (const [k, v] of initHeaders) {
+        if (typeof k === 'string' && typeof v === 'string') setCanonical(k, v);
+      }
+    } else if (typeof initHeaders === 'object') {
+      for (const [k, v] of Object.entries(initHeaders)) {
+        if (typeof v === 'string') setCanonical(k, v);
+      }
+    }
+  }
+
+  if (!out['Accept']) {
+    out['Accept'] = 'application/json';
+  }
+  return out;
+}
+
 let fetchInterceptorInstalled = false;
 
 /**
@@ -370,9 +425,9 @@ let fetchInterceptorInstalled = false;
  *
  * - Ensures any `/api/*` request is always resolved to the full production Netlify URL
  *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`) in production & Android APK.
- * - Enforces an `AbortController` timeout on every API call so Android WebView requests never hang forever.
- * - Uses `credentials: 'omit'` and `mode: 'cors'` on cross-origin requests so Bearer token auth
- *   works across Capacitor (`https://localhost`) -> Netlify (`https://annpurnacholebhature.netlify.app`) without CORS failures.
+ * - Uses plain `Record<string, string>` headers so `Authorization: Bearer <token>` is preserved across
+ *   both standard WebView `fetch` and Capacitor native HTTP bridges.
+ * - Never substitutes local offline responses for `/api/auth/login`, `/api/auth/me`, or `/api/sheets/status`.
  */
 export function installCapacitorApiFetchInterceptor(): void {
   if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
@@ -419,16 +474,32 @@ export function installCapacitorApiFetchInterceptor(): void {
       typeof window !== 'undefined' &&
       !resolvedUrl.startsWith(window.location.origin);
 
-    const mergedHeaders = new Headers(init?.headers || {});
-    if (!mergedHeaders.has('Accept')) {
-      mergedHeaders.set('Accept', 'application/json');
-    }
+    const plainHeaders = buildPlainHeadersRecord(
+      init?.headers || (input instanceof Request ? input.headers : undefined)
+    );
+
+    const method = (
+      init?.method ||
+      (input instanceof Request ? input.method : 'GET') ||
+      'GET'
+    ).toUpperCase();
 
     const isSheetsHeavyRoute =
       apiPathWithQuery.includes('/batch-sync-sheets') ||
       apiPathWithQuery.includes('/retry-sheets') ||
       apiPathWithQuery.includes('/hydrate') ||
-      (apiPathWithQuery.startsWith('/api/bills') && (init?.method || 'GET').toUpperCase() === 'POST');
+      (apiPathWithQuery.startsWith('/api/bills') && method === 'POST');
+
+    // Endpoints that MUST always be answered by the live production Netlify backend
+    // and must NEVER silently fall back to local storage:
+    const isStrictProductionOnlyRoute =
+      apiPathWithQuery.startsWith('/api/auth/login') ||
+      apiPathWithQuery.startsWith('/api/auth/me') ||
+      apiPathWithQuery.startsWith('/api/auth/logout') ||
+      apiPathWithQuery.startsWith('/api/sheets/status') ||
+      apiPathWithQuery.startsWith('/api/health') ||
+      apiPathWithQuery.includes('/retry-sheets') ||
+      apiPathWithQuery.includes('/batch-sync-sheets');
 
     const timeoutMs = isSheetsHeavyRoute ? SHEETS_SYNC_TIMEOUT_MS : STANDARD_API_TIMEOUT_MS;
 
@@ -447,7 +518,8 @@ export function installCapacitorApiFetchInterceptor(): void {
       try {
         return await originalFetch(resolvedUrl, {
           ...init,
-          headers: mergedHeaders,
+          method,
+          headers: plainHeaders,
           signal: controller.signal,
           ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
         });
@@ -464,7 +536,6 @@ export function installCapacitorApiFetchInterceptor(): void {
       try {
         response = await executeRemoteFetch(timeoutMs);
       } catch (firstErr: any) {
-        // If caller explicitly aborted, do not retry
         if (init?.signal?.aborted) {
           throw firstErr;
         }
@@ -495,63 +566,34 @@ export function installCapacitorApiFetchInterceptor(): void {
         }
       }
 
-      // Only fall back to local handler if a newly added route returns 404 on an un-updated remote server
-      if (
-        response.status === 404 &&
-        (apiPathWithQuery.startsWith('/api/admin/reset-audit') ||
-          apiPathWithQuery.startsWith('/api/auth/change-password'))
-      ) {
-        return handleCapacitorLocalApiRequest(apiPathWithQuery, {
-          ...init,
-          headers: mergedHeaders,
-        });
-      }
-
-      // Return the authoritative production backend response directly (including 200, 401, 403, etc.)
-      // Never swallow 401s into Local Database Mode so Android and Desktop always share real server sessions and data.
+      // Return the authoritative production backend response directly (200, 400, 401, 403, 404, 500)
       return response;
     } catch (networkErr: any) {
       const isTimeout = networkErr?.name === 'AbortError';
       const localInit: RequestInit = {
         ...init,
-        headers: mergedHeaders,
+        method,
+        headers: plainHeaders,
       };
 
-      // When running inside a local dev/preview server (e.g. localhost:3000 or *.run.app) and not Capacitor,
-      // allow fallback to the local Express backend if the remote production server is unreachable
-      if (!inCapacitor && isCrossOrigin && typeof window !== 'undefined') {
-        try {
-          const localDevRes = await originalFetch(
-            `${window.location.origin}${apiPathWithQuery}`,
-            localInit
-          );
-          return localDevRes;
-        } catch {
-          // continue to standard fallback
-        }
-      }
-
-      // For explicit Google Sheets retry/batch-sync actions, surface the exact timeout/connection error
-      if (
-        configuredBaseUrl &&
-        (apiPathWithQuery.includes('/retry-sheets') ||
-          apiPathWithQuery.includes('/batch-sync-sheets'))
-      ) {
+      // Never fake production authentication, session verification, or Google Sheets status with local fallback
+      if (isStrictProductionOnlyRoute) {
         return new Response(
           JSON.stringify({
             success: false,
             error: isTimeout
-              ? `Google Sheets sync timed out after ${Math.round(timeoutMs / 1000)}s contacting ${configuredBaseUrl}. Please check your internet connection and retry.`
-              : `Could not reach Netlify backend (${configuredBaseUrl}): ${networkErr?.message || 'Network error'}.`,
+              ? `Connection to production server (${configuredBaseUrl}) timed out after ${Math.round(timeoutMs / 1000)}s. Please check your internet connection and try again.`
+              : `Cannot reach production server (${configuredBaseUrl}): ${networkErr?.message || 'Network connection failed'}. Please check your internet connection.`,
           }),
-          { status: 504, headers: { 'Content-Type': 'application/json' } }
+          { status: 503, headers: { 'Content-Type': 'application/json' } }
         );
       }
 
-      // Only use local offline fallback if the device is genuinely offline (airplane mode / no internet)
+      // Preserve offline read/write support ONLY when the device has no internet connection
+      // and the user already has a verified session token, marking the response clearly as local-offline-fallback
       const isBrowserOffline =
         typeof navigator !== 'undefined' && navigator.onLine === false;
-      if (isBrowserOffline && (inCapacitor || mergedHeaders.has('Authorization'))) {
+      if (isBrowserOffline && (inCapacitor || Boolean(plainHeaders['Authorization']))) {
         return handleCapacitorLocalApiRequest(apiPathWithQuery, localInit);
       }
 
