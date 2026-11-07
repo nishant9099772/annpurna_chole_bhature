@@ -418,6 +418,202 @@ function buildPlainHeadersRecord(initHeaders?: HeadersInit): Record<string, stri
   return out;
 }
 
+/**
+ * Secret-safe Android API Diagnostic entry.
+ * Never stores request bodies, passwords, tokens, or secrets.
+ */
+export interface AndroidApiDiagnostic {
+  timestamp: string;
+  method: string;
+  url: string;
+  status: number | null;
+  transport: string;
+  latencyMs: number;
+  error: string | null;
+}
+
+const MAX_ANDROID_DIAGNOSTICS = 25;
+const androidDiagnosticsBuffer: AndroidApiDiagnostic[] = [];
+let lastAndroidApiFailure: AndroidApiDiagnostic | null = null;
+
+function sanitizeUrlForDiagnostics(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl, DEFAULT_PRODUCTION_API_BASE_URL);
+    u.searchParams.forEach((_, key) => {
+      if (/token|key|secret|pass|auth/i.test(key)) {
+        u.searchParams.set(key, '[REDACTED]');
+      }
+    });
+    return u.toString();
+  } catch {
+    return rawUrl.split('?')[0];
+  }
+}
+
+function recordAndroidDiagnostic(entry: AndroidApiDiagnostic): void {
+  if (!isCapacitorOrAndroidWebView()) return;
+  androidDiagnosticsBuffer.unshift(entry);
+  if (androidDiagnosticsBuffer.length > MAX_ANDROID_DIAGNOSTICS) {
+    androidDiagnosticsBuffer.pop();
+  }
+  if (entry.error || (entry.status !== null && entry.status >= 400)) {
+    lastAndroidApiFailure = entry;
+    console.warn(
+      `[AndroidAPI Diagnostic] ${entry.method} ${entry.url} | status=${
+        entry.status ?? 'NETWORK_ERR'
+      } | transport=${entry.transport} | latency=${entry.latencyMs}ms | error=${
+        entry.error || 'HTTP ' + entry.status
+      }`
+    );
+  }
+}
+
+export function getAndroidApiDiagnostics(): AndroidApiDiagnostic[] {
+  return [...androidDiagnosticsBuffer];
+}
+
+export function getLastAndroidApiFailure(): AndroidApiDiagnostic | null {
+  return lastAndroidApiFailure;
+}
+
+/**
+ * Executes an HTTP request using Capacitor's built-in native `CapacitorHttp` plugin if available.
+ * Runs in native Android Java (`HttpURLConnection`), completely bypassing `WebViewLocalServer.shouldInterceptRequest`
+ * and WebView CORS limitations while preserving `Authorization`, `Content-Type`, and JSON request bodies.
+ */
+async function executeCapacitorNativeHttp(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  bodyString: string | undefined,
+  timeoutMs: number
+): Promise<Response | null> {
+  if (typeof window === 'undefined') return null;
+  const win = window as any;
+  const capHttp =
+    win.Capacitor?.Plugins?.CapacitorHttp ||
+    win.CapacitorCustomPlatform?.plugins?.CapacitorHttp;
+
+  if (!capHttp || typeof capHttp.request !== 'function') {
+    return null;
+  }
+
+  let dataPayload: any = undefined;
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (bodyString && bodyString.trim().length > 0) {
+      try {
+        dataPayload = JSON.parse(bodyString);
+      } catch {
+        dataPayload = bodyString;
+      }
+    } else {
+      dataPayload = {};
+    }
+  }
+
+  const capRes = await capHttp.request({
+    url,
+    method,
+    headers,
+    ...(dataPayload !== undefined ? { data: dataPayload } : {}),
+    connectTimeout: timeoutMs,
+    readTimeout: timeoutMs,
+  });
+
+  if (!capRes || typeof capRes.status !== 'number') {
+    return null;
+  }
+
+  const resHeaders: Record<string, string> = {
+    'X-Annapurna-Transport': 'capacitor-http',
+  };
+  if (capRes.headers && typeof capRes.headers === 'object') {
+    for (const [k, v] of Object.entries(capRes.headers)) {
+      if (typeof v === 'string') {
+        resHeaders[k] = v;
+      } else if (Array.isArray(v)) {
+        resHeaders[k] = v.join(', ');
+      }
+    }
+  }
+  if (!resHeaders['Content-Type'] && !resHeaders['content-type']) {
+    resHeaders['Content-Type'] = 'application/json; charset=utf-8';
+  }
+
+  const responseText =
+    typeof capRes.data === 'string' ? capRes.data : JSON.stringify(capRes.data ?? {});
+
+  return new Response(responseText, {
+    status: capRes.status,
+    headers: resHeaders,
+  });
+}
+
+/**
+ * Executes an HTTP request via standard `XMLHttpRequest` as a resilient fallback when
+ * Android WebView `window.fetch` throws `TypeError: Failed to fetch`.
+ */
+function executeXhrFetch(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  bodyString: string | undefined,
+  timeoutMs: number
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    if (typeof XMLHttpRequest === 'undefined') {
+      reject(new Error('XMLHttpRequest is not available'));
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url, true);
+    xhr.timeout = timeoutMs;
+    xhr.withCredentials = false;
+
+    for (const [k, v] of Object.entries(headers)) {
+      try {
+        xhr.setRequestHeader(k, v);
+      } catch {
+        // ignore restricted header names
+      }
+    }
+
+    xhr.onload = () => {
+      const contentType = xhr.getResponseHeader('content-type') || 'application/json; charset=utf-8';
+      resolve(
+        new Response(xhr.responseText ?? '', {
+          status: xhr.status || 200,
+          headers: {
+            'Content-Type': contentType,
+            'X-Annapurna-Transport': 'xhr',
+          },
+        })
+      );
+    };
+
+    xhr.onerror = () => {
+      reject(new Error(`XHR network error (status=${xhr.status || 0})`));
+    };
+
+    xhr.ontimeout = () => {
+      const err = new Error(`XHR timed out after ${Math.round(timeoutMs / 1000)}s`);
+      err.name = 'AbortError';
+      reject(err);
+    };
+
+    try {
+      if (method !== 'GET' && method !== 'HEAD' && bodyString !== undefined) {
+        xhr.send(bodyString);
+      } else {
+        xhr.send();
+      }
+    } catch (sendErr) {
+      reject(sendErr);
+    }
+  });
+}
+
 let fetchInterceptorInstalled = false;
 
 /**
@@ -425,8 +621,8 @@ let fetchInterceptorInstalled = false;
  *
  * - Ensures any `/api/*` request is always resolved to the full production Netlify URL
  *   (`import.meta.env.VITE_API_BASE_URL` = `https://annpurnacholebhature.netlify.app`) in production & Android APK.
- * - Uses plain `Record<string, string>` headers so `Authorization: Bearer <token>` is preserved across
- *   both standard WebView `fetch` and Capacitor native HTTP bridges.
+ * - Uses plain `Record<string, string>` headers and explicit stringified bodies so `Authorization`,
+ *   `Content-Type`, and JSON request bodies survive across WebView `fetch`, `CapacitorHttp`, and `XMLHttpRequest`.
  * - Never substitutes local offline responses for `/api/auth/login`, `/api/auth/me`, or `/api/sheets/status`.
  */
 export function installCapacitorApiFetchInterceptor(): void {
@@ -468,21 +664,49 @@ export function installCapacitorApiFetchInterceptor(): void {
     const configuredBaseUrl = getConfiguredApiBaseUrl();
     const inCapacitor = isCapacitorOrAndroidWebView();
     const resolvedUrl = resolveApiUrl(apiPathWithQuery);
+    const safeDiagUrl = sanitizeUrlForDiagnostics(resolvedUrl);
 
     const isCrossOrigin =
       /^https?:\/\//i.test(resolvedUrl) &&
       typeof window !== 'undefined' &&
       !resolvedUrl.startsWith(window.location.origin);
 
-    const plainHeaders = buildPlainHeadersRecord(
-      init?.headers || (input instanceof Request ? input.headers : undefined)
-    );
-
     const method = (
       init?.method ||
       (input instanceof Request ? input.method : 'GET') ||
       'GET'
     ).toUpperCase();
+
+    const plainHeaders = buildPlainHeadersRecord(
+      init?.headers || (input instanceof Request ? input.headers : undefined)
+    );
+
+    // Extract request body reliably whether passed via init.body or Request object
+    let bodyString: string | undefined = undefined;
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (typeof init?.body === 'string') {
+        bodyString = init.body;
+      } else if (init?.body && typeof init.body === 'object') {
+        try {
+          bodyString = JSON.stringify(init.body);
+        } catch {
+          bodyString = undefined;
+        }
+      } else if (input instanceof Request) {
+        try {
+          bodyString = await input.clone().text();
+        } catch {
+          bodyString = undefined;
+        }
+      }
+
+      if (!plainHeaders['Content-Type']) {
+        plainHeaders['Content-Type'] = 'application/json';
+      }
+      if (bodyString === undefined || bodyString === '') {
+        bodyString = '{}';
+      }
+    }
 
     const isSheetsHeavyRoute =
       apiPathWithQuery.includes('/batch-sync-sheets') ||
@@ -502,8 +726,13 @@ export function installCapacitorApiFetchInterceptor(): void {
       apiPathWithQuery.includes('/batch-sync-sheets');
 
     const timeoutMs = isSheetsHeavyRoute ? SHEETS_SYNC_TIMEOUT_MS : STANDARD_API_TIMEOUT_MS;
+    const startMs = Date.now();
+    const transportsAttempted: string[] = [];
 
-    const executeRemoteFetch = async (attemptTimeoutMs: number): Promise<Response> => {
+    const executeStandardFetch = async (
+      attemptTimeoutMs: number,
+      useBareOptions: boolean
+    ): Promise<Response> => {
       const controller = new AbortController();
       const callerSignal = init?.signal;
       const onCallerAbort = () => controller.abort();
@@ -516,13 +745,20 @@ export function installCapacitorApiFetchInterceptor(): void {
       }
       const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
       try {
-        return await originalFetch(resolvedUrl, {
-          ...init,
-          method,
-          headers: plainHeaders,
-          signal: controller.signal,
-          ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
-        });
+        const fetchInit: RequestInit = useBareOptions
+          ? {
+              method,
+              headers: plainHeaders,
+              ...(bodyString !== undefined ? { body: bodyString } : {}),
+            }
+          : {
+              method,
+              headers: plainHeaders,
+              ...(bodyString !== undefined ? { body: bodyString } : {}),
+              signal: controller.signal,
+              ...(isCrossOrigin ? { mode: 'cors', credentials: 'omit' } : {}),
+            };
+        return await originalFetch(resolvedUrl, fetchInit);
       } finally {
         clearTimeout(timeoutId);
         if (callerSignal) {
@@ -531,59 +767,167 @@ export function installCapacitorApiFetchInterceptor(): void {
       }
     };
 
-    try {
-      let response: Response;
+    const runMultiTransportAttempt = async (): Promise<{
+      response: Response;
+      transport: string;
+    }> => {
+      let lastError: any = null;
+
+      // 1. On Android Capacitor, try native CapacitorHttp first if available on window.Capacitor
+      if (inCapacitor) {
+        try {
+          transportsAttempted.push('capacitor-http');
+          const capRes = await executeCapacitorNativeHttp(
+            resolvedUrl,
+            method,
+            plainHeaders,
+            bodyString,
+            timeoutMs
+          );
+          if (capRes) {
+            const text = await capRes
+              .clone()
+              .text()
+              .catch(() => '');
+            if (!isHtmlPayload(text)) {
+              return { response: capRes, transport: 'capacitor-http' };
+            }
+          }
+        } catch (capErr: any) {
+          lastError = capErr;
+        }
+      }
+
+      // 2. Standard window.fetch with CORS & AbortController
       try {
-        response = await executeRemoteFetch(timeoutMs);
+        transportsAttempted.push('fetch');
+        const stdRes = await executeStandardFetch(timeoutMs, false);
+        const text =
+          typeof stdRes.clone === 'function'
+            ? await stdRes
+                .clone()
+                .text()
+                .catch(() => '')
+            : '';
+        if (!isHtmlPayload(text)) {
+          return { response: stdRes, transport: 'fetch' };
+        }
+        lastError = new Error(
+          `Received unexpected HTML payload (HTTP ${stdRes.status}) from ${safeDiagUrl}`
+        );
+      } catch (fetchErr: any) {
+        lastError = fetchErr;
+      }
+
+      // 3. On Android Capacitor, if standard fetch failed (e.g. "TypeError: Failed to fetch"),
+      //    try bare fetch (without AbortSignal / credentials options) and then XMLHttpRequest
+      if (inCapacitor) {
+        try {
+          transportsAttempted.push('bare-fetch');
+          const bareRes = await executeStandardFetch(timeoutMs, true);
+          const text =
+            typeof bareRes.clone === 'function'
+              ? await bareRes
+                  .clone()
+                  .text()
+                  .catch(() => '')
+              : '';
+          if (!isHtmlPayload(text)) {
+            return { response: bareRes, transport: 'bare-fetch' };
+          }
+        } catch (bareErr: any) {
+          lastError = bareErr;
+        }
+
+        try {
+          transportsAttempted.push('xhr');
+          const xhrRes = await executeXhrFetch(
+            resolvedUrl,
+            method,
+            plainHeaders,
+            bodyString,
+            timeoutMs
+          );
+          const text = await xhrRes
+            .clone()
+            .text()
+            .catch(() => '');
+          if (!isHtmlPayload(text)) {
+            return { response: xhrRes, transport: 'xhr' };
+          }
+          lastError = new Error(
+            `XHR received unexpected HTML payload (HTTP ${xhrRes.status}) from ${safeDiagUrl}`
+          );
+        } catch (xhrErr: any) {
+          lastError = xhrErr;
+        }
+      }
+
+      throw lastError || new Error('Network request failed');
+    };
+
+    try {
+      let result: { response: Response; transport: string };
+      try {
+        result = await runMultiTransportAttempt();
       } catch (firstErr: any) {
         if (init?.signal?.aborted) {
           throw firstErr;
         }
-        // Automatic 1x retry after 500ms for transient mobile radio / cold-start hiccups
-        await new Promise((r) => setTimeout(r, 500));
-        response = await executeRemoteFetch(timeoutMs);
+        await new Promise((r) => setTimeout(r, 400));
+        result = await runMultiTransportAttempt();
       }
 
-      const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
+      const { response, transport } = result;
+      recordAndroidDiagnostic({
+        timestamp: new Date().toISOString(),
+        method,
+        url: safeDiagUrl,
+        status: response.status,
+        transport,
+        latencyMs: Date.now() - startMs,
+        error: response.ok ? null : `HTTP ${response.status}`,
+      });
 
-      if (contentType.includes('application/pdf')) {
-        return response;
-      }
-
-      if (typeof response.clone === 'function') {
-        const clonedText = await response
-          .clone()
-          .text()
-          .catch(() => '');
-        if (isHtmlPayload(clonedText)) {
-          return new Response(
-            JSON.stringify({
-              success: false,
-              error: `Backend URL (${configuredBaseUrl}) returned an unexpected HTML page instead of JSON API response.`,
-            }),
-            { status: 502, headers: { 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-
-      // Return the authoritative production backend response directly (200, 400, 401, 403, 404, 500)
       return response;
     } catch (networkErr: any) {
       const isTimeout = networkErr?.name === 'AbortError';
+      const errName = networkErr?.name || 'NetworkError';
+      const errMsg = networkErr?.message || 'Network connection failed';
+      const transportSummary = transportsAttempted.join(' -> ') || 'fetch';
+      const latencyMs = Date.now() - startMs;
+
+      const diagEntry: AndroidApiDiagnostic = {
+        timestamp: new Date().toISOString(),
+        method,
+        url: safeDiagUrl,
+        status: null,
+        transport: transportSummary,
+        latencyMs,
+        error: `${errName}: ${errMsg}`,
+      };
+      recordAndroidDiagnostic(diagEntry);
+
       const localInit: RequestInit = {
         ...init,
         method,
         headers: plainHeaders,
+        ...(bodyString !== undefined ? { body: bodyString } : {}),
       };
 
       // Never fake production authentication, session verification, or Google Sheets status with local fallback
       if (isStrictProductionOnlyRoute) {
+        const detailedError = inCapacitor
+          ? `Cannot reach production server [${method} ${safeDiagUrl}] (Status: No HTTP response | Error: ${errName}: ${errMsg} | Transports: ${transportSummary}).`
+          : isTimeout
+          ? `Connection to production server (${configuredBaseUrl}) timed out after ${Math.round(timeoutMs / 1000)}s. Please check your internet connection and try again.`
+          : `Cannot reach production server (${configuredBaseUrl}): ${errMsg}. Please check your internet connection.`;
+
         return new Response(
           JSON.stringify({
             success: false,
-            error: isTimeout
-              ? `Connection to production server (${configuredBaseUrl}) timed out after ${Math.round(timeoutMs / 1000)}s. Please check your internet connection and try again.`
-              : `Cannot reach production server (${configuredBaseUrl}): ${networkErr?.message || 'Network connection failed'}. Please check your internet connection.`,
+            error: detailedError,
+            diagnostic: diagEntry,
           }),
           { status: 503, headers: { 'Content-Type': 'application/json' } }
         );
@@ -600,9 +944,12 @@ export function installCapacitorApiFetchInterceptor(): void {
       return new Response(
         JSON.stringify({
           success: false,
-          error: isTimeout
+          error: inCapacitor
+            ? `API request failed [${method} ${safeDiagUrl}] (${errName}: ${errMsg} | Transports: ${transportSummary}).`
+            : isTimeout
             ? `Request to ${configuredBaseUrl} timed out. Please check your internet connection.`
-            : `Cannot reach server (${configuredBaseUrl}): ${networkErr?.message || 'Network connection failed'}.`,
+            : `Cannot reach server (${configuredBaseUrl}): ${errMsg}.`,
+          diagnostic: diagEntry,
         }),
         { status: 503, headers: { 'Content-Type': 'application/json' } }
       );

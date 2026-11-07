@@ -9,6 +9,11 @@ export interface CapacitorConfig {
     allowNavigation?: string[];
     url?: string;
   };
+  plugins?: {
+    CapacitorHttp?: {
+      enabled?: boolean;
+    };
+  };
   android?: {
     allowMixedContent?: boolean;
     captureInput?: boolean;
@@ -25,13 +30,15 @@ const config: CapacitorConfig = {
   server: {
     androidScheme: 'https',
     cleartext: false,
-    allowNavigation: [
-      '*.netlify.app',
-      '*.googleapis.com',
-      '*.google.com',
-      'wa.me',
-      'api.whatsapp.com',
-    ],
+    // IMPORTANT: Do NOT add *.netlify.app or API domains to allowNavigation!
+    // In Capacitor Android, hosts in allowNavigation are registered in WebViewLocalServer.authorityMatcher,
+    // which intercepts fetch()/POST requests in shouldInterceptRequest() and causes "TypeError: Failed to fetch".
+    allowNavigation: [],
+  },
+  plugins: {
+    CapacitorHttp: {
+      enabled: true,
+    },
   },
   android: {
     allowMixedContent: false,

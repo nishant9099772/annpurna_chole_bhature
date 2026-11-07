@@ -23,6 +23,8 @@ import {
   verifyNetlifyBackendUrl,
   isCapacitorOrAndroidWebView,
   decodeSessionTokenRole,
+  getLastAndroidApiFailure,
+  AndroidApiDiagnostic,
 } from '../utils/apiClient';
 
 interface AdminLoginProps {
@@ -66,6 +68,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [androidDiag, setAndroidDiag] = useState<AndroidApiDiagnostic | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
   // Track whether the user is actively typing in the User ID field so Android password autofill
@@ -89,6 +92,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     setUsername(option.userId);
     setPassword('');
     setError(null);
+    setAndroidDiag(null);
   };
 
   const handleSaveAndTestServerUrl = async () => {
@@ -181,9 +185,24 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         role?: UserRole;
         expiresAt?: number;
         error?: string;
+        diagnostic?: AndroidApiDiagnostic;
       }>(response);
 
       if (!ok) {
+        if (isNativeApk) {
+          setAndroidDiag(
+            data?.diagnostic ||
+              getLastAndroidApiFailure() || {
+                timestamp: new Date().toISOString(),
+                method: 'POST',
+                url: `${getConfiguredApiBaseUrl()}/api/auth/login`,
+                status,
+                transport: response.headers?.get?.('X-Annapurna-Transport') || 'fetch',
+                latencyMs: 0,
+                error: data?.error || `HTTP ${status}`,
+              }
+          );
+        }
         throw new Error(
           data?.error ||
             (status === 401
@@ -198,6 +217,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         );
       }
 
+      setAndroidDiag(null);
       const decodedToken = decodeSessionTokenRole(data.token);
       const rawRole = data.role || decodedToken?.role;
       const resolvedRole: UserRole =
@@ -225,6 +245,9 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
         data.expiresAt || decodedToken?.exp
       );
     } catch (err: any) {
+      if (isNativeApk && !androidDiag) {
+        setAndroidDiag(getLastAndroidApiFailure());
+      }
       setError(err.message || 'Login failed. Please verify your User ID and Password.');
     } finally {
       setIsLoading(false);
@@ -300,11 +323,22 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           </div>
         </div>
 
-        {/* Error Alert */}
+        {/* Error Alert + Android-Only Network Diagnostics */}
         {error && (
-          <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2 text-red-700 text-xs sm:text-sm">
-            <AlertCircle className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
-            <span>{error}</span>
+          <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg space-y-2 text-red-700 text-xs sm:text-sm">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
+              <span className="break-words">{error}</span>
+            </div>
+            {isNativeApk && androidDiag && (
+              <div className="mt-2 pt-2 border-t border-red-200/80 text-[11px] font-mono text-red-900 bg-red-100/60 p-2 rounded space-y-0.5 break-all">
+                <div className="font-bold text-red-950">Android Network Diagnostics:</div>
+                <div>URL: {androidDiag.method} {androidDiag.url}</div>
+                <div>HTTP Status: {androidDiag.status !== null ? androidDiag.status : 'None (Network Exception)'}</div>
+                <div>Transports: {androidDiag.transport}</div>
+                <div>Error: {androidDiag.error || 'Unknown error'}</div>
+              </div>
+            )}
           </div>
         )}
 
